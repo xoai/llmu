@@ -180,8 +180,15 @@ fn readme_documents_offline_history_semantics() {
         "malformed",
         "stderr",
     ] {
+        let hit = if needle == "malformed" {
+            // Sentence-initial capitalization is cosmetic; the fact is that
+            // malformed records are documented (FR-2.8).
+            section.to_ascii_lowercase().contains("malformed")
+        } else {
+            section.contains(needle)
+        };
         assert!(
-            section.contains(needle),
+            hit,
             "the history section must document {needle} (FR-2/FR-7.1)"
         );
     }
