@@ -23,8 +23,25 @@ pub struct Config {
     pub claude: ClaudeSubCfg,
     /// OpenAI Codex CLI (ChatGPT plan) — local session logs + wham usage endpoint.
     pub codex: CodexCfg,
+    /// Optional HTTP response TTL cache (FR-3). Zero TTL disables it.
+    pub http_cache: HttpCacheCfg,
     /// USD per 1M tokens: model-prefix -> [input, output, cache_read, cache_write]
     pub pricing: HashMap<String, [f64; 4]>,
+}
+
+/// `[http_cache]` — optional raw GET/JSON response caching. `ttl_seconds`
+/// zero (the default) disables cache reads and writes entirely, so existing
+/// configs and behavior are unchanged (FR-3.1, FR-7.5).
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct HttpCacheCfg {
+    /// Entry lifetime in seconds; 0 disables caching (default).
+    pub ttl_seconds: u64,
+}
+impl HttpCacheCfg {
+    pub fn enabled(&self) -> bool {
+        self.ttl_seconds > 0
+    }
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -316,6 +333,11 @@ enabled = true
 enabled = true
 # home = "~/.codex"
 
+[http_cache]
+# Optional TTL (seconds) for raw HTTP GET/JSON response caching.
+# Zero (default) disables cache reads and writes entirely.
+# ttl_seconds = 300
+
 # USD per 1M tokens: [input, output, cache_read, cache_write]
 # Used only to ESTIMATE costs where no billed-cost API exists.
 # Longest matching prefix wins. Keep these in sync with provider pricing pages.
@@ -407,5 +429,28 @@ mod tests {
             .unwrap();
         assert!((cost - (2.50 + 10.0 + 1.25)).abs() < 1e-9);
         assert_eq!(c.estimate_cost("mystery-model-9000", 1, 1, 1, 1), None);
+    }
+
+    #[test]
+    fn http_cache_defaults_to_disabled() {
+        let c = cfg();
+        assert_eq!(c.http_cache.ttl_seconds, 0);
+        assert!(!c.http_cache.enabled());
+        let parsed: Config = toml::from_str("").expect("empty config parses");
+        assert_eq!(parsed.http_cache.ttl_seconds, 0);
+        assert!(!parsed.http_cache.enabled());
+    }
+
+    #[test]
+    fn http_cache_parses_positive_ttl() {
+        let c: Config = toml::from_str("[http_cache]\nttl_seconds = 300\n").unwrap();
+        assert_eq!(c.http_cache.ttl_seconds, 300);
+        assert!(c.http_cache.enabled());
+    }
+
+    #[test]
+    fn http_cache_section_appears_in_sample() {
+        assert!(Config::sample().contains("[http_cache]"));
+        assert!(Config::sample().contains("ttl_seconds"));
     }
 }
