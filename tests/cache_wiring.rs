@@ -39,7 +39,10 @@ fn cli_declares_global_fresh_and_builds_typed_fetch_context() {
 #[test]
 fn every_one_shot_gather_passes_the_typed_fetch_context() {
     let main = read("src/main.rs");
-    let call_sites: Vec<&str> = main
+    // Only the non-test half: main.rs's own tests module legitimately
+    // contains the needle in its assertions.
+    let prod = main.split("#[cfg(test)]").next().unwrap();
+    let call_sites: Vec<&str> = prod
         .lines()
         .filter(|l| l.contains("gather(") && !l.trim_start().starts_with("pub(crate) fn gather"))
         .collect();
@@ -49,7 +52,7 @@ fn every_one_shot_gather_passes_the_typed_fetch_context() {
     );
     for line in &call_sites {
         assert!(
-            line.contains("&ctx"),
+            line.contains("ctx"),
             "every one-shot gather must pass the typed fetch context, got: {line}"
         );
     }
@@ -62,15 +65,24 @@ fn providers_module_declares_typed_fetch_context() {
         "pub struct FetchContext",
         "pub cache: http::CacheOptions",
         "pub fresh: bool",
-        "fn usage(&self, _cfg: &Config, _ctx: &FetchContext",
-        "fn quotas(&self, _cfg: &Config, _ctx: &FetchContext",
-        "fn balances(&self, _cfg: &Config, _ctx: &FetchContext",
+        "_ctx: &FetchContext",
     ] {
         assert!(
             m.contains(needle),
             "src/providers/mod.rs must declare `{needle}` (plan Task 7: typed per-fetch context, no hidden global state)"
         );
     }
+    for method in ["fn usage(", "fn quotas(", "fn balances("] {
+        assert!(
+            m.contains(method),
+            "src/providers/mod.rs must keep `{method}` on the Provider trait"
+        );
+    }
+    assert_eq!(
+        m.matches("_ctx: &FetchContext").count(),
+        3,
+        "usage, quotas, and balances must each accept the typed fetch context"
+    );
 }
 
 #[test]

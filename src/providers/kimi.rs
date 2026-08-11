@@ -20,16 +20,20 @@ impl Provider for Kimi {
     /// STRINGS ("limit":"100"); `usage` is the weekly meter (resetTime
     /// RFC3339), `limits[]` are windowed meters whose `window` is
     /// {duration, timeUnit: TIME_UNIT_MINUTE|HOUR|DAY|WEEK}.
-    fn quotas(&self, cfg: &Config) -> Result<QuotaFetch> {
+    fn quotas(&self, cfg: &Config, ctx: &FetchContext) -> Result<QuotaFetch> {
         let key = match cfg.kimi.code_key() {
             Some(k) => k,
             None => return Ok(QuotaFetch::default()),
         };
         let auth = format!("Bearer {key}");
-        let v = http::get_json(
+        let cj = http::get_json_cached(
+            &ctx.cache,
+            ctx.fresh,
             &format!("{}/usages", cfg.kimi.code_base()),
             &[("Authorization", &auth)],
         )?;
+        let live = cj.origin == http::CacheOrigin::Live;
+        let v = cj.body;
         // Some deployments wrap the payload in `data`.
         let v = if v["data"].is_object() {
             v["data"].clone()
@@ -43,10 +47,14 @@ impl Provider for Kimi {
                  (payload drift?) — rerun with LLMU_DEBUG=1 to see the raw response"
             );
         }
-        Ok(QuotaFetch::live(out))
+        Ok(QuotaFetch {
+            snapshots: out,
+            notes: vec![],
+            refresh_last_known_good: live,
+        })
     }
 
-    fn balances(&self, cfg: &Config) -> Result<Vec<BalanceSnapshot>> {
+    fn balances(&self, cfg: &Config, ctx: &FetchContext) -> Result<Vec<BalanceSnapshot>> {
         let key = match cfg.kimi.key() {
             Some(k) => k,
             None if cfg.kimi.code_key().is_some() => anyhow::bail!(
@@ -58,7 +66,8 @@ impl Provider for Kimi {
         };
         let auth = format!("Bearer {key}");
         let url = format!("{}/v1/users/me/balance", cfg.kimi.base());
-        let v = http::get_json(&url, &[("Authorization", &auth)])?;
+        let v =
+            http::get_json_cached(&ctx.cache, ctx.fresh, &url, &[("Authorization", &auth)])?.body;
         let d = &v["data"];
         Ok(vec![BalanceSnapshot {
             provider: "kimi".into(),
@@ -150,7 +159,7 @@ mod tests {
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::thread;
 
     static TEST_DIR_NONCE: AtomicU64 = AtomicU64::new(0);
@@ -224,15 +233,17 @@ mod tests {
       "limits":[{"window":{"duration":300,"timeUnit":"TIME_UNIT_MINUTE"},
                  "detail":{"limit":"100","used":"10","remaining":"90","resetTime":"2026-08-10T14:49:49.158199Z"}}]
     }"#;
-    const BALANCE_OK: &str = r#"{"data":{"available_balance":10.5,"voucher_balance":2.0,"cash_balance":8.5}}"#;
+    const BALANCE_OK: &str =
+        r#"{"data":{"available_balance":10.5,"voucher_balance":2.0,"cash_balance":8.5}}"#;
 
     fn ctx_with_cache(dir: &Path) -> FetchContext {
-        let mut ctx = FetchContext::default();
-        ctx.cache = http::CacheOptions {
-            dir: Some(dir.to_path_buf()),
-            ttl_seconds: 3600,
-        };
-        ctx
+        FetchContext {
+            cache: http::CacheOptions {
+                dir: Some(dir.to_path_buf()),
+                ttl_seconds: 3600,
+            },
+            ..Default::default()
+        }
     }
 
     /// Real payload observed 2026-08-10 (numeric fields as strings).
@@ -259,12 +270,14 @@ mod tests {
     /// Task 7 (RED): a raw TTL cache hit on the coding quota GET must
     /// never mark the emitted snapshots for last-known-good refresh
     /// (FR-3.10, AS-7): the second run is network-free and reports the
-    /// marker false.
+    /// marker false. The local fixture is reachable through the existing
+    /// `[kimi] code_base_url` override.
     #[test]
     fn quota_cache_hit_never_marks_last_known_good_refresh() {
         let srv = CounterServer::start(vec![(200, QUOTAS_OK)]);
         let mut cfg = Config::default();
         cfg.kimi.code_key = Some("K-1".into());
+        cfg.kimi.code_base_url = Some(srv.url.clone());
         let ctx = ctx_with_cache(&temp_dir("kimi-quota-cache"));
 
         let first = Kimi.quotas(&cfg, &ctx).unwrap();
@@ -288,6 +301,7 @@ mod tests {
         let srv = CounterServer::start(vec![(200, BALANCE_OK)]);
         let mut cfg = Config::default();
         cfg.kimi.api_key = Some("K-2".into());
+        cfg.kimi.base_url = Some(srv.url.clone());
         let ctx = ctx_with_cache(&temp_dir("kimi-balance-cache"));
 
         let one = Kimi.balances(&cfg, &ctx).unwrap();

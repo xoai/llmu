@@ -42,7 +42,13 @@ impl Provider for Glm {
     /// response shape is unconfirmed in the wild, so parsing is
     /// shape-tolerant and failures produce an actionable note instead of
     /// silence — an LLMU_DEBUG=1 dump is enough to pin the real schema.
-    fn usage(&self, cfg: &Config, since: DateTime<Utc>, until: DateTime<Utc>) -> Result<Fetch> {
+    fn usage(
+        &self,
+        cfg: &Config,
+        ctx: &FetchContext,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<Fetch> {
         let key = match cfg.glm.key() {
             Some(k) => k,
             None => return Ok(Fetch::default()),
@@ -61,13 +67,16 @@ impl Provider for Glm {
             fmt(since),
             fmt(until)
         );
-        let v = http::get_json(
+        let v = http::get_json_cached(
+            &ctx.cache,
+            ctx.fresh,
             &url,
             &[
                 ("Authorization", key.as_str()),
                 ("Accept", "application/json"),
             ],
-        )?;
+        )?
+        .body;
         if v["success"].as_bool() == Some(false) {
             let msg = v["msg"].as_str().unwrap_or("");
             if msg.to_lowercase().contains("coding plan") {
@@ -150,19 +159,26 @@ impl Provider for Glm {
         })
     }
 
-    fn quotas(&self, cfg: &Config) -> Result<QuotaFetch> {
+    fn quotas(&self, cfg: &Config, ctx: &FetchContext) -> Result<QuotaFetch> {
         let key = match cfg.glm.key() {
             Some(k) => k,
             None => return Ok(QuotaFetch::default()),
         };
         let base = cfg.glm.base();
-        let v = http::get_json(
+        let quota_cj = http::get_json_cached(
+            &ctx.cache,
+            ctx.fresh,
             &format!("{base}/api/monitor/usage/quota/limit"),
             &[
                 ("Authorization", key.as_str()),
                 ("Accept", "application/json"),
             ],
         )?;
+        // A cached-origin response underlying the emitted snapshots must
+        // never re-age the last-known-good cache (FR-3.10): track every
+        // remote GET's origin.
+        let mut all_live = quota_cj.origin == http::CacheOrigin::Live;
+        let v = quota_cj.body;
 
         // Valid key without a Coding Plan: {"success":false,"code":500,"msg":"...coding plan..."}
         if v["success"].as_bool() == Some(false) {
@@ -174,21 +190,29 @@ impl Provider for Glm {
         }
 
         // Plan name is best-effort; failures must not blank the meters.
-        let plan = http::get_json(
+        // A cached plan response still counts toward provenance: the plan
+        // label rides inside the emitted snapshots.
+        let plan_fetch = http::get_json_cached(
+            &ctx.cache,
+            ctx.fresh,
             &format!("{base}/api/biz/subscription/list"),
             &[
                 ("Authorization", key.as_str()),
                 ("Accept", "application/json"),
             ],
         )
-        .ok()
-        .and_then(|s| {
-            s["data"].as_array().and_then(|a| {
-                a.iter()
-                    .find_map(|e| e["productName"].as_str().map(String::from))
+        .ok();
+        if let Some(pf) = &plan_fetch {
+            all_live &= pf.origin == http::CacheOrigin::Live;
+        }
+        let plan = plan_fetch
+            .and_then(|s| {
+                s.body["data"].as_array().and_then(|a| {
+                    a.iter()
+                        .find_map(|e| e["productName"].as_str().map(String::from))
+                })
             })
-        })
-        .unwrap_or_else(|| "GLM Coding Plan".into());
+            .unwrap_or_else(|| "GLM Coding Plan".into());
 
         let limits = v["data"]["limits"]
             .as_array()
@@ -203,7 +227,11 @@ impl Provider for Glm {
                  (payload drift?) — rerun with LLMU_DEBUG=1 to see the raw response"
             );
         }
-        Ok(QuotaFetch::live(out))
+        Ok(QuotaFetch {
+            snapshots: out,
+            notes: vec![],
+            refresh_last_known_good: all_live,
+        })
     }
 }
 
@@ -288,7 +316,7 @@ mod tests {
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::thread;
 
     static TEST_DIR_NONCE: AtomicU64 = AtomicU64::new(0);
@@ -366,12 +394,13 @@ mod tests {
     ]}}"#;
 
     fn ctx_with_cache(dir: &Path) -> FetchContext {
-        let mut ctx = FetchContext::default();
-        ctx.cache = http::CacheOptions {
-            dir: Some(dir.to_path_buf()),
-            ttl_seconds: 3600,
-        };
-        ctx
+        FetchContext {
+            cache: http::CacheOptions {
+                dir: Some(dir.to_path_buf()),
+                ttl_seconds: 3600,
+            },
+            ..Default::default()
+        }
     }
 
     /// Real GLM Coding Max payload observed 2026-08-10.
@@ -406,12 +435,14 @@ mod tests {
     /// Task 7 (RED): a raw TTL cache hit on the quota/limit GET (and the
     /// best-effort plan GET) must never mark the emitted snapshots for
     /// last-known-good refresh (FR-3.10, AS-7): the second run is
-    /// network-free and reports the marker false.
+    /// network-free and reports the marker false. The local fixture is
+    /// reachable through the existing `[glm] base_url` override.
     #[test]
     fn quota_cache_hit_never_marks_last_known_good_refresh() {
         let srv = CounterServer::start(vec![(200, QUOTA_LIMIT_OK), (200, PLAN_OK)]);
         let mut cfg = Config::default();
         cfg.glm.api_key = Some("G-1".into());
+        cfg.glm.base_url = Some(srv.url.clone());
         let ctx = ctx_with_cache(&temp_dir("glm-quota-cache"));
 
         let first = Glm.quotas(&cfg, &ctx).unwrap();
@@ -436,6 +467,7 @@ mod tests {
         let srv = CounterServer::start(vec![(200, MODEL_USAGE_OK)]);
         let mut cfg = Config::default();
         cfg.glm.api_key = Some("G-2".into());
+        cfg.glm.base_url = Some(srv.url.clone());
         let ctx = ctx_with_cache(&temp_dir("glm-usage-cache"));
         let since = Utc.timestamp_opt(1754000000, 0).single().unwrap();
         let until = since + chrono::Duration::days(1);
