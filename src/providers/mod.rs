@@ -143,6 +143,61 @@ mod tests {
         assert!(f.refresh_last_known_good);
     }
 
+    /// Task 7 (RED): a fetch context derived from configuration carries
+    /// the `[http_cache]` TTL and the global `--fresh` flag; `dir` stays
+    /// None so production resolves the platform cache directory (FR-3.4).
+    #[test]
+    fn fetch_context_from_config_carries_ttl_and_freshness() {
+        let mut cfg = Config::default();
+        cfg.http_cache.ttl_seconds = 300;
+        let ctx = FetchContext::from_config(&cfg, true);
+        assert_eq!(ctx.cache.ttl_seconds, 300);
+        assert!(ctx.cache.dir.is_none());
+        assert!(ctx.cache.enabled());
+        assert!(ctx.fresh);
+        assert!(!FetchContext::from_config(&cfg, false).fresh);
+        assert!(!FetchContext::default().cache.enabled());
+        assert!(!FetchContext::default().fresh);
+    }
+
+    /// Task 7 (RED): every side-effect-free JSON GET in the eligible
+    /// providers opts into `get_json_cached` (FR-3.3); Gemini is
+    /// signature-only — its POST and local-file operations stay
+    /// cache-ineligible — and the Claude OAuth token POST stays a plain
+    /// `post_json`.
+    #[test]
+    fn eligible_provider_gets_opt_in_and_posts_stay_uncached() {
+        for f in [
+            "anthropic.rs",
+            "claude_sub.rs",
+            "codex.rs",
+            "deepseek.rs",
+            "glm.rs",
+            "kimi.rs",
+            "openai.rs",
+        ] {
+            let src = include_str!(f);
+            assert!(
+                src.contains("get_json_cached"),
+                "{f} must opt its eligible GETs into get_json_cached"
+            );
+        }
+        let gem = include_str!("gemini.rs");
+        assert!(
+            !gem.contains("get_json_cached"),
+            "Gemini must stay cache-ineligible (signature-only)"
+        );
+        assert!(
+            gem.contains("post_form_json") && gem.contains("post_json"),
+            "Gemini OAuth form POST and quota RPC POSTs remain uncached"
+        );
+        let claude = include_str!("claude_sub.rs");
+        assert!(
+            claude.contains("post_json"),
+            "the Claude OAuth token POST must remain uncached"
+        );
+    }
+
     /// Every current override adapts: with no credentials the empty
     /// default (marker false) is returned instead of an empty vector.
     #[test]

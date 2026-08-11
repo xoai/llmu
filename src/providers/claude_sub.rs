@@ -1,4 +1,4 @@
-use super::{Provider, QuotaFetch};
+use super::{FetchContext, Provider, QuotaFetch};
 use crate::{config::Config, credentials, http, types::*};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -1197,5 +1197,84 @@ mod tests {
             srv.requests().is_empty(),
             "no HTTP at all without a refresh token"
         );
+    }
+
+    /// Task 7 (RED): a raw TTL cache hit on the usage GET must never
+    /// mark the emitted snapshots for last-known-good refresh (FR-3.10,
+    /// AS-7): the second run replays the cached body without touching
+    /// the network and reports `refresh_last_known_good == false`.
+    #[test]
+    fn cached_usage_hit_never_marks_last_known_good_refresh() {
+        let dir = temp_dir("cache-hit");
+        let path = write_oauth(&dir, &oauth_valid("AT1", Some("R1")));
+        let srv = FixtureServer::start(vec![ScriptedResponse::usage_ok()]);
+        let mut ctx = FetchContext::default();
+        ctx.cache = http::CacheOptions {
+            dir: Some(temp_dir("cache-dir")),
+            ttl_seconds: 3600,
+        };
+        let cfg = cfg_for(path.clone());
+
+        let first = quotas_impl(&cfg, &ctx, &srv.endpoints).unwrap();
+        assert!(
+            first.refresh_last_known_good,
+            "a live usage GET marks last-known-good refresh"
+        );
+        assert_eq!(srv.requests().len(), 1);
+
+        let second = quotas_impl(&cfg, &ctx, &srv.endpoints).unwrap();
+        assert_eq!(
+            second.snapshots.len(),
+            3,
+            "the cached usage body still parses into all meters"
+        );
+        assert!(
+            !second.refresh_last_known_good,
+            "a raw cache hit must never re-age last-known-good (FR-3.10)"
+        );
+        assert_eq!(
+            srv.requests().len(),
+            1,
+            "the second run must be network-free"
+        );
+    }
+
+    /// Task 7 (RED): the same run with a fresh context bypasses the
+    /// cache read, still stores the live response, and keeps the
+    /// last-known-good marker true.
+    #[test]
+    fn fresh_context_bypasses_cached_usage_and_stays_live() {
+        let dir = temp_dir("fresh-ctx");
+        let path = write_oauth(&dir, &oauth_valid("AT1", Some("R1")));
+        let srv = FixtureServer::start(vec![
+            ScriptedResponse::usage_ok(),
+            ScriptedResponse::usage_ok(),
+        ]);
+        let mut ctx = FetchContext::default();
+        ctx.cache = http::CacheOptions {
+            dir: Some(temp_dir("fresh-dir")),
+            ttl_seconds: 3600,
+        };
+        let cfg = cfg_for(path.clone());
+        let first = quotas_impl(&cfg, &ctx, &srv.endpoints).unwrap();
+        assert!(first.refresh_last_known_good);
+        let mut fresh_ctx = ctx.clone();
+        fresh_ctx.fresh = true;
+        let second = quotas_impl(&cfg, &fresh_ctx, &srv.endpoints).unwrap();
+        assert!(
+            second.refresh_last_known_good,
+            "fresh must observe the response live (FR-3.2)"
+        );
+        assert_eq!(
+            srv.requests().len(),
+            2,
+            "fresh must bypass the cached read and fetch live"
+        );
+        let third = quotas_impl(&cfg, &ctx, &srv.endpoints).unwrap();
+        assert!(
+            !third.refresh_last_known_good,
+            "the stored fresh response is now a plain cache hit"
+        );
+        assert_eq!(srv.requests().len(), 2, "the third run is network-free");
     }
 }

@@ -649,7 +649,49 @@ mod tests {
         }
     }
 
-    /// A panicking provider worker must surface as a note, not vanish —
+    /// Task 7 (RED): one-shot commands derive the typed fetch context
+    /// from `[http_cache]` plus the global `--fresh` flag (FR-3.2).
+    #[test]
+    fn fresh_context_builds_from_config_and_flag() {
+        let mut cfg = Config::default();
+        cfg.http_cache.ttl_seconds = 60;
+        let ctx = providers::FetchContext::from_config(&cfg, true);
+        assert!(ctx.fresh);
+        assert_eq!(ctx.cache.ttl_seconds, 60);
+        assert!(!providers::FetchContext::from_config(&cfg, false).fresh);
+    }
+
+    /// Task 7 (RED): every one-shot gather call site (usage, quota,
+    /// balance, overview) passes the shared typed fetch context — no
+    /// hidden global or environment freshness state (plan Task 7).
+    #[test]
+    fn one_shot_gather_sites_pass_the_fetch_context() {
+        let src = include_str!("main.rs");
+        let sites: Vec<&str> = src
+            .lines()
+            .filter(|l| l.contains("gather(") && !l.trim_start().starts_with("pub(crate) fn gather"))
+            .collect();
+        assert_eq!(sites.len(), 4, "usage, quota, balance, and overview");
+        for line in &sites {
+            assert!(
+                line.contains("&ctx"),
+                "every one-shot gather must pass the context, got: {line}"
+            );
+        }
+    }
+
+    /// Task 7 (RED): `--fresh` also reaches the TUI as its initial-fetch
+    /// bypass (FR-3.2: later scheduled ticks honor the TTL).
+    #[test]
+    fn tui_run_receives_the_global_fresh_flag() {
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("cli.fresh"),
+            "the global --fresh must reach the TUI dispatch"
+        );
+    }
+
+    /// Task 7 (RED): a panicking provider worker must surface as a note, not vanish —
     /// the review found the join loop silently dropping JoinError.
     #[test]
     fn panicked_provider_thread_yields_note() {

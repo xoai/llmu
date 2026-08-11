@@ -9,7 +9,7 @@
 //! cached input tokens are counted (there is no cache-write charge). The
 //! cost endpoint may be unavailable on some org types — that break is
 //! silent by design (see `collect_billed`).
-use super::Provider;
+use super::{FetchContext, Provider};
 use crate::{config::Config, http, types::*};
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
@@ -125,6 +125,85 @@ fn collect_billed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    static TEST_DIR_NONCE: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nonce = TEST_DIR_NONCE.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!(
+            "llmu-openai-test-{}-{}-{nonce}",
+            std::process::id(),
+            name
+        ));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// Local HTTP fixture: serves one response per expected request and
+    /// counts connections, so a cache hit can be proven network-free.
+    struct CounterServer {
+        url: String,
+        hits: Arc<AtomicUsize>,
+    }
+
+    impl CounterServer {
+        fn start(responses: Vec<(u16, &'static str)>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let hits = Arc::new(AtomicUsize::new(0));
+            let h2 = hits.clone();
+            thread::spawn(move || {
+                for (code, body) in responses {
+                    let (mut sock, _) = listener.accept().unwrap();
+                    let mut buf: Vec<u8> = vec![];
+                    let mut tmp = [0u8; 4096];
+                    loop {
+                        let n = sock.read(&mut tmp).unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    h2.fetch_add(1, Ordering::SeqCst);
+                    let reason = match code {
+                        200 => "OK",
+                        _ => "X",
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    sock.write_all(resp.as_bytes()).unwrap();
+                }
+            });
+            Self {
+                url: format!("http://{addr}"),
+                hits,
+            }
+        }
+
+        fn hits(&self) -> usize {
+            self.hits.load(Ordering::SeqCst)
+        }
+    }
+
+    const USAGE_PAGE: &str = r#"{"data":[{"start_time":1754000000,"results":[
+      {"model":"gpt-4o","input_tokens":20,"input_cached_tokens":5,"output_tokens":7,"num_model_requests":3}
+    ]}],"has_more":false}"#;
+    const COST_PAGE: &str = r#"{"data":[{"start_time":1754000000,"results":[
+      {"amount":{"value":12.34},"line_item":"Tokens"}
+    ]}],"has_more":false}"#;
 
     fn since() -> DateTime<Utc> {
         Utc.timestamp_opt(1754000000, 0).single().unwrap()
@@ -192,5 +271,31 @@ mod tests {
         assert_eq!(fetch.billed.len(), 1, "page-1 entries retained");
         assert_eq!(fetch.billed[0].amount_usd, 12.34);
         assert!(fetch.notes.is_empty(), "404 is a silent break");
+    }
+
+    /// Task 7 (RED): both OpenAI GETs (usage pagination + costs report)
+    /// opt into the raw cache — a second run within the TTL performs no
+    /// network request and still parses the same rows.
+    #[test]
+    fn usage_and_cost_gets_are_cached_between_runs() {
+        let srv = CounterServer::start(vec![(200, USAGE_PAGE), (200, COST_PAGE)]);
+        let mut cfg = Config::default();
+        cfg.openai.admin_key = Some("O-1".into());
+        let mut ctx = FetchContext::default();
+        ctx.cache = http::CacheOptions {
+            dir: Some(temp_dir("openai-cache")),
+            ttl_seconds: 3600,
+        };
+        let until = since() + chrono::Duration::days(1);
+
+        let one = OpenAi.usage(&cfg, &ctx, since(), until).unwrap();
+        assert_eq!(one.events.len(), 1);
+        assert_eq!(one.events[0].requests, 3);
+        assert_eq!(srv.hits(), 2, "usage page + costs page");
+
+        let two = OpenAi.usage(&cfg, &ctx, since(), until).unwrap();
+        assert_eq!(two.events.len(), 1);
+        assert_eq!(two.billed.len(), 1);
+        assert_eq!(srv.hits(), 2, "both GETs must hit the raw cache");
     }
 }

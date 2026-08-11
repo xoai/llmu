@@ -1,4 +1,4 @@
-use super::{Provider, QuotaFetch};
+use super::{FetchContext, Provider, QuotaFetch};
 use crate::{config::Config, http, types::*};
 use anyhow::Result;
 use chrono::{DateTime, Duration, DurationRound, Utc};
@@ -398,6 +398,95 @@ impl Provider for Codex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    static TEST_DIR_NONCE: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nonce = TEST_DIR_NONCE.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!(
+            "llmu-codex-test-{}-{}-{nonce}",
+            std::process::id(),
+            name
+        ));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// Local HTTP fixture: serves one response per expected request and
+    /// counts connections, so a cache hit can be proven network-free.
+    struct CounterServer {
+        url: String,
+        hits: Arc<AtomicUsize>,
+    }
+
+    impl CounterServer {
+        fn start(responses: Vec<(u16, &'static str)>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let hits = Arc::new(AtomicUsize::new(0));
+            let h2 = hits.clone();
+            thread::spawn(move || {
+                for (code, body) in responses {
+                    let (mut sock, _) = listener.accept().unwrap();
+                    let mut buf: Vec<u8> = vec![];
+                    let mut tmp = [0u8; 4096];
+                    loop {
+                        let n = sock.read(&mut tmp).unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    h2.fetch_add(1, Ordering::SeqCst);
+                    let reason = match code {
+                        200 => "OK",
+                        _ => "X",
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    sock.write_all(resp.as_bytes()).unwrap();
+                }
+            });
+            Self {
+                url: format!("http://{addr}"),
+                hits,
+            }
+        }
+
+        fn hits(&self) -> usize {
+            self.hits.load(Ordering::SeqCst)
+        }
+    }
+
+    const WHAM_OK: &str = r#"{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":12.0,"limit_window_seconds":18000},"secondary_window":{"used_percent":34.0,"limit_window_seconds":604800}}}"#;
+
+    fn wham_cfg(home: &Path) -> Config {
+        let mut cfg = Config::default();
+        cfg.codex.home = Some(home.to_path_buf());
+        cfg
+    }
+
+    fn ctx_with_cache(dir: &Path) -> FetchContext {
+        let mut ctx = FetchContext::default();
+        ctx.cache = http::CacheOptions {
+            dir: Some(dir.to_path_buf()),
+            ttl_seconds: 3600,
+        };
+        ctx
+    }
 
     /// Real wham/usage primary_window observed 2026-08-10.
     #[test]
@@ -411,5 +500,35 @@ mod tests {
         assert_eq!(q.window, "7d");
         assert!(q.resets_at.is_some());
         assert_eq!(q.used, 0.0);
+    }
+
+    /// Task 7 (RED): a raw TTL cache hit on wham/usage must never mark
+    /// the emitted snapshots for last-known-good refresh (FR-3.10,
+    /// AS-7): the second run is network-free and reports the marker
+    /// false.
+    #[test]
+    fn wham_cache_hit_never_marks_last_known_good_refresh() {
+        let home = temp_dir("wham-home");
+        fs::write(
+            home.join("auth.json"),
+            r#"{"tokens":{"access_token":"CT-1","account_id":"acct-1"}}"#,
+        )
+        .unwrap();
+        let srv = CounterServer::start(vec![(200, WHAM_OK)]);
+        let cfg = wham_cfg(&home);
+        let ctx = ctx_with_cache(&temp_dir("wham-cache"));
+
+        let first = Codex.quotas(&cfg, &ctx).unwrap();
+        assert!(first.refresh_last_known_good);
+        assert_eq!(first.snapshots.len(), 2);
+        assert_eq!(srv.hits(), 1);
+
+        let second = Codex.quotas(&cfg, &ctx).unwrap();
+        assert_eq!(second.snapshots.len(), 2);
+        assert!(
+            !second.refresh_last_known_good,
+            "a wham cache hit must never re-age last-known-good (FR-3.10)"
+        );
+        assert_eq!(srv.hits(), 1, "the second run must be network-free");
     }
 }

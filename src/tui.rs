@@ -218,6 +218,63 @@ pub fn run(cfg: Config, since_spec: String, net_secs: u64, local_secs: u64) -> R
     res
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Task 7 (RED): a one-shot `--fresh` bypasses only the initial full
+    /// network fetch; later scheduled ticks honor the TTL (FR-3.2).
+    #[test]
+    fn fresh_bypasses_only_the_initial_full_fetch() {
+        let mut s = FreshState::new(true);
+        assert!(s.take(false), "the initial network tick bypasses");
+        assert!(!s.take(false), "scheduled ticks honor the TTL");
+        assert!(!s.take(false));
+    }
+
+    /// Task 7 (RED): `r` bypasses exactly the next full network fetch
+    /// and then clears (FR-3.2); a later `r` re-arms it.
+    #[test]
+    fn r_bypasses_exactly_one_fetch_then_clears() {
+        let mut s = FreshState::new(false);
+        assert!(s.take(true), "the forced fetch bypasses");
+        assert!(!s.take(false), "the next scheduled tick honors the TTL");
+        assert!(s.take(true), "a later r re-arms the bypass");
+        assert!(!s.take(false));
+    }
+
+    /// Task 7 (RED): local-only ticks neither consume nor require the
+    /// network bypass — the pending initial bypass survives until the
+    /// first full network fetch.
+    #[test]
+    fn local_only_ticks_do_not_consume_the_bypass() {
+        let mut s = FreshState::new(true);
+        // (local ticks never call take)
+        assert!(s.take(false), "the first full fetch still bypasses");
+        assert!(!s.take(false));
+    }
+
+    /// Task 7 (RED): both TUI gather paths thread the typed fetch
+    /// context; the network tick derives it from config plus the
+    /// per-tick freshness decision, the local-only tick from config
+    /// alone.
+    #[test]
+    fn tui_gather_sites_pass_the_fetch_context() {
+        let src = include_str!("tui.rs");
+        let sites: Vec<&str> = src
+            .lines()
+            .filter(|l| l.contains("crate::gather("))
+            .collect();
+        assert_eq!(sites.len(), 2, "network tick + local-only tick");
+        for line in &sites {
+            assert!(
+                line.contains("&ctx"),
+                "every TUI gather must pass the context, got: {line}"
+            );
+        }
+    }
+}
+
 fn draw(
     f: &mut Frame,
     d: &Dashboard,
