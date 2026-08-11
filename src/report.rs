@@ -406,7 +406,13 @@ pub fn render_balance_csv(balances: &[BalanceSnapshot]) -> String {
 /// `resets_at` is RFC 3339 when known, empty otherwise.
 pub fn render_quota_csv(quotas: &[QuotaSnapshot]) -> String {
     let header = [
-        "provider", "plan", "window", "used", "limit", "unit", "resets_at",
+        "provider",
+        "plan",
+        "window",
+        "used",
+        "limit",
+        "unit",
+        "resets_at",
     ];
     let rows: Vec<Vec<String>> = quotas
         .iter()

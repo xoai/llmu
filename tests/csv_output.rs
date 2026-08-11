@@ -27,15 +27,14 @@ fn read(rel: &str) -> String {
 #[test]
 fn main_declares_csv_flags_conflicting_with_json() {
     let m = read("src/main.rs");
+    let lines: Vec<&str> = m.lines().collect();
+    let decls = lines
+        .windows(2)
+        .filter(|w| w[0].contains("conflicts_with = \"json\"") && w[1].trim() == "csv: bool,")
+        .count();
     assert_eq!(
-        m.matches("csv: bool").count(),
-        3,
-        "usage, balance, and quota must each accept `--csv` (FR-1.1)"
-    );
-    assert_eq!(
-        m.matches("conflicts_with = \"json\"").count(),
-        3,
-        "`--csv` must conflict with `--json` on every report command (FR-1.2)"
+        decls, 3,
+        "usage, balance, and quota must each declare `--csv` conflicting with `--json` (FR-1.1/1.2)"
     );
 }
 

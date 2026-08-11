@@ -79,10 +79,7 @@ fn report_renders_balance_history_table() {
 /// Task 8 owns CSV output in main.rs/report.rs (FR-1).
 #[test]
 fn csv_belongs_to_task_8_and_is_not_introduced_here() {
-    for f in [
-        "src/types.rs",
-        "src/store.rs",
-    ] {
+    for f in ["src/types.rs", "src/store.rs"] {
         assert!(
             !read(f).contains("csv"),
             "{f} must not introduce CSV output (Task 8 owns CSV, FR-1)"
