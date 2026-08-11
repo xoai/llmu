@@ -360,7 +360,7 @@ fn parse_bucket(plan: &str, b: &Value) -> Result<QuotaSnapshot> {
 }
 
 /// Deterministic row order (FR-5.9): model/window first, then tier label.
-fn sort_rows(rows: &mut Vec<QuotaSnapshot>) {
+fn sort_rows(rows: &mut [QuotaSnapshot]) {
     rows.sort_by(|a, b| a.window.cmp(&b.window).then_with(|| a.plan.cmp(&b.plan)));
 }
 
@@ -684,7 +684,7 @@ mod tests {
         }
     }
 
-    fn write_creds(dir: &PathBuf, obj: &serde_json::Value) -> PathBuf {
+    fn write_creds(dir: &Path, obj: &serde_json::Value) -> PathBuf {
         let p = dir.join("oauth_creds.json");
         fs::write(&p, serde_json::to_vec_pretty(obj).unwrap()).unwrap();
         p
@@ -693,7 +693,7 @@ mod tests {
     /// Config pinned to a hermetic credential path: the explicit override
     /// short-circuits $GEMINI_CLI_HOME / $HOME discovery (no real ~/.gemini
     /// is ever touched, Task 3 gotcha).
-    fn cfg_with(dir: &PathBuf) -> Config {
+    fn cfg_with(dir: &Path) -> Config {
         Config {
             gemini: GeminiCfg {
                 usage_log: None,
@@ -730,7 +730,6 @@ mod tests {
     }
 
     const TIER_OK: &str = r#"{"currentTier":{"id":"standard-tier","name":"Standard","hasAcceptedTos":true,"hasOnboardedPreviously":true},"cloudaicompanionProject":"projects/12345"}"#;
-    const TIER_OK_NO_PROJECT: &str = r#"{"currentTier":{"id":"standard-tier","name":"Standard","hasAcceptedTos":true,"hasOnboardedPreviously":true}}"#;
     const QUOTA_OK: &str = r#"{"buckets":[
         {"modelId":"gemini-code-assist","tokenType":"code","remainingAmount":"500000","remainingFraction":0.5,"resetTime":"2026-08-12T00:00:00Z"}
     ]}"#;
@@ -1414,7 +1413,7 @@ mod tests {
         let marker_dir = temp_dir("configured-marker");
         fs::write(marker_dir.join("gemini-credentials.json"), b"iv:tag:enc").unwrap();
         let mut marker = Config::default();
-        marker.gemini.credentials = Some(marker_dir.join("oauth_creds.json").into());
+        marker.gemini.credentials = Some(marker_dir.join("oauth_creds.json"));
         assert!(
             Gemini.configured(&marker),
             "the encrypted marker still quota-configures Gemini for the diagnostic (FR-5.2)"
@@ -1423,7 +1422,7 @@ mod tests {
         let cred_dir = temp_dir("configured-creds");
         write_creds(&cred_dir, &fresh_creds());
         let mut creds = Config::default();
-        creds.gemini.credentials = Some(cred_dir.join("oauth_creds.json").into());
+        creds.gemini.credentials = Some(cred_dir.join("oauth_creds.json"));
         assert!(
             Gemini.configured(&creds),
             "a supported plaintext credential quota-configures Gemini (FR-5.2)"

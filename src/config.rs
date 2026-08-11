@@ -216,7 +216,7 @@ impl GeminiCfg {
         }
         let home = env("GEMINI_CLI_HOME")
             .map(PathBuf::from)
-            .or_else(|| dirs::home_dir())?;
+            .or_else(dirs::home_dir)?;
         Some(home.join(".gemini"))
     }
 
