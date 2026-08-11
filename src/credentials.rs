@@ -10,10 +10,17 @@
 //! Concurrency uses an llmu-only sibling lock
 //! (`<credential-filename>.llmu-refresh.lock`) acquired with
 //! `create_new`; llmu never creates, deletes, or claims compatibility
-//! with upstream CLI lock files (FR-4.7). Cross-tool safety therefore
-//! rests on the refresh-token compare-and-swap immediately before
-//! rename; the residual non-atomic check/rename race against writers
-//! that ignore the llmu lock is acknowledged rather than hidden (AD-2).
+//! with upstream CLI lock files (FR-4.7). The lock is acquired by
+//! `lock_and_read` and held for the WHOLE transaction — across the
+//! provider's refresh HTTP request and the persistence that follows
+//! (FR-4.3). Two llmu processes can therefore never use the same
+//! refresh token concurrently: the second blocks on the lock until the
+//! first has persisted or given up, then re-reads and adopts.
+//!
+//! Cross-tool safety rests on the refresh-token compare-and-swap
+//! immediately before rename; the residual non-atomic check/rename race
+//! against writers that ignore the llmu lock is acknowledged rather
+//! than hidden (AD-2).
 
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
@@ -76,15 +83,16 @@ pub struct CredentialSchema<'a> {
     pub validate: &'a dyn Fn(&Value) -> Result<()>,
 }
 
-/// What `replace_with_cas` did.
+/// What a persistence attempt did.
 #[derive(Debug)]
 pub enum ReplaceOutcome {
     /// The merged value was validated, written, and re-read successfully.
     Replaced { value: Value },
-    /// Under the lock the stored refresh token already differed from the
-    /// request token: another llmu process refreshed first. `value` is
-    /// the freshly re-read root so the caller can adopt the new token
-    /// and skip its own duplicate refresh (FR-4.3, AS-4).
+    /// Immediately before the rename the stored refresh token differed
+    /// from the locked snapshot's token: a writer that ignores the llmu
+    /// lock landed during this transaction. Nothing was overwritten;
+    /// `value` is the freshly re-read root so the caller can adopt it
+    /// and decide (AS-4).
     ChangedByOther { value: Value },
 }
 
@@ -141,7 +149,7 @@ fn is_stale(lock: &Path) -> bool {
 
 /// Secure credential read: names the path, never echoes content
 /// (FR-4.6). Providers use it for the pre-lock read that decides
-/// whether a refresh is needed.
+/// whether a refresh is worth attempting.
 pub fn read_json(path: &Path) -> Result<Value> {
     read_file_json(path, "reading")
 }
@@ -252,85 +260,110 @@ fn write_temp(dir: &Path, data: &[u8]) -> Result<PathBuf> {
     Ok(tmp)
 }
 
-/// The guarded credential transaction (FR-4.2 through FR-4.6):
-///
-/// 1. Acquire the llmu refresh lock.
-/// 2. Re-read under the lock. When the stored refresh token already
-///    differs from `expected_refresh_token`, another process refreshed
-///    first: return `ChangedByOther` with the fresh root and write
-///    nothing (FR-4.3 adoption seam).
-/// 3. Run the provider-owned `merge` on a fresh copy so every unknown
-///    top-level and nested field survives, then validate (FR-4.2, FR-4.6).
-/// 4. Write a unique same-directory `0600` temp file and flush it.
-/// 5. Re-read the target and compare its refresh token to
-///    `expected_refresh_token` (CAS, FR-4.4). Mismatch aborts with a
-///    concurrency diagnostic and the temp file is removed.
-/// 6. Rename over the target, then verify by re-reading the required
-///    fields (FR-4.5).
-///
-/// Any HTTP, JSON, validation, CAS, or persistence failure leaves the
-/// original file unchanged and never logs credential values (FR-4.6).
-/// The CAS/rename pair is atomic within llmu's lock; writers that
-/// ignore the llmu lock can still race the check/rename window — the
-/// residual race is acknowledged, not hidden (AD-2).
-pub fn replace_with_cas(
-    timing: &LockTiming,
-    path: &Path,
-    schema: &CredentialSchema,
-    expected_refresh_token: &str,
-    merge: impl FnOnce(&Value) -> Value,
-) -> Result<ReplaceOutcome> {
-    let _lock = acquire_lock(path, timing)?;
+/// Acquire the llmu refresh lock and re-read the credential file under
+/// it (FR-4.3). The returned `LockedCredential` owns the guard for its
+/// whole lifetime: a provider runs its refresh HTTP request while it
+/// lives, inspects the snapshot with `value()`, and then either drops
+/// it (an already-usable token needs no write) or consumes it with
+/// `replace_with_cas` to persist through the SAME guard. Because the
+/// lock is held before any provider work, a request-before-lock hazard
+/// is unrepresentable — two llmu processes can never refresh the same
+/// token concurrently.
+pub fn lock_and_read(timing: &LockTiming, path: &Path) -> Result<LockedCredential> {
+    let lock = acquire_lock(path, timing)?;
+    let value = read_file_json(path, "re-reading")?;
+    Ok(LockedCredential {
+        _lock: lock,
+        path: path.to_path_buf(),
+        value,
+    })
+}
 
-    // FR-4.3: re-read under the lock. When the stored refresh token
-    // already differs from the request token, another llmu process
-    // refreshed first — hand back the fresh root so the caller can
-    // adopt the new token and skip its duplicate refresh; write nothing.
-    let current = read_file_json(path, "re-reading")?;
-    let stored = (schema.refresh_token)(&current).context("no refresh token in credential file")?;
-    if stored != expected_refresh_token {
-        return Ok(ReplaceOutcome::ChangedByOther { value: current });
+/// A credential file read while the llmu refresh lock is held.
+#[derive(Debug)]
+pub struct LockedCredential {
+    _lock: RefreshLock,
+    path: PathBuf,
+    value: Value,
+}
+
+impl LockedCredential {
+    /// The parsed root object captured under the lock.
+    pub fn value(&self) -> &Value {
+        &self.value
     }
 
-    // FR-4.2: the provider-owned merge works on a fresh deep copy, so
-    // every unknown top-level and nested field survives by construction.
-    let merged = merge(&current);
-    (schema.validate)(&merged).context("merged credential failed provider validation")?;
+    /// Persist a provider-merged value through the same guard (FR-4.2
+    /// through FR-4.6). The expected refresh token is derived from the
+    /// locked snapshot, never from a caller-supplied value, so a stale
+    /// request token cannot be passed in by accident.
+    ///
+    /// Sequence: provider-owned `merge` on a fresh copy (unknown fields
+    /// survive), validate, unique same-directory `0600` temp write with
+    /// flush, CAS re-read immediately before rename, rename, post-rename
+    /// re-read and validate. A cross-tool writer that lands in the
+    /// check/rename window yields `ChangedByOther` with the fresh root
+    /// and nothing is overwritten. Any failure removes the temp file and
+    /// leaves the original unchanged; credential values never reach
+    /// diagnostics (FR-4.6).
+    pub fn replace_with_cas(
+        self,
+        schema: &CredentialSchema,
+        merge: impl FnOnce(&Value) -> Value,
+    ) -> Result<ReplaceOutcome> {
+        // The CAS expected value comes from the snapshot read under the
+        // lock — the caller cannot supply a pre-lock token that no
+        // longer matches (FR-4.3, FR-4.4).
+        let expected =
+            (schema.refresh_token)(&self.value).context("no refresh token in credential file")?;
 
-    // FR-4.5/4.6: validation precedes the temp file; then write a unique
-    // same-directory 0600 temp file and flush it before any replacement.
-    let mut data =
-        serde_json::to_vec_pretty(&merged).context("encoding merged credential as JSON")?;
-    data.push(b'\n');
-    let dir = path
-        .parent()
-        .context("credential path has no parent directory")?;
-    let tmp = write_temp(dir, &data)?;
-    let outcome = (|| -> Result<ReplaceOutcome> {
-        // FR-4.4: compare-and-swap immediately before replacement. The
-        // target may have changed since our under-lock re-read — writers
-        // that ignore the llmu lock can race this window, so the CAS
-        // aborts rather than overwrites (residual race, AD-2).
-        let fresh = read_file_json(path, "re-reading")?;
-        match (schema.refresh_token)(&fresh) {
-            Some(t) if t == expected_refresh_token => {}
-            _ => bail!(
-                "credential file changed by another writer; refresh aborted — no changes written"
-            ),
-        }
-        fs::rename(&tmp, path)
-            .with_context(|| format!("replacing credential file {}", path.display()))?;
-        // FR-4.5: verify by re-reading the required fields.
-        let on_disk = read_file_json(path, "re-reading")?;
-        (schema.validate)(&on_disk).context("post-write verification of credential file failed")?;
-        Ok(ReplaceOutcome::Replaced { value: on_disk })
-    })();
-    match outcome {
-        Ok(o) => Ok(o),
-        Err(e) => {
-            // FR-4.6: remove the temp file on every failure path.
-            let _ = fs::remove_file(&tmp);
-            Err(e)
+        // FR-4.2: the provider-owned merge works on a fresh deep copy, so
+        // every unknown top-level and nested field survives by construction.
+        let merged = merge(&self.value);
+        (schema.validate)(&merged).context("merged credential failed provider validation")?;
+
+        // FR-4.5/4.6: validation precedes the temp file; then write a unique
+        // same-directory 0600 temp file and flush it before any replacement.
+        let mut data =
+            serde_json::to_vec_pretty(&merged).context("encoding merged credential as JSON")?;
+        data.push(b'\n');
+        let dir = self
+            .path
+            .parent()
+            .context("credential path has no parent directory")?;
+        let tmp = write_temp(dir, &data)?;
+        let outcome = (|| -> Result<ReplaceOutcome> {
+            // FR-4.4: compare-and-swap immediately before replacement. The
+            // target may have changed since `lock_and_read` — writers that
+            // ignore the llmu lock can race this window, so the CAS
+            // returns `ChangedByOther` rather than overwriting (residual
+            // race, AD-2; AS-4 adoption).
+            let fresh = read_file_json(&self.path, "re-reading")?;
+            match (schema.refresh_token)(&fresh) {
+                Some(t) if t == expected => {}
+                _ => return Ok(ReplaceOutcome::ChangedByOther { value: fresh }),
+            }
+            fs::rename(&tmp, &self.path)
+                .with_context(|| format!("replacing credential file {}", self.path.display()))?;
+            // FR-4.5: verify by re-reading the required fields.
+            let on_disk = read_file_json(&self.path, "re-reading")?;
+            (schema.validate)(&on_disk)
+                .context("post-write verification of credential file failed")?;
+            Ok(ReplaceOutcome::Replaced { value: on_disk })
+        })();
+        match outcome {
+            Ok(o) => {
+                if !matches!(o, ReplaceOutcome::Replaced { .. }) {
+                    // FR-4.6: no write happened — remove the temp file.
+                    let _ = fs::remove_file(&tmp);
+                }
+                Ok(o)
+            }
+            Err(e) => {
+                // FR-4.6: remove the temp file on every failure path.
+                let _ = fs::remove_file(&tmp);
+                Err(e)
+            }
         }
     }
 }
@@ -342,7 +375,8 @@ mod tests {
     use std::cell::Cell;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime};
 
     static TEST_DIR_NONCE: AtomicU64 = AtomicU64::new(0);
@@ -417,13 +451,14 @@ mod tests {
                 "meta": {"unknown_inner": "keep", "known": "old"}
             }),
         );
-        let out = replace_with_cas(&default_timing(), &p, &schema(&always_ok), "T1", |v| {
+        let locked = lock_and_read(&default_timing(), &p).unwrap();
+        let out = locked.replace_with_cas(&schema(&always_ok), |v| {
             let mut m = v.clone();
             m["access_token"] = json!("NEW");
             m["meta"]["known"] = json!("new");
             m
-        })
-        .unwrap();
+        });
+        let out = out.unwrap();
         assert!(
             matches!(out, ReplaceOutcome::Replaced { .. }),
             "expected a successful replace"
@@ -447,13 +482,15 @@ mod tests {
     fn cas_success_replaces_with_verified_merged_value() {
         let dir = temp_dir("cas-ok");
         let p = write_creds(&dir, &json!({"refresh_token": "T1", "old": 1}));
-        let out = replace_with_cas(&default_timing(), &p, &schema(&always_ok), "T1", |v| {
-            let mut m = v.clone();
-            m["access_token"] = json!("NEW");
-            m["old"] = json!(2);
-            m
-        })
-        .unwrap();
+        let locked = lock_and_read(&default_timing(), &p).unwrap();
+        let out = locked
+            .replace_with_cas(&schema(&always_ok), |v| {
+                let mut m = v.clone();
+                m["access_token"] = json!("NEW");
+                m["old"] = json!(2);
+                m
+            })
+            .unwrap();
         let ReplaceOutcome::Replaced { value } = out else {
             panic!("expected replaced outcome");
         };
@@ -467,30 +504,37 @@ mod tests {
     }
 
     #[test]
-    fn cas_mismatch_aborts_and_preserves_foreign_write() {
-        let dir = temp_dir("cas-mismatch");
+    fn cross_tool_pre_rename_mismatch_returns_changed_by_other_without_overwrite() {
+        let dir = temp_dir("cross-tool");
         let p = write_creds(&dir, &json!({"refresh_token": "T1"}));
-        let err = replace_with_cas(&default_timing(), &p, &schema(&always_ok), "T1", |_v| {
-            // Simulate a writer that ignores the llmu lock landing between
-            // our under-lock re-read and the pre-replace CAS re-read: the
-            // merge closure runs exactly in that window.
-            fs::write(
-                &p,
-                serde_json::to_vec_pretty(&json!({"refresh_token": "T2", "access_token": "OTHER"}))
-                    .unwrap(),
-            )
+        let locked = lock_and_read(&default_timing(), &p).unwrap();
+        // The provider's refresh window: a writer that ignores the llmu
+        // lock rewrites the file while the guard is alive.
+        fs::write(
+            &p,
+            serde_json::to_vec_pretty(&json!({"refresh_token": "T2", "access_token": "OTHER"}))
+                .unwrap(),
+        )
+        .unwrap();
+        let out = locked
+            .replace_with_cas(&schema(&always_ok), |v| {
+                let mut m = v.clone();
+                m["access_token"] = json!("OURS");
+                m
+            })
             .unwrap();
-            json!({"refresh_token": "T1", "access_token": "OURS"})
-        })
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("changed by another writer"),
-            "mismatch must surface a concurrency diagnostic (FR-4.4): {err}"
+        let ReplaceOutcome::ChangedByOther { value } = out else {
+            panic!("a cross-tool token change must never be overwritten (AS-4)");
+        };
+        assert_eq!(
+            value["refresh_token"], "T2",
+            "the fresh root is offered for adoption"
         );
+        assert_eq!(value["access_token"], "OTHER");
         let on_disk = read_json(&p).unwrap();
         assert_eq!(
             on_disk["refresh_token"], "T2",
-            "the foreign write must be preserved"
+            "the cross-tool write must be preserved"
         );
         assert_eq!(
             on_disk["access_token"], "OTHER",
@@ -498,7 +542,11 @@ mod tests {
         );
         assert!(
             temp_files(&dir).is_empty(),
-            "the temp file must be removed after the CAS failure (FR-4.6)"
+            "the temp file must be removed after the CAS mismatch (FR-4.6)"
+        );
+        assert!(
+            !lock_path(&p).exists(),
+            "consuming the guard must release the lock"
         );
     }
 
@@ -533,12 +581,14 @@ mod tests {
         );
         fs::remove_file(&tmp).unwrap();
         let p = write_creds(&dir, &json!({"refresh_token": "T1"}));
-        replace_with_cas(&default_timing(), &p, &schema(&always_ok), "T1", |v| {
-            let mut m = v.clone();
-            m["access_token"] = json!("N");
-            m
-        })
-        .unwrap();
+        let locked = lock_and_read(&default_timing(), &p).unwrap();
+        locked
+            .replace_with_cas(&schema(&always_ok), |v| {
+                let mut m = v.clone();
+                m["access_token"] = json!("N");
+                m
+            })
+            .unwrap();
         let mode = fs::metadata(&p).unwrap().permissions().mode() & 0o777;
         assert_eq!(
             mode, 0o600,
@@ -559,12 +609,14 @@ mod tests {
             );
             Ok(())
         };
-        let out = replace_with_cas(&default_timing(), &p, &schema(&validate), "T1", |v| {
-            let mut m = v.clone();
-            m["access_token"] = json!("NEW");
-            m
-        })
-        .unwrap();
+        let locked = lock_and_read(&default_timing(), &p).unwrap();
+        let out = locked
+            .replace_with_cas(&schema(&validate), |v| {
+                let mut m = v.clone();
+                m["access_token"] = json!("NEW");
+                m
+            })
+            .unwrap();
         assert!(matches!(out, ReplaceOutcome::Replaced { .. }));
         assert_eq!(
             calls.get(),
@@ -580,12 +632,14 @@ mod tests {
         let p = write_creds(&dir, &json!({"refresh_token": "T1"}));
         let before = fs::read(&p).unwrap();
         let failing = |_v: &Value| -> Result<()> { bail!("missing provider-required field") };
-        let err = replace_with_cas(&default_timing(), &p, &schema(&failing), "T1", |v| {
-            let mut m = v.clone();
-            m["access_token"] = json!("NEW");
-            m
-        })
-        .unwrap_err();
+        let locked = lock_and_read(&default_timing(), &p).unwrap();
+        let err = locked
+            .replace_with_cas(&schema(&failing), |v| {
+                let mut m = v.clone();
+                m["access_token"] = json!("NEW");
+                m
+            })
+            .unwrap_err();
         assert!(
             format!("{err:#}").contains("missing provider-required field"),
             "validation failure must surface the provider-owned diagnostic, got: {err:#}"
@@ -598,6 +652,10 @@ mod tests {
         assert!(
             temp_files(&dir).is_empty(),
             "validation runs before the temp file is created (FR-4.6)"
+        );
+        assert!(
+            !lock_path(&p).exists(),
+            "consuming the guard must release the lock"
         );
     }
 
@@ -727,27 +785,134 @@ mod tests {
     }
 
     #[test]
-    fn changed_by_other_adopts_foreign_token_without_merge_or_write() {
-        let dir = temp_dir("adopt");
+    fn lock_and_read_acquires_lock_and_returns_locked_snapshot() {
+        let dir = temp_dir("lock-and-read");
+        let p = write_creds(&dir, &json!({"refresh_token": "T1"}));
+        let lock = lock_path(&p);
+        let locked = lock_and_read(&default_timing(), &p).unwrap();
+        assert!(
+            lock.exists(),
+            "lock_and_read must hold the llmu lock for the whole transaction (FR-4.3)"
+        );
+        assert_eq!(
+            locked.value()["refresh_token"],
+            "T1",
+            "the snapshot is the re-read taken under the lock"
+        );
+        let err = lock_and_read(&short_timing(), &p).unwrap_err();
+        assert!(
+            err.to_string().contains("timed out"),
+            "a second local refresher must be excluded while the guard is alive (FR-4.3): {err}"
+        );
+        drop(locked);
+        assert!(!lock.exists(), "dropping the guard must release the lock");
+        let _again = lock_and_read(&default_timing(), &p).unwrap();
+    }
+
+    #[test]
+    fn provider_inspects_current_json_while_guard_alive() {
+        let dir = temp_dir("inspect");
+        let p = write_creds(
+            &dir,
+            &json!({"refresh_token": "T1", "meta": {"unknown_inner": "keep"}}),
+        );
+        let locked = lock_and_read(&default_timing(), &p).unwrap();
+        let on_disk: Value =
+            serde_json::from_slice(&fs::read(&p).unwrap()).expect("fixture parses");
+        assert_eq!(
+            locked.value(),
+            &on_disk,
+            "the provider must see the current JSON while the guard is alive"
+        );
+        assert!(lock_path(&p).exists(), "the guard is still held");
+    }
+
+    #[test]
+    fn second_refresher_cannot_enter_network_section_until_first_guard_drops() {
+        let dir = temp_dir("network-section");
+        let p = write_creds(&dir, &json!({"refresh_token": "T1"}));
+        let guard = lock_and_read(&default_timing(), &p).unwrap();
+        let entered = Arc::new(AtomicBool::new(false));
+        let entered2 = entered.clone();
+        let path2 = p.clone();
+        let handle = std::thread::spawn(move || {
+            let locked = lock_and_read(
+                &LockTiming {
+                    retry_delay: Duration::from_millis(10),
+                    timeout: Duration::from_secs(1),
+                },
+                &path2,
+            )
+            .expect("second refresher acquires once the first guard drops");
+            // The simulated network-request section is only reachable
+            // after lock_and_read returns.
+            entered2.store(true, Ordering::SeqCst);
+            drop(locked);
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !entered.load(Ordering::SeqCst),
+            "the second refresher must not reach its network section while the first guard is alive (FR-4.3)"
+        );
+        drop(guard);
+        handle.join().unwrap();
+        assert!(
+            entered.load(Ordering::SeqCst),
+            "the second refresher must reach its network section after the first guard drops"
+        );
+        assert!(!lock_path(&p).exists(), "both guards are released");
+    }
+
+    #[test]
+    fn persistence_consumes_the_same_guard_without_reacquiring() {
+        let dir = temp_dir("same-guard");
+        let p = write_creds(&dir, &json!({"refresh_token": "T1"}));
+        let lock = lock_path(&p);
+        let locked = lock_and_read(&default_timing(), &p).unwrap();
+        assert!(
+            lock.exists(),
+            "the guard holds the lock across the simulated refresh HTTP window"
+        );
+        let out = locked
+            .replace_with_cas(&schema(&always_ok), |v| {
+                let mut m = v.clone();
+                m["access_token"] = json!("NEW");
+                m
+            })
+            .unwrap();
+        assert!(
+            matches!(out, ReplaceOutcome::Replaced { .. }),
+            "persistence through the same guard must succeed without re-acquiring the lock (re-acquisition would time out against its own lock file)"
+        );
+        assert!(
+            !lock.exists(),
+            "consuming the guard releases the lock only after persistence"
+        );
+    }
+
+    #[test]
+    fn already_usable_credentials_can_be_dropped_without_http_or_write() {
+        let dir = temp_dir("usable-drop");
         let p = write_creds(
             &dir,
             &json!({"refresh_token": "T2", "access_token": "ALREADY-NEW", "meta": {"k": "v"}}),
         );
         let before = fs::read(&p).unwrap();
-        let out = replace_with_cas(&default_timing(), &p, &schema(&always_ok), "T1", |_v| {
-            panic!("merge must not run when another process already changed the token")
-        })
-        .unwrap();
-        let ReplaceOutcome::ChangedByOther { value } = out else {
-            panic!("expected the duplicate-refresh adoption seam (FR-4.3)");
-        };
-        assert_eq!(value["refresh_token"], "T2");
-        assert_eq!(value["access_token"], "ALREADY-NEW");
+        let lock = lock_path(&p);
+        {
+            let locked = lock_and_read(&default_timing(), &p).unwrap();
+            let snapshot = locked.value();
+            assert_eq!(snapshot["refresh_token"], "T2");
+            assert_eq!(snapshot["access_token"], "ALREADY-NEW");
+            // Provider decides the token is already usable: no refresh
+            // HTTP, no persistence — dropping the guard is the whole cost.
+        }
         assert_eq!(
             fs::read(&p).unwrap(),
             before,
-            "adoption must never write the credential file"
+            "dropping without write must leave the file byte-identical"
         );
+        assert!(!lock.exists(), "dropping must release the llmu lock");
         assert!(temp_files(&dir).is_empty());
     }
 
@@ -756,34 +921,38 @@ mod tests {
         let dir = temp_dir("no-token");
         let p = write_creds(&dir, &json!({"access_token": "x"}));
         let before = fs::read(&p).unwrap();
-        let err = replace_with_cas(&default_timing(), &p, &schema(&always_ok), "T1", |v| {
-            v.clone()
-        })
-        .unwrap_err();
+        let locked = lock_and_read(&default_timing(), &p).unwrap();
+        let err = locked
+            .replace_with_cas(&schema(&always_ok), |v| v.clone())
+            .unwrap_err();
         assert!(
-            err.to_string().contains("no refresh token"),
-            "unsupported credentials must fail without mutation (FR-4.1): {err}"
+            format!("{err:#}").contains("no refresh token"),
+            "credentials without the provider-required refresh field must fail without mutation (FR-4.1): {err:#}"
         );
         assert_eq!(fs::read(&p).unwrap(), before);
         assert!(temp_files(&dir).is_empty());
+        assert!(
+            !lock_path(&p).exists(),
+            "consuming the guard must release the lock"
+        );
     }
 
     #[test]
     fn errors_and_read_failures_never_expose_token_values() {
         let dir = temp_dir("no-secrets");
         let p = write_creds(&dir, &json!({"refresh_token": "T1"}));
-        let err = replace_with_cas(&default_timing(), &p, &schema(&always_ok), "T1", |_v| {
-            fs::write(
-                &p,
-                serde_json::to_vec_pretty(&json!({"refresh_token": "T2"})).unwrap(),
-            )
-            .unwrap();
-            json!({"refresh_token": "T1"})
-        })
-        .unwrap_err();
-        let msg = err.to_string();
+        let failing = |_v: &Value| -> Result<()> { bail!("validation failed") };
+        let locked = lock_and_read(&default_timing(), &p).unwrap();
+        let err = locked
+            .replace_with_cas(&schema(&failing), |v| {
+                let mut m = v.clone();
+                m["access_token"] = json!("TOK-1");
+                m
+            })
+            .unwrap_err();
+        let msg = format!("{err:#}");
         assert!(
-            !msg.contains("T1") && !msg.contains("T2"),
+            !msg.contains("T1") && !msg.contains("TOK-1"),
             "diagnostics must never carry token values (FR-4.6): {msg}"
         );
 
@@ -798,12 +967,9 @@ mod tests {
             !err.to_string().contains("not json"),
             "read errors must name the path, never echo content"
         );
-        let err = replace_with_cas(&default_timing(), &bad, &schema(&always_ok), "T1", |v| {
-            v.clone()
-        })
-        .unwrap_err();
+        let locked = lock_and_read(&default_timing(), &bad).unwrap_err();
         assert!(
-            !err.to_string().contains("not json"),
+            !locked.to_string().contains("not json"),
             "transaction read errors must not echo content"
         );
         assert!(temp_files(&dir).is_empty());

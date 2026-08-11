@@ -5,6 +5,13 @@
 //! `tests/http_cache.rs` pattern) so Tasks 4/5 cannot drift the shape they
 //! depend on. It fails because the contract does not exist yet: no
 //! `mod credentials;`, no shared credential transaction API, no llmu lock.
+//!
+//! Revision (concurrency follow-up): the transaction API must be the
+//! opaque lock-holder `LockedCredential` returned by `lock_and_read`, so
+//! the llmu lock is held ACROSS the provider's refresh HTTP request
+//! (FR-4.3). A module-level free `replace_with_cas` entry point that
+//! acquires the lock only at persistence time is prohibited: it would let
+//! two processes refresh the same token concurrently.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -27,13 +34,14 @@ fn main_wires_the_shared_credentials_module() {
 }
 
 #[test]
-fn credentials_module_exposes_transaction_api() {
+fn credentials_module_exposes_locked_transaction_api() {
     let c = read("src/credentials.rs");
     for needle in [
         "pub struct CredentialSchema",
         "pub struct LockTiming",
         "pub enum ReplaceOutcome",
-        "pub fn replace_with_cas",
+        "pub struct LockedCredential",
+        "pub fn lock_and_read",
         "pub fn read_json",
         "pub const LOCK_SUFFIX",
     ] {
@@ -45,6 +53,40 @@ fn credentials_module_exposes_transaction_api() {
     assert!(
         c.contains(".llmu-refresh.lock"),
         "the sibling lock must carry the llmu-only suffix `<credential-filename>.llmu-refresh.lock` (FR-4.7)"
+    );
+}
+
+#[test]
+fn locked_credential_is_opaque_with_value_and_consuming_replace() {
+    let c = read("src/credentials.rs");
+    assert!(
+        c.contains("impl LockedCredential"),
+        "the transaction API must hang off the opaque lock holder (no free functions)"
+    );
+    assert!(
+        c.contains("pub fn value("),
+        "a provider must inspect the locked snapshot via `value()` while the guard is alive"
+    );
+    assert!(
+        c.contains("pub fn replace_with_cas(\n        self,"),
+        "persistence must consume the SAME lock guard (`self` first parameter) — never re-acquire (FR-4.3)"
+    );
+}
+
+#[test]
+fn free_request_before_lock_replace_entry_point_is_forbidden() {
+    let c = read("src/credentials.rs");
+    assert!(
+        !c.contains("\npub fn replace_with_cas("),
+        "a module-level free replace_with_cas would let a provider send the refresh HTTP request BEFORE acquiring the llmu lock (FR-4.3); the only entry points are `lock_and_read` and `LockedCredential::replace_with_cas`"
+    );
+    assert!(
+        !c.contains("expected_refresh_token"),
+        "callers must never pass a pre-lock expected token — it is derived from the locked snapshot"
+    );
+    assert!(
+        c.contains("lock_and_read(timing"),
+        "the lock must be acquired with the caller-supplied timing at `lock_and_read`, before any provider work"
     );
 }
 
