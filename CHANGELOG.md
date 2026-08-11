@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-08-11
+
 ### Fixed
 
 - Live watch mode now renders quota rows beyond the first six when terminal
