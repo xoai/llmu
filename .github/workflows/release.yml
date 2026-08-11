@@ -1,0 +1,363 @@
+name: release
+
+# Release automation for llmu.
+#
+# A push to the default branch runs Release Please v4 (manifest-driven, Rust
+# release type). Release Please maintains a single release PR as a DRAFT;
+# before the action runs, this job captures any existing open
+# `autorelease: pending` PR (number + head branch) and converts it back to
+# draft so nothing can merge before the changelog finalizer lands. The job
+# then checks out the resolved release-PR head branch — the action-returned
+# PR's branch when Release Please created/updated one, the captured pending
+# PR's branch otherwise — re-runs the checked-in changelog finalizer against
+# the branch's updated Cargo.toml, pushes back the changed CHANGELOG.md as
+# github-actions[bot], and only then marks the resolved PR number ready for
+# review, including on chore-only pushes that leave the pending PR untouched.
+# Merging the PR makes Release Please force-create the vX.Y.Z git tag and a
+# draft GitHub Release in the same workflow run; resolve-release then names
+# that tag, the build matrix compiles five platform archives (each carrying
+# the MIT LICENSE flat beside the binary) plus SHA-256 checksums from it,
+# and the publish job derives the expected asset counts from the matrix
+# itself, attaches all files to the draft, installs the canonical changelog
+# notes, and publishes the release only after every upload succeeds.
+#
+# Manual recovery: workflow_dispatch requires the `tag` input naming an
+# existing vX.Y.Z release. resolve-release validates the strict tag format
+# and a git-level tag lookup only; the publish job then verifies the
+# matching GitHub Release with its write-scoped token before downloading
+# artifacts. Reruns converge after partial uploads via clobber semantics
+# and never create a second version.
+#
+# No publication to the crates registry happens anywhere in this workflow.
+# Only the repository GITHUB_TOKEN is referenced.
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          Existing vX.Y.Z tag whose release assets must be rebuilt and
+          republished (recovery path). Must be an existing git tag and
+          GitHub Release.
+        required: true
+        type: string
+
+# Least-privilege default: every job starts with read-only contents; only
+# the release-please and publish jobs widen their own permissions.
+permissions:
+  contents: read
+
+# Per-ref serialization so a recovery run and a release run never race;
+# never cancel a run that is already publishing.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # The release-please job maintains the single release PR: it captures any
+  # open pending PR (number + head branch) and drafts it before the action,
+  # then finalizes the resolved PR branch and readies that same PR only
+  # after the finalizer commit lands — whether the action returned the PR
+  # or it was captured before the action.
+  release-please:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      # Default lifecycle labels (autorelease: pending / ready) are managed
+      # through the Issues API, so this job must keep issues: write even
+      # though the workflow default is contents: read.
+      issues: write
+    outputs:
+      release_created: ${{ steps.release-please.outputs.release_created }}
+      tag_name: ${{ steps.release-please.outputs.tag_name }}
+    steps:
+      - name: Capture and draft any open pending release PR
+        id: pending-pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          json="$(gh pr list --label "autorelease: pending" --state open --json number,headRefName,isDraft --jq '.[0] // empty')"
+          if [ -n "$json" ]; then
+            number="$(jq -r '.number' <<<"$json")"
+            branch="$(jq -r '.headRefName' <<<"$json")"
+            is_draft="$(jq -r '.isDraft' <<<"$json")"
+            if [ "$is_draft" != "true" ]; then
+              gh pr ready "$number" --undo
+              echo "reverted release PR #$number to draft until the changelog finalizer lands"
+            fi
+          else
+            number=""
+            branch=""
+          fi
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+      - id: release-please
+        uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout release PR head branch
+        if: steps.release-please.outputs.prs_created == 'true' || steps.pending-pr.outputs.number != ''
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.release-please.outputs.prs_created == 'true' && fromJSON(steps.release-please.outputs.prs)[0].headBranchName || steps.pending-pr.outputs.branch }}
+          fetch-depth: 0
+
+      - name: Configure github-actions[bot] author
+        if: steps.release-please.outputs.prs_created == 'true' || steps.pending-pr.outputs.number != ''
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Finalize changelog on release PR branch
+        if: steps.release-please.outputs.prs_created == 'true' || steps.pending-pr.outputs.number != ''
+        run: python3 scripts/finalize_changelog.py finalize --changelog CHANGELOG.md --cargo Cargo.toml
+
+      - name: Commit and push finalized CHANGELOG
+        if: steps.release-please.outputs.prs_created == 'true' || steps.pending-pr.outputs.number != ''
+        env:
+          # Same resolution as the checkout `ref:`: the action-returned PR
+          # branch when prs_created, the pre-action capture otherwise.
+          BRANCH: ${{ steps.release-please.outputs.prs_created == 'true' && fromJSON(steps.release-please.outputs.prs)[0].headBranchName || steps.pending-pr.outputs.branch }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet CHANGELOG.md; then
+            echo "CHANGELOG.md unchanged; nothing to push"
+          else
+            git add CHANGELOG.md
+            git commit -m "chore: finalize changelog for release"
+            git push origin "HEAD:$BRANCH"
+          fi
+
+      - name: Mark release PR ready for review
+        if: steps.release-please.outputs.prs_created == 'true' || steps.pending-pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The action's `pr` output is a JSON object; the PR number comes
+          # from the `prs` JSON array when the action returned a PR, or from
+          # the pre-action capture when it did not.
+          PR_NUMBER: ${{ steps.release-please.outputs.prs_created == 'true' && fromJSON(steps.release-please.outputs.prs)[0].number || steps.pending-pr.outputs.number }}
+        run: |
+          set -euo pipefail
+          if [ -n "$PR_NUMBER" ] && gh pr view "$PR_NUMBER" --json isDraft --jq .isDraft | grep -qx true; then
+            gh pr ready "$PR_NUMBER"
+            echo "release PR #$PR_NUMBER marked ready; finalized changelog is on the branch"
+          fi
+
+  resolve-release:
+    needs: release-please
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve and validate release tag
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_CREATED: ${{ needs.release-please.outputs.release_created }}
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+          MANUAL_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          resolve() {
+            local candidate="$1"
+            if [[ ! "$candidate" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "error: tag '$candidate' fails the strict ^v[0-9]+\.[0-9]+\.[0-9]+$ format check" >&2
+              exit 1
+            fi
+            if ! git rev-parse --verify "refs/tags/$candidate" >/dev/null 2>&1; then
+              echo "error: git tag '$candidate' does not exist in the repository" >&2
+              exit 1
+            fi
+            echo "tag=$candidate" >> "$GITHUB_OUTPUT"
+          }
+          case "$EVENT_NAME" in
+            push)
+              if [ "$RELEASE_CREATED" != "true" ]; then
+                echo "no release created by release-please; binary jobs skipped"
+                echo "tag=" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              resolve "$RELEASE_TAG"
+              ;;
+            workflow_dispatch)
+              if [ -z "$MANUAL_TAG" ]; then
+                echo "error: manual recovery requires the 'tag' input" >&2
+                exit 1
+              fi
+              resolve "$MANUAL_TAG"
+              ;;
+            *)
+              echo "unsupported event; binary jobs skipped"
+              echo "tag=" >> "$GITHUB_OUTPUT"
+              exit 0
+          esac
+
+  build:
+    needs: resolve-release
+    if: needs.resolve-release.outputs.tag != ''
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+    steps:
+      - name: Checkout exact release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-release.outputs.tag }}
+
+      - name: Install musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package archive and checksum (Linux / macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TAG: ${{ needs.resolve-release.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          NAME="llmu-$TAG-$TARGET"
+          cp LICENSE "target/$TARGET/release/LICENSE"
+          tar -C "target/$TARGET/release" -czf "$NAME.tar.gz" llmu LICENSE
+          shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+
+      - name: Package archive and checksum (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TAG: ${{ needs.resolve-release.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $name = "llmu-$env:TAG-$env:TARGET"
+          Copy-Item LICENSE -Destination "target/$env:TARGET/release/LICENSE"
+          Compress-Archive -Path "target/$env:TARGET/release/llmu.exe","target/$env:TARGET/release/LICENSE" -DestinationPath "$name.zip"
+          (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower() + "  $name.zip" | Out-File -Encoding ascii "$name.zip.sha256"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llmu-${{ matrix.target }}
+          path: |
+            llmu-*.tar.gz*
+            llmu-*.zip*
+          if-no-files-found: error
+
+  publish:
+    needs: [resolve-release, build]
+    if: needs.resolve-release.outputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-release.outputs.tag }}
+
+      - name: Verify release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.resolve-release.outputs.tag }}
+        run: gh release view "$TAG"
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Validate release assets and checksums
+        shell: bash
+        env:
+          # One archive + one adjacent checksum per matrix leg; kept in
+          # lockstep with the matrix by the release_automation contract
+          # test (TARGET_TRIPLES.len()).
+          EXPECTED_TARGETS: 5
+        run: |
+          set -euo pipefail
+          expected_total=$((EXPECTED_TARGETS * 2))
+          total="$(find dist -type f | wc -l)"
+          if [ "$total" -eq "$expected_total" ]; then
+            echo "ok: found $total assets in dist/"
+          else
+            echo "error: expected exactly $expected_total assets (${EXPECTED_TARGETS} archives + ${EXPECTED_TARGETS} checksums), found $total" >&2
+            find dist -type f >&2
+            exit 1
+          fi
+          archives="$(find dist -type f ! -name '*.sha256' | wc -l)"
+          checksums="$(find dist -type f -name '*.sha256' | wc -l)"
+          if [ "$archives" -eq "$EXPECTED_TARGETS" ] && [ "$checksums" -eq "$EXPECTED_TARGETS" ]; then
+            echo "ok: $archives archives and $checksums adjacent checksums"
+          else
+            echo "error: expected $EXPECTED_TARGETS archives and $EXPECTED_TARGETS checksums, found $archives and $checksums" >&2
+            exit 1
+          fi
+          for archive in dist/*.tar.gz dist/*.zip; do
+            if [ ! -f "$archive.sha256" ]; then
+              echo "error: archive $archive is missing its adjacent .sha256 checksum" >&2
+              exit 1
+            fi
+          done
+          cd dist
+          for checksum in *.sha256; do
+            sha256sum -c "$checksum"
+          done
+
+      - name: Extract canonical changelog notes
+        shell: bash
+        env:
+          TAG: ${{ needs.resolve-release.outputs.tag }}
+        run: |
+          python3 scripts/finalize_changelog.py extract --version "${TAG#v}" --changelog CHANGELOG.md > release-notes.md
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.resolve-release.outputs.tag }}
+        run: gh release upload "$TAG" dist/* --clobber
+
+      - name: Replace draft release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.resolve-release.outputs.tag }}
+        run: gh release edit "$TAG" --notes-file release-notes.md
+
+      - name: Publish the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.resolve-release.outputs.tag }}
+        run: gh release edit "$TAG" --draft=false

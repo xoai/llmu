@@ -1,0 +1,27 @@
+# Rust
+/target
+
+# Tool configs (local, may contain machine-specific settings)
+.claude/
+.opencode/
+CLAUDE.md
+AGENTS.md
+.mcp.json
+opencode.json
+
+# Sage
+.sage/
+.sage-memory/
+.sage-wiki/
+sage/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Build
+/sage-wiki
+bin/
