@@ -9,7 +9,7 @@
 //! cached input tokens are counted (there is no cache-write charge). The
 //! cost endpoint may be unavailable on some org types — that break is
 //! silent by design (see `collect_billed`).
-use super::Provider;
+use super::{FetchContext, Provider};
 use crate::{config::Config, http, types::*};
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
@@ -29,7 +29,13 @@ impl Provider for OpenAi {
         "usage (tokens/model/day incl. cached) + billed cost via org Usage/Costs API"
     }
 
-    fn usage(&self, cfg: &Config, since: DateTime<Utc>, until: DateTime<Utc>) -> Result<Fetch> {
+    fn usage(
+        &self,
+        cfg: &Config,
+        ctx: &FetchContext,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<Fetch> {
         let key = cfg.openai.key().context("no OpenAI admin key")?;
         let auth = format!("Bearer {key}");
         let hdrs: &[(&str, &str)] = &[("Authorization", &auth)];
@@ -46,7 +52,7 @@ impl Provider for OpenAi {
             if let Some(p) = &page {
                 url.push_str(&format!("&page={p}"));
             }
-            let v = http::get_json(&url, hdrs)?;
+            let v = http::get_json_cached(&ctx.cache, ctx.fresh, &url, hdrs)?.body;
             for bucket in v["data"].as_array().unwrap_or(&vec![]) {
                 let start = bucket["start_time"]
                     .as_i64()
@@ -91,7 +97,7 @@ impl Provider for OpenAi {
             if let Some(p) = page {
                 url.push_str(&format!("&page={p}"));
             }
-            http::get_json(&url, hdrs)
+            http::get_json_cached(&ctx.cache, ctx.fresh, &url, hdrs).map(|c| c.body)
         });
 
         Ok(fetch)

@@ -1,4 +1,4 @@
-use super::{Provider, QuotaFetch};
+use super::{FetchContext, Provider, QuotaFetch};
 use crate::config::expand_tilde;
 use crate::credentials::{self, CredentialSchema, LockTiming, ReplaceOutcome};
 use crate::{config::Config, http, types::*};
@@ -380,7 +380,15 @@ impl Provider for Gemini {
         "local usageMetadata JSONL; Code Assist live quotas via Gemini CLI OAuth credentials (refresh-only writes)"
     }
 
-    fn usage(&self, cfg: &Config, since: DateTime<Utc>, until: DateTime<Utc>) -> Result<Fetch> {
+    fn usage(
+        &self,
+        cfg: &Config,
+        _ctx: &FetchContext,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<Fetch> {
+        // Task 7 signature adaptation: Gemini usage is a local JSONL read
+        // and stays cache-ineligible (plan Task 7).
         let Some(path) = &cfg.gemini.usage_log else {
             return Ok(Fetch::default());
         };
@@ -448,7 +456,7 @@ impl Provider for Gemini {
         Ok(fetch)
     }
 
-    fn quotas(&self, cfg: &Config) -> Result<QuotaFetch> {
+    fn quotas(&self, cfg: &Config, _ctx: &FetchContext) -> Result<QuotaFetch> {
         self.quotas_with_endpoints(cfg, &GeminiEndpoints::default())
     }
 }
@@ -456,6 +464,8 @@ impl Provider for Gemini {
 impl Gemini {
     /// Quota flow against an endpoint bundle (AD-4). Production calls the
     /// pinned endpoints via `Provider::quotas`; tests inject local servers.
+    /// Task 7 signature adaptation: every Gemini API call is a POST and
+    /// remains cache-ineligible (plan Task 7).
     fn quotas_with_endpoints(&self, cfg: &Config, ep: &GeminiEndpoints) -> Result<QuotaFetch> {
         let Some(path) = cfg.gemini.credentials_path() else {
             // FR-5.2 / AS-2: the encrypted-store marker is diagnosed and
@@ -1450,7 +1460,9 @@ mod tests {
             },
             ..Default::default()
         };
-        let err = Gemini.usage(&cfg, Utc::now(), Utc::now()).unwrap_err();
+        let err = Gemini
+            .usage(&cfg, &FetchContext::default(), Utc::now(), Utc::now())
+            .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("usage_log"),

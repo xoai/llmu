@@ -7,7 +7,7 @@
 //! `granted_balance`, `topped_up_balance` and `currency`. There is no
 //! usage-history endpoint, so llmu snapshots the balance on every run
 //! and store.rs derives daily spend from day-over-day deltas.
-use super::Provider;
+use super::{FetchContext, Provider};
 use crate::{config::Config, http, types::*};
 use anyhow::{Context, Result};
 
@@ -24,16 +24,19 @@ impl Provider for DeepSeek {
         "balance only (no usage-history API); llmu snapshots balances to derive daily spend"
     }
 
-    fn balances(&self, cfg: &Config) -> Result<Vec<BalanceSnapshot>> {
+    fn balances(&self, cfg: &Config, ctx: &FetchContext) -> Result<Vec<BalanceSnapshot>> {
         let key = cfg
             .deepseek
             .key_or(&["DEEPSEEK_API_KEY"])
             .context("no DeepSeek key")?;
         let auth = format!("Bearer {key}");
-        let v = http::get_json(
+        let v = http::get_json_cached(
+            &ctx.cache,
+            ctx.fresh,
             "https://api.deepseek.com/user/balance",
             &[("Authorization", &auth), ("Accept", "application/json")],
-        )?;
+        )?
+        .body;
         let mut out = vec![];
         for b in v["balance_infos"].as_array().unwrap_or(&vec![]) {
             let f = |k: &str| -> f64 {

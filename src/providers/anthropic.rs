@@ -10,7 +10,7 @@
 //! 404s on some org types —
 //! that break is silent by design (see `collect_billed`). Amounts may
 //! arrive as numbers, decimal strings, or `{"amount": ...}`.
-use super::Provider;
+use super::{FetchContext, Provider};
 use crate::{config::Config, http, types::*};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -48,7 +48,13 @@ impl Provider for Anthropic {
         "usage (tokens/model/day) + billed cost via Admin API; local Claude Code logs handled separately"
     }
 
-    fn usage(&self, cfg: &Config, since: DateTime<Utc>, until: DateTime<Utc>) -> Result<Fetch> {
+    fn usage(
+        &self,
+        cfg: &Config,
+        ctx: &FetchContext,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<Fetch> {
         let key = cfg.anthropic.key().context("no Anthropic admin key")?;
         let hdrs: &[(&str, &str)] = &[("x-api-key", &key), ("anthropic-version", "2023-06-01")];
         let mut fetch = Fetch::default();
@@ -64,7 +70,7 @@ impl Provider for Anthropic {
             if let Some(p) = &page {
                 url.push_str(&format!("&page={p}"));
             }
-            let v = http::get_json(&url, hdrs)?;
+            let v = http::get_json_cached(&ctx.cache, ctx.fresh, &url, hdrs)?.body;
             for bucket in v["data"].as_array().unwrap_or(&vec![]) {
                 let start = bucket["starting_at"]
                     .as_str()
@@ -125,7 +131,7 @@ impl Provider for Anthropic {
             if let Some(p) = page {
                 url.push_str(&format!("&page={p}"));
             }
-            http::get_json(&url, hdrs)
+            http::get_json_cached(&ctx.cache, ctx.fresh, &url, hdrs).map(|c| c.body)
         });
 
         Ok(fetch)

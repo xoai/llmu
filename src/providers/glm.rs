@@ -1,4 +1,4 @@
-use super::{Provider, QuotaFetch};
+use super::{FetchContext, Provider, QuotaFetch};
 use crate::{config::Config, http, types::*};
 use anyhow::Result;
 use chrono::{DateTime, TimeZone, Utc};
@@ -42,7 +42,13 @@ impl Provider for Glm {
     /// response shape is unconfirmed in the wild, so parsing is
     /// shape-tolerant and failures produce an actionable note instead of
     /// silence — an LLMU_DEBUG=1 dump is enough to pin the real schema.
-    fn usage(&self, cfg: &Config, since: DateTime<Utc>, until: DateTime<Utc>) -> Result<Fetch> {
+    fn usage(
+        &self,
+        cfg: &Config,
+        ctx: &FetchContext,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<Fetch> {
         let key = match cfg.glm.key() {
             Some(k) => k,
             None => return Ok(Fetch::default()),
@@ -61,13 +67,16 @@ impl Provider for Glm {
             fmt(since),
             fmt(until)
         );
-        let v = http::get_json(
+        let v = http::get_json_cached(
+            &ctx.cache,
+            ctx.fresh,
             &url,
             &[
                 ("Authorization", key.as_str()),
                 ("Accept", "application/json"),
             ],
-        )?;
+        )?
+        .body;
         if v["success"].as_bool() == Some(false) {
             let msg = v["msg"].as_str().unwrap_or("");
             if msg.to_lowercase().contains("coding plan") {
@@ -150,19 +159,26 @@ impl Provider for Glm {
         })
     }
 
-    fn quotas(&self, cfg: &Config) -> Result<QuotaFetch> {
+    fn quotas(&self, cfg: &Config, ctx: &FetchContext) -> Result<QuotaFetch> {
         let key = match cfg.glm.key() {
             Some(k) => k,
             None => return Ok(QuotaFetch::default()),
         };
         let base = cfg.glm.base();
-        let v = http::get_json(
+        let quota_cj = http::get_json_cached(
+            &ctx.cache,
+            ctx.fresh,
             &format!("{base}/api/monitor/usage/quota/limit"),
             &[
                 ("Authorization", key.as_str()),
                 ("Accept", "application/json"),
             ],
         )?;
+        // A cached-origin response underlying the emitted snapshots must
+        // never re-age the last-known-good cache (FR-3.10): track every
+        // remote GET's origin.
+        let mut all_live = quota_cj.origin == http::CacheOrigin::Live;
+        let v = quota_cj.body;
 
         // Valid key without a Coding Plan: {"success":false,"code":500,"msg":"...coding plan..."}
         if v["success"].as_bool() == Some(false) {
@@ -174,21 +190,29 @@ impl Provider for Glm {
         }
 
         // Plan name is best-effort; failures must not blank the meters.
-        let plan = http::get_json(
+        // A cached plan response still counts toward provenance: the plan
+        // label rides inside the emitted snapshots.
+        let plan_fetch = http::get_json_cached(
+            &ctx.cache,
+            ctx.fresh,
             &format!("{base}/api/biz/subscription/list"),
             &[
                 ("Authorization", key.as_str()),
                 ("Accept", "application/json"),
             ],
         )
-        .ok()
-        .and_then(|s| {
-            s["data"].as_array().and_then(|a| {
-                a.iter()
-                    .find_map(|e| e["productName"].as_str().map(String::from))
+        .ok();
+        if let Some(pf) = &plan_fetch {
+            all_live &= pf.origin == http::CacheOrigin::Live;
+        }
+        let plan = plan_fetch
+            .and_then(|s| {
+                s.body["data"].as_array().and_then(|a| {
+                    a.iter()
+                        .find_map(|e| e["productName"].as_str().map(String::from))
+                })
             })
-        })
-        .unwrap_or_else(|| "GLM Coding Plan".into());
+            .unwrap_or_else(|| "GLM Coding Plan".into());
 
         let limits = v["data"]["limits"]
             .as_array()
@@ -203,7 +227,11 @@ impl Provider for Glm {
                  (payload drift?) — rerun with LLMU_DEBUG=1 to see the raw response"
             );
         }
-        Ok(QuotaFetch::live(out))
+        Ok(QuotaFetch {
+            snapshots: out,
+            notes: vec![],
+            refresh_last_known_good: all_live,
+        })
     }
 }
 
@@ -283,6 +311,97 @@ pub(crate) fn parse_limits(limits: &[serde_json::Value], plan: &str) -> Vec<Quot
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+
+    static TEST_DIR_NONCE: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nonce = TEST_DIR_NONCE.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!(
+            "llmu-glm-test-{}-{}-{nonce}",
+            std::process::id(),
+            name
+        ));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// Local HTTP fixture: serves one response per expected request and
+    /// counts connections, so a cache hit can be proven network-free.
+    struct CounterServer {
+        url: String,
+        hits: Arc<AtomicUsize>,
+    }
+
+    impl CounterServer {
+        fn start(responses: Vec<(u16, &'static str)>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let hits = Arc::new(AtomicUsize::new(0));
+            let h2 = hits.clone();
+            thread::spawn(move || {
+                for (code, body) in responses {
+                    let (mut sock, _) = listener.accept().unwrap();
+                    let mut buf: Vec<u8> = vec![];
+                    let mut tmp = [0u8; 4096];
+                    loop {
+                        let n = sock.read(&mut tmp).unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    h2.fetch_add(1, Ordering::SeqCst);
+                    let reason = match code {
+                        200 => "OK",
+                        _ => "X",
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    sock.write_all(resp.as_bytes()).unwrap();
+                }
+            });
+            Self {
+                url: format!("http://{addr}"),
+                hits,
+            }
+        }
+
+        fn hits(&self) -> usize {
+            self.hits.load(Ordering::SeqCst)
+        }
+    }
+
+    const QUOTA_LIMIT_OK: &str = r#"{"code":200,"data":{"limits":[
+      {"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":28000,"currentValue":4715,"remaining":23284,"percentage":16,"nextResetTime":1786361041347},
+      {"type":"CREDIT_LIMIT","unit":6,"number":1,"usage":140000,"currentValue":83774,"remaining":56225,"percentage":59,"nextResetTime":1786773609998}
+    ],"level":"max"},"success":true}"#;
+    const PLAN_OK: &str = r#"{"data":[{"productName":"GLM Coding Max"}]}"#;
+    const MODEL_USAGE_OK: &str = r#"{"success":true,"data":{"models":[
+      {"modelName":"glm-4.6","inputTokens":100,"outputTokens":50,"calls":2,"date":1754000000000}
+    ]}}"#;
+
+    fn ctx_with_cache(dir: &Path) -> FetchContext {
+        FetchContext {
+            cache: http::CacheOptions {
+                dir: Some(dir.to_path_buf()),
+                ttl_seconds: 3600,
+            },
+            ..Default::default()
+        }
+    }
 
     /// Real GLM Coding Max payload observed 2026-08-10.
     #[test]
@@ -311,5 +430,52 @@ mod tests {
         assert_eq!(w(6, 1), "1w");
         assert_eq!(w(6, 3), "3w");
         assert_eq!(w(3, 5), "5h");
+    }
+
+    /// Task 7 (RED): a raw TTL cache hit on the quota/limit GET (and the
+    /// best-effort plan GET) must never mark the emitted snapshots for
+    /// last-known-good refresh (FR-3.10, AS-7): the second run is
+    /// network-free and reports the marker false. The local fixture is
+    /// reachable through the existing `[glm] base_url` override.
+    #[test]
+    fn quota_cache_hit_never_marks_last_known_good_refresh() {
+        let srv = CounterServer::start(vec![(200, QUOTA_LIMIT_OK), (200, PLAN_OK)]);
+        let mut cfg = Config::default();
+        cfg.glm.api_key = Some("G-1".into());
+        cfg.glm.base_url = Some(srv.url.clone());
+        let ctx = ctx_with_cache(&temp_dir("glm-quota-cache"));
+
+        let first = Glm.quotas(&cfg, &ctx).unwrap();
+        assert!(first.refresh_last_known_good);
+        assert_eq!(first.snapshots.len(), 2);
+        assert_eq!(first.snapshots[0].plan, "GLM Coding Max");
+        assert_eq!(srv.hits(), 2);
+
+        let second = Glm.quotas(&cfg, &ctx).unwrap();
+        assert_eq!(second.snapshots.len(), 2);
+        assert!(
+            !second.refresh_last_known_good,
+            "a quota cache hit must never re-age last-known-good (FR-3.10)"
+        );
+        assert_eq!(srv.hits(), 2, "the second run must be network-free");
+    }
+
+    /// Task 7 (RED): the model-usage GET also opts into the raw cache —
+    /// a second run within the TTL performs no network request.
+    #[test]
+    fn model_usage_get_is_cached_between_runs() {
+        let srv = CounterServer::start(vec![(200, MODEL_USAGE_OK)]);
+        let mut cfg = Config::default();
+        cfg.glm.api_key = Some("G-2".into());
+        cfg.glm.base_url = Some(srv.url.clone());
+        let ctx = ctx_with_cache(&temp_dir("glm-usage-cache"));
+        let since = Utc.timestamp_opt(1754000000, 0).single().unwrap();
+        let until = since + chrono::Duration::days(1);
+
+        let one = Glm.usage(&cfg, &ctx, since, until).unwrap();
+        assert_eq!(one.events.len(), 1);
+        let two = Glm.usage(&cfg, &ctx, since, until).unwrap();
+        assert_eq!(two.events.len(), 1);
+        assert_eq!(srv.hits(), 1, "the model-usage GET must be cached");
     }
 }

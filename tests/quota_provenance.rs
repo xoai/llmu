@@ -26,7 +26,9 @@ fn providers_module_declares_quota_fetch_contract() {
         "pub snapshots: Vec<QuotaSnapshot>",
         "pub notes: Vec<String>",
         "pub refresh_last_known_good: bool",
-        "fn quotas(&self, _cfg: &Config) -> Result<QuotaFetch>",
+        // Task 7 threaded the typed fetch context into every Provider
+        // method; the quota override now carries it too.
+        "fn quotas(&self, _cfg: &Config, _ctx: &FetchContext)",
         "fn live(",
     ] {
         assert!(

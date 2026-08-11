@@ -40,6 +40,35 @@ impl QuotaFetch {
     }
 }
 
+/// Explicit per-fetch cache/freshness context (plan Task 7, FR-3.2):
+/// threaded from the CLI through `gather` into every `Provider` method.
+/// There is no hidden process-global, static, thread-local, or
+/// environment freshness state; tests construct or derive it directly.
+#[derive(Debug, Clone, Default)]
+pub struct FetchContext {
+    /// Raw HTTP TTL cache options (`[http_cache]`; zero TTL disables
+    /// reads and writes, FR-3.1).
+    pub cache: http::CacheOptions,
+    /// Bypass raw cache reads for this fetch; successful live responses
+    /// are still stored (FR-3.2).
+    pub fresh: bool,
+}
+
+impl FetchContext {
+    /// Build the one-shot context from configuration plus the global
+    /// `--fresh` flag (FR-3.2). `dir` None resolves to the platform
+    /// cache directory under `llmu/http` (FR-3.4).
+    pub fn from_config(cfg: &Config, fresh: bool) -> Self {
+        FetchContext {
+            cache: http::CacheOptions {
+                dir: None,
+                ttl_seconds: cfg.http_cache.ttl_seconds,
+            },
+            fresh,
+        }
+    }
+}
+
 /// Every provider implements the same tiny surface; unsupported
 /// capabilities just return empty vectors.
 pub trait Provider: Sync {
@@ -48,13 +77,19 @@ pub trait Provider: Sync {
     /// One-line capability summary for `llmu providers`.
     fn capabilities(&self) -> &'static str;
 
-    fn usage(&self, _cfg: &Config, _since: DateTime<Utc>, _until: DateTime<Utc>) -> Result<Fetch> {
+    fn usage(
+        &self,
+        _cfg: &Config,
+        _ctx: &FetchContext,
+        _since: DateTime<Utc>,
+        _until: DateTime<Utc>,
+    ) -> Result<Fetch> {
         Ok(Fetch::default())
     }
-    fn quotas(&self, _cfg: &Config) -> Result<QuotaFetch> {
+    fn quotas(&self, _cfg: &Config, _ctx: &FetchContext) -> Result<QuotaFetch> {
         Ok(QuotaFetch::default())
     }
-    fn balances(&self, _cfg: &Config) -> Result<Vec<BalanceSnapshot>> {
+    fn balances(&self, _cfg: &Config, _ctx: &FetchContext) -> Result<Vec<BalanceSnapshot>> {
         Ok(vec![])
     }
 }
@@ -143,6 +178,61 @@ mod tests {
         assert!(f.refresh_last_known_good);
     }
 
+    /// Task 7 (RED): a fetch context derived from configuration carries
+    /// the `[http_cache]` TTL and the global `--fresh` flag; `dir` stays
+    /// None so production resolves the platform cache directory (FR-3.4).
+    #[test]
+    fn fetch_context_from_config_carries_ttl_and_freshness() {
+        let mut cfg = Config::default();
+        cfg.http_cache.ttl_seconds = 300;
+        let ctx = FetchContext::from_config(&cfg, true);
+        assert_eq!(ctx.cache.ttl_seconds, 300);
+        assert!(ctx.cache.dir.is_none());
+        assert!(ctx.cache.enabled());
+        assert!(ctx.fresh);
+        assert!(!FetchContext::from_config(&cfg, false).fresh);
+        assert!(!FetchContext::default().cache.enabled());
+        assert!(!FetchContext::default().fresh);
+    }
+
+    /// Task 7 (RED): every side-effect-free JSON GET in the eligible
+    /// providers opts into `get_json_cached` (FR-3.3); Gemini is
+    /// signature-only — its POST and local-file operations stay
+    /// cache-ineligible — and the Claude OAuth token POST stays a plain
+    /// `post_json`.
+    #[test]
+    fn eligible_provider_gets_opt_in_and_posts_stay_uncached() {
+        let files: &[(&str, &str)] = &[
+            ("anthropic.rs", include_str!("anthropic.rs")),
+            ("claude_sub.rs", include_str!("claude_sub.rs")),
+            ("codex.rs", include_str!("codex.rs")),
+            ("deepseek.rs", include_str!("deepseek.rs")),
+            ("glm.rs", include_str!("glm.rs")),
+            ("kimi.rs", include_str!("kimi.rs")),
+            ("openai.rs", include_str!("openai.rs")),
+        ];
+        for (name, src) in files {
+            assert!(
+                src.contains("get_json_cached"),
+                "{name} must opt its eligible GETs into get_json_cached"
+            );
+        }
+        let gem = include_str!("gemini.rs");
+        assert!(
+            !gem.contains("get_json_cached"),
+            "Gemini must stay cache-ineligible (signature-only)"
+        );
+        assert!(
+            gem.contains("post_form_json") && gem.contains("post_json"),
+            "Gemini OAuth form POST and quota RPC POSTs remain uncached"
+        );
+        let claude = include_str!("claude_sub.rs");
+        assert!(
+            claude.contains("post_json"),
+            "the Claude OAuth token POST must remain uncached"
+        );
+    }
+
     /// Every current override adapts: with no credentials the empty
     /// default (marker false) is returned instead of an empty vector.
     #[test]
@@ -152,7 +242,7 @@ mod tests {
         // user's credentials file or calls the network.
         cfg.claude.credentials = Some("/nonexistent/llmu-claude-test".into());
         cfg.claude.access_token = None;
-        let f = ClaudeSub.quotas(&cfg).unwrap();
+        let f = ClaudeSub.quotas(&cfg, &FetchContext::default()).unwrap();
         assert!(f.snapshots.is_empty());
         assert!(!f.refresh_last_known_good);
     }
@@ -162,7 +252,9 @@ mod tests {
         // Key discovery falls back to KIMI_CODE_API_KEY; pin it empty so
         // the test is hermetic regardless of the developer's environment.
         std::env::set_var("KIMI_CODE_API_KEY", "");
-        let f = Kimi.quotas(&Config::default()).unwrap();
+        let f = Kimi
+            .quotas(&Config::default(), &FetchContext::default())
+            .unwrap();
         assert!(f.snapshots.is_empty());
         assert!(!f.refresh_last_known_good);
     }
@@ -170,7 +262,9 @@ mod tests {
     #[test]
     fn glm_quotas_without_credentials_return_empty_default() {
         std::env::set_var("ZAI_API_KEY", "");
-        let f = Glm.quotas(&Config::default()).unwrap();
+        let f = Glm
+            .quotas(&Config::default(), &FetchContext::default())
+            .unwrap();
         assert!(f.snapshots.is_empty());
         assert!(!f.refresh_last_known_good);
     }
@@ -181,7 +275,10 @@ mod tests {
     fn codex_quotas_without_credentials_keep_existing_error() {
         let mut cfg = Config::default();
         cfg.codex.home = Some("/nonexistent/llmu-codex-test".into());
-        let e = Codex.quotas(&cfg).unwrap_err().to_string();
+        let e = Codex
+            .quotas(&cfg, &FetchContext::default())
+            .unwrap_err()
+            .to_string();
         assert!(
             e.contains("no auth.json token and no rate_limits in session logs"),
             "existing codex quota error must survive: {e}"

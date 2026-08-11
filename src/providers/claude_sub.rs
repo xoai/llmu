@@ -1,4 +1,4 @@
-use super::{Provider, QuotaFetch};
+use super::{FetchContext, Provider, QuotaFetch};
 use crate::{config::Config, credentials, http, types::*};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -349,9 +349,11 @@ fn refresh_or_adopt(
     Ok(token)
 }
 
-fn usage_get(token: &str, ep: &Endpoints) -> Result<serde_json::Value> {
+fn usage_get(token: &str, ep: &Endpoints, ctx: &FetchContext) -> Result<http::CachedJson> {
     let auth = format!("Bearer {token}");
-    http::get_json(
+    http::get_json_cached(
+        &ctx.cache,
+        ctx.fresh,
         &ep.usage,
         &[
             ("Authorization", auth.as_str()),
@@ -381,7 +383,11 @@ fn map_usage_error(e: anyhow::Error) -> anyhow::Error {
 }
 
 /// File-backed `claudeAiOauth` flow (FR-6.1 through FR-6.7, FR-6.9).
-fn quota_file_backed(path: &Path, ep: &Endpoints) -> Result<QuotaFetch> {
+/// The last-known-good marker is true only when the usage response
+/// underlying the emitted snapshots was observed live over the network:
+/// a raw TTL cache hit must never re-age the quota cache (FR-3.10,
+/// AD-1). Empty snapshots stay false.
+fn quota_file_backed(path: &Path, ep: &Endpoints, ctx: &FetchContext) -> Result<QuotaFetch> {
     let root = credentials::read_json(path)?;
     let state = ClaudeOauth::from_root(&root)?;
     let mut notes = vec![];
@@ -401,8 +407,8 @@ fn quota_file_backed(path: &Path, ep: &Endpoints) -> Result<QuotaFetch> {
         state.token.clone()
     };
 
-    let usage = match usage_get(&token, ep) {
-        Ok(v) => v,
+    let usage = match usage_get(&token, ep, ctx) {
+        Ok(c) => c,
         Err(e) if usage_is_401(&e) => {
             // FR-6.6: exactly one reactive retry for file-backed
             // credentials: re-read, adopt a changed usable token, else
@@ -415,7 +421,7 @@ fn quota_file_backed(path: &Path, ep: &Endpoints) -> Result<QuotaFetch> {
             } else {
                 refresh_or_adopt(path, ep, &mut notes, Some(&token))?
             };
-            usage_get(&retry, ep).map_err(|e| {
+            usage_get(&retry, ep, ctx).map_err(|e| {
                 if usage_is_401(&e) {
                     anyhow::anyhow!(
                         "oauth/usage 401 persists after one refresh — log in again with Claude Code"
@@ -427,26 +433,28 @@ fn quota_file_backed(path: &Path, ep: &Endpoints) -> Result<QuotaFetch> {
         }
         Err(e) => return Err(map_usage_error(e)),
     };
+    let live = usage.origin == http::CacheOrigin::Live;
 
     let plan = state
         .sub_type
         .unwrap_or_else(|| "Claude subscription".into());
     let mut out = vec![];
-    parse_usage(&usage, &plan, &mut out);
+    parse_usage(&usage.body, &plan, &mut out);
+    let empty = out.is_empty();
     Ok(QuotaFetch {
         snapshots: out,
         notes,
-        refresh_last_known_good: true,
+        refresh_last_known_good: live && !empty,
     })
 }
 
 /// Direct access-token flow (e.g. OpenCode's auth.json): read-only, never
 /// refreshed (FR-4.1, FR-6.8).
-fn quota_direct(cfg: &Config, ep: &Endpoints) -> Result<QuotaFetch> {
+fn quota_direct(cfg: &Config, ep: &Endpoints, ctx: &FetchContext) -> Result<QuotaFetch> {
     let Some(token) = &cfg.claude.access_token else {
         return Ok(QuotaFetch::default());
     };
-    let usage = usage_get(token, ep).map_err(|e| {
+    let usage = usage_get(token, ep, ctx).map_err(|e| {
         if usage_is_401(&e) {
             // FR-6.8: source-specific remediation — name OpenCode, never
             // claim llmu can refresh an access-only token.
@@ -457,16 +465,22 @@ fn quota_direct(cfg: &Config, ep: &Endpoints) -> Result<QuotaFetch> {
             map_usage_error(e)
         }
     })?;
+    let live = usage.origin == http::CacheOrigin::Live;
     let mut out = vec![];
-    parse_usage(&usage, "Claude subscription", &mut out);
-    Ok(QuotaFetch::live(out))
+    parse_usage(&usage.body, "Claude subscription", &mut out);
+    let empty = out.is_empty();
+    Ok(QuotaFetch {
+        snapshots: out,
+        notes: vec![],
+        refresh_last_known_good: live && !empty,
+    })
 }
 
 /// Internal entry point with an injectable endpoint bundle (AD-4).
-fn quotas_impl(cfg: &Config, ep: &Endpoints) -> Result<QuotaFetch> {
+fn quotas_impl(cfg: &Config, ctx: &FetchContext, ep: &Endpoints) -> Result<QuotaFetch> {
     match cfg.claude.credentials_path() {
-        Some(path) => quota_file_backed(&path, ep),
-        None => quota_direct(cfg, ep),
+        Some(path) => quota_file_backed(&path, ep, ctx),
+        None => quota_direct(cfg, ep, ctx),
     }
 }
 
@@ -481,8 +495,8 @@ impl Provider for ClaudeSub {
         "Pro/Max live session + weekly quotas via api.anthropic.com/api/oauth/usage (Claude Code OAuth token, auto-refreshed)"
     }
 
-    fn quotas(&self, cfg: &Config) -> Result<QuotaFetch> {
-        quotas_impl(cfg, &Endpoints::prod())
+    fn quotas(&self, cfg: &Config, ctx: &FetchContext) -> Result<QuotaFetch> {
+        quotas_impl(cfg, ctx, &Endpoints::prod())
     }
 }
 
@@ -747,7 +761,12 @@ mod tests {
             ScriptedResponse::token_ok(),
             ScriptedResponse::usage_ok(),
         ]);
-        let f = quotas_impl(&cfg_for(path.clone()), &srv.endpoints).unwrap();
+        let f = quotas_impl(
+            &cfg_for(path.clone()),
+            &FetchContext::default(),
+            &srv.endpoints,
+        )
+        .unwrap();
         let reqs = srv.requests();
         assert_eq!(reqs.len(), 2, "exactly one refresh POST then one usage GET");
         assert_eq!(reqs[0].method, "POST");
@@ -794,7 +813,12 @@ mod tests {
         let path = write_oauth(&dir, &oauth_valid("AT1", Some("R1")));
         let before = fs::read(&path).unwrap();
         let srv = FixtureServer::start(vec![ScriptedResponse::usage_ok()]);
-        let f = quotas_impl(&cfg_for(path.clone()), &srv.endpoints).unwrap();
+        let f = quotas_impl(
+            &cfg_for(path.clone()),
+            &FetchContext::default(),
+            &srv.endpoints,
+        )
+        .unwrap();
         let reqs = srv.requests();
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0].method, "GET");
@@ -816,7 +840,7 @@ mod tests {
             ScriptedResponse::token_ok(),
             ScriptedResponse::usage_ok(),
         ]);
-        quotas_impl(&cfg_for(path), &srv.endpoints).unwrap();
+        quotas_impl(&cfg_for(path), &FetchContext::default(), &srv.endpoints).unwrap();
         let reqs = srv.requests();
         let body: Value = serde_json::from_str(&reqs[0].body).unwrap();
         let obj = body
@@ -860,7 +884,7 @@ mod tests {
             ScriptedResponse::token_ok(),
             ScriptedResponse::usage_ok(),
         ]);
-        quotas_impl(&cfg_for(path), &srv.endpoints).unwrap();
+        quotas_impl(&cfg_for(path), &FetchContext::default(), &srv.endpoints).unwrap();
         let body: Value = serde_json::from_str(&srv.requests()[0].body).unwrap();
         assert_eq!(body["client_id"], PROD_CLIENT_ID);
     }
@@ -875,7 +899,12 @@ mod tests {
             ScriptedResponse::token(200, TOKEN_ROTATED_REL),
             ScriptedResponse::usage_ok(),
         ]);
-        quotas_impl(&cfg_for(path.clone()), &srv.endpoints).unwrap();
+        quotas_impl(
+            &cfg_for(path.clone()),
+            &FetchContext::default(),
+            &srv.endpoints,
+        )
+        .unwrap();
         let o = &on_disk(&path)["claudeAiOauth"];
         assert_eq!(o["refreshToken"], "R2", "a rotated refresh token persists");
         assert!(
@@ -895,7 +924,12 @@ mod tests {
             ScriptedResponse::token(200, TOKEN_NO_ROTATION),
             ScriptedResponse::usage_ok(),
         ]);
-        quotas_impl(&cfg_for(path.clone()), &srv.endpoints).unwrap();
+        quotas_impl(
+            &cfg_for(path.clone()),
+            &FetchContext::default(),
+            &srv.endpoints,
+        )
+        .unwrap();
         let o = &on_disk(&path)["claudeAiOauth"];
         assert_eq!(
             o["refreshToken"], "R1",
@@ -936,7 +970,9 @@ mod tests {
         held_rx.recv().unwrap();
         let path3 = path.clone();
         let ep = srv.endpoints.clone();
-        let handle = thread::spawn(move || quotas_impl(&cfg_for(path3), &ep).unwrap());
+        let handle = thread::spawn(move || {
+            quotas_impl(&cfg_for(path3), &FetchContext::default(), &ep).unwrap()
+        });
         go_tx.send(()).unwrap();
         let f = handle.join().unwrap();
         child.join().unwrap();
@@ -959,7 +995,12 @@ mod tests {
             ScriptedResponse::token(500, r#"{"error":"boom"}"#),
             ScriptedResponse::usage_ok(),
         ]);
-        let f = quotas_impl(&cfg_for(path.clone()), &srv.endpoints).unwrap();
+        let f = quotas_impl(
+            &cfg_for(path.clone()),
+            &FetchContext::default(),
+            &srv.endpoints,
+        )
+        .unwrap();
         assert_eq!(
             f.snapshots.len(),
             3,
@@ -988,9 +1029,13 @@ mod tests {
             400,
             r#"{"error":"invalid_grant"}"#,
         )]);
-        let err = quotas_impl(&cfg_for(path.clone()), &srv.endpoints)
-            .unwrap_err()
-            .to_string();
+        let err = quotas_impl(
+            &cfg_for(path.clone()),
+            &FetchContext::default(),
+            &srv.endpoints,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             err.contains("log in"),
             "permanent rejection instructs login (FR-6.7): {err}"
@@ -1022,7 +1067,12 @@ mod tests {
             ScriptedResponse::token_ok(),
             ScriptedResponse::usage_ok(),
         ]);
-        let f = quotas_impl(&cfg_for(path.clone()), &srv.endpoints).unwrap();
+        let f = quotas_impl(
+            &cfg_for(path.clone()),
+            &FetchContext::default(),
+            &srv.endpoints,
+        )
+        .unwrap();
         let reqs = srv.requests();
         assert_eq!(
             reqs.len(),
@@ -1064,7 +1114,7 @@ mod tests {
             },
             ScriptedResponse::usage_ok(),
         ]);
-        let f = quotas_impl(&cfg_for(path), &srv.endpoints).unwrap();
+        let f = quotas_impl(&cfg_for(path), &FetchContext::default(), &srv.endpoints).unwrap();
         let reqs = srv.requests();
         assert_eq!(reqs.len(), 2, "adoption must not touch the token endpoint");
         assert_eq!(reqs[0].method, "GET");
@@ -1085,7 +1135,7 @@ mod tests {
             ScriptedResponse::token_ok(),
             ScriptedResponse::usage(401, r#"{"error":"unauthorized"}"#),
         ]);
-        let err = quotas_impl(&cfg_for(path), &srv.endpoints)
+        let err = quotas_impl(&cfg_for(path), &FetchContext::default(), &srv.endpoints)
             .unwrap_err()
             .to_string();
         assert!(err.contains("401"), "the retried 401 surfaces: {err}");
@@ -1108,7 +1158,8 @@ mod tests {
             let dir = temp_dir(&format!("status-{status}"));
             let path = write_oauth(&dir, &oauth_valid("AT1", Some("R1")));
             let srv = FixtureServer::start(vec![ScriptedResponse::usage(status, body)]);
-            let err = quotas_impl(&cfg_for(path), &srv.endpoints).unwrap_err();
+            let err =
+                quotas_impl(&cfg_for(path), &FetchContext::default(), &srv.endpoints).unwrap_err();
             let msg = err.to_string();
             assert!(
                 !msg.contains("token refresh"),
@@ -1136,7 +1187,9 @@ mod tests {
             401,
             r#"{"error":"unauthorized"}"#,
         )]);
-        let err = quotas_impl(&cfg, &srv.endpoints).unwrap_err().to_string();
+        let err = quotas_impl(&cfg, &FetchContext::default(), &srv.endpoints)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("OpenCode"),
             "the source must be named (FR-6.8): {err}"
@@ -1165,7 +1218,7 @@ mod tests {
         o["refreshTokenExpiresAt"] = json!(now_ms() + 86_400_000);
         let path = write_oauth(&dir, &o);
         let srv = FixtureServer::start(vec![ScriptedResponse::usage_ok()]);
-        let f = quotas_impl(&cfg_for(path), &srv.endpoints).unwrap();
+        let f = quotas_impl(&cfg_for(path), &FetchContext::default(), &srv.endpoints).unwrap();
         assert_eq!(
             f.snapshots.len(),
             3,
@@ -1185,9 +1238,13 @@ mod tests {
         let path = write_oauth(&dir, &oauth_expiring("AT1", None));
         let before = fs::read(&path).unwrap();
         let srv = FixtureServer::start(vec![]);
-        let err = quotas_impl(&cfg_for(path.clone()), &srv.endpoints)
-            .unwrap_err()
-            .to_string();
+        let err = quotas_impl(
+            &cfg_for(path.clone()),
+            &FetchContext::default(),
+            &srv.endpoints,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             err.contains("log in"),
             "no refresh token means login remediation: {err}"
@@ -1197,5 +1254,88 @@ mod tests {
             srv.requests().is_empty(),
             "no HTTP at all without a refresh token"
         );
+    }
+
+    /// Task 7 (RED): a raw TTL cache hit on the usage GET must never
+    /// mark the emitted snapshots for last-known-good refresh (FR-3.10,
+    /// AS-7): the second run replays the cached body without touching
+    /// the network and reports `refresh_last_known_good == false`.
+    #[test]
+    fn cached_usage_hit_never_marks_last_known_good_refresh() {
+        let dir = temp_dir("cache-hit");
+        let path = write_oauth(&dir, &oauth_valid("AT1", Some("R1")));
+        let srv = FixtureServer::start(vec![ScriptedResponse::usage_ok()]);
+        let ctx = FetchContext {
+            cache: http::CacheOptions {
+                dir: Some(temp_dir("cache-dir")),
+                ttl_seconds: 3600,
+            },
+            ..Default::default()
+        };
+        let cfg = cfg_for(path.clone());
+
+        let first = quotas_impl(&cfg, &ctx, &srv.endpoints).unwrap();
+        assert!(
+            first.refresh_last_known_good,
+            "a live usage GET marks last-known-good refresh"
+        );
+        assert_eq!(srv.requests().len(), 1);
+
+        let second = quotas_impl(&cfg, &ctx, &srv.endpoints).unwrap();
+        assert_eq!(
+            second.snapshots.len(),
+            3,
+            "the cached usage body still parses into all meters"
+        );
+        assert!(
+            !second.refresh_last_known_good,
+            "a raw cache hit must never re-age last-known-good (FR-3.10)"
+        );
+        assert_eq!(
+            srv.requests().len(),
+            1,
+            "the second run must be network-free"
+        );
+    }
+
+    /// Task 7 (RED): the same run with a fresh context bypasses the
+    /// cache read, still stores the live response, and keeps the
+    /// last-known-good marker true.
+    #[test]
+    fn fresh_context_bypasses_cached_usage_and_stays_live() {
+        let dir = temp_dir("fresh-ctx");
+        let path = write_oauth(&dir, &oauth_valid("AT1", Some("R1")));
+        let srv = FixtureServer::start(vec![
+            ScriptedResponse::usage_ok(),
+            ScriptedResponse::usage_ok(),
+        ]);
+        let ctx = FetchContext {
+            cache: http::CacheOptions {
+                dir: Some(temp_dir("fresh-dir")),
+                ttl_seconds: 3600,
+            },
+            ..Default::default()
+        };
+        let cfg = cfg_for(path.clone());
+        let first = quotas_impl(&cfg, &ctx, &srv.endpoints).unwrap();
+        assert!(first.refresh_last_known_good);
+        let mut fresh_ctx = ctx.clone();
+        fresh_ctx.fresh = true;
+        let second = quotas_impl(&cfg, &fresh_ctx, &srv.endpoints).unwrap();
+        assert!(
+            second.refresh_last_known_good,
+            "fresh must observe the response live (FR-3.2)"
+        );
+        assert_eq!(
+            srv.requests().len(),
+            2,
+            "fresh must bypass the cached read and fetch live"
+        );
+        let third = quotas_impl(&cfg, &ctx, &srv.endpoints).unwrap();
+        assert!(
+            !third.refresh_last_known_good,
+            "the stored fresh response is now a plain cache hit"
+        );
+        assert_eq!(srv.requests().len(), 2, "the third run is network-free");
     }
 }

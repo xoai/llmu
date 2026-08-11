@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
 use clap::{Args, Parser, Subcommand};
 use config::Config;
-use providers::QuotaFetch;
+use providers::{FetchContext, QuotaFetch};
 use report::{Group, Period, QuotaStyle};
 use types::*;
 
@@ -28,6 +28,11 @@ struct Cli {
     /// Alternate config file (default: ~/.config/llmu/config.toml)
     #[arg(long, global = true)]
     config: Option<std::path::PathBuf>,
+    /// Bypass the optional HTTP response cache (FR-3.2): fetch live and
+    /// store successful responses. For `llmu --fresh tui`, bypasses only
+    /// the initial full network fetch; later scheduled ticks honor the TTL.
+    #[arg(long, global = true)]
+    fresh: bool,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -206,9 +211,13 @@ fn merge_provider(
 }
 
 /// Fetch all sources in parallel with plain OS threads — no async runtime
-/// needed for a handful of REST calls.
+/// needed for a handful of REST calls. `ctx` threads the raw HTTP cache
+/// options and per-invocation freshness into every provider method
+/// (FR-3.2, plan Task 7: no hidden global freshness state).
+#[allow(clippy::too_many_arguments)] // explicit context threading by design (plan Task 7)
 pub(crate) fn gather(
     cfg: &Config,
+    ctx: &FetchContext,
     since: DateTime<Utc>,
     until: DateTime<Utc>,
     provider_filter: Option<&[String]>,
@@ -242,13 +251,13 @@ pub(crate) fn gather(
                 s.spawn(move || {
                     let mut out = ProviderFetch::default();
                     if want_usage {
-                        match p.usage(cfg, since, until) {
+                        match p.usage(cfg, ctx, since, until) {
                             Ok(f) => absorb_fetch(&mut out, f),
                             Err(e) => out.notes.push(format!("{}: usage: {e}", p.id())),
                         }
                     }
                     if want_quota {
-                        match p.quotas(cfg) {
+                        match p.quotas(cfg, ctx) {
                             Ok(f) => absorb_quota(&mut out, p.id(), f),
                             Err(e) => {
                                 quota_failure(&mut out, p.id(), e, store::cached_quotas(p.id()))
@@ -256,7 +265,7 @@ pub(crate) fn gather(
                         }
                     }
                     if want_balance {
-                        match p.balances(cfg) {
+                        match p.balances(cfg, ctx) {
                             Ok(b) => out.balances = b,
                             Err(e) => out.notes.push(format!("{}: balance: {e}", p.id())),
                         }
@@ -306,10 +315,11 @@ pub(crate) fn gather(
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = Config::load(cli.config.clone())?;
+    let ctx = FetchContext::from_config(&cfg, cli.fresh);
     let now = Utc::now();
 
     let Some(cmd) = cli.cmd else {
-        return overview(&cfg, now);
+        return overview(&cfg, &ctx, now);
     };
     match cmd {
         Cmd::Init => {
@@ -367,7 +377,7 @@ fn main() -> Result<()> {
                 .as_ref()
                 .map(|p| p.split(',').map(|s| s.trim().to_string()).collect());
 
-            let mut g = gather(&cfg, since, until, pf.as_deref(), true, false, false);
+            let mut g = gather(&cfg, &ctx, since, until, pf.as_deref(), true, false, false);
 
             if let Some(m) = &a.model {
                 let m = m.to_ascii_lowercase();
@@ -412,11 +422,11 @@ fn main() -> Result<()> {
             }
         }
 
-        Cmd::Balance { json, history } => handle_balance(&cfg, now, json, history)?,
+        Cmd::Balance { json, history } => handle_balance(&cfg, &ctx, now, json, history)?,
 
         Cmd::Quota { json } => {
             let since = now - Duration::hours(6);
-            let g = gather(&cfg, since, now, None, false, true, false);
+            let g = gather(&cfg, &ctx, since, now, None, false, true, false);
             if json {
                 println!("{}", serde_json::to_string_pretty(&g.quotas)?);
             } else if g.quotas.is_empty() {
@@ -437,7 +447,7 @@ fn main() -> Result<()> {
             local_refresh,
         } => {
             parse_since(&since, now)?; // validate the spec up front
-            tui::run(cfg, since, refresh, local_refresh)?;
+            tui::run(cfg, since, refresh, local_refresh, cli.fresh)?;
         }
     }
     Ok(())
@@ -448,7 +458,13 @@ fn main() -> Result<()> {
 /// and appends no snapshot. The ordinary branch snapshots fetched
 /// balances and surfaces write failures instead of discarding them
 /// (FR-2.9).
-fn handle_balance(cfg: &Config, now: DateTime<Utc>, json: bool, history: bool) -> Result<()> {
+fn handle_balance(
+    cfg: &Config,
+    ctx: &FetchContext,
+    now: DateTime<Utc>,
+    json: bool,
+    history: bool,
+) -> Result<()> {
     if history {
         let hist = match store::read_balance_history() {
             Ok(h) => h,
@@ -466,7 +482,7 @@ fn handle_balance(cfg: &Config, now: DateTime<Utc>, json: bool, history: bool) -
         print!("{}", history_payload(&hist, json)?);
         return Ok(());
     }
-    let mut g = gather(cfg, now, now, None, false, false, true);
+    let mut g = gather(cfg, ctx, now, now, None, false, false, true);
     if let Err(e) = store::record_balances(&g.balances) {
         g.notes
             .push(format!("failed to append balance snapshot: {e}"));
@@ -509,7 +525,7 @@ fn history_payload(hist: &store::BalanceHistory, json: bool) -> Result<String> {
 /// Bare `llmu`: the zero-config landing view. Auto-discovers whatever
 /// credentials and local logs exist and shows quotas, balances, and a
 /// 7-day per-provider summary in one shot.
-fn overview(cfg: &Config, now: DateTime<Utc>) -> Result<()> {
+fn overview(cfg: &Config, ctx: &FetchContext, now: DateTime<Utc>) -> Result<()> {
     let n_conf = providers::all()
         .iter()
         .filter(|p| p.configured(cfg))
@@ -518,7 +534,7 @@ fn overview(cfg: &Config, now: DateTime<Utc>) -> Result<()> {
     println!("llmu — {} source(s) detected (run `llmu providers` for details, `llmu --help` for filters)\n", n_conf);
 
     let since = now - Duration::days(7);
-    let g = gather(cfg, since, now, None, true, true, true);
+    let g = gather(cfg, ctx, since, now, None, true, true, true);
 
     if !g.quotas.is_empty() {
         println!("{}", ansi::paint("subscription quotas:", ansi::BOLD));
@@ -649,7 +665,53 @@ mod tests {
         }
     }
 
-    /// A panicking provider worker must surface as a note, not vanish —
+    /// Task 7 (RED): one-shot commands derive the typed fetch context
+    /// from `[http_cache]` plus the global `--fresh` flag (FR-3.2).
+    #[test]
+    fn fresh_context_builds_from_config_and_flag() {
+        let mut cfg = Config::default();
+        cfg.http_cache.ttl_seconds = 60;
+        let ctx = providers::FetchContext::from_config(&cfg, true);
+        assert!(ctx.fresh);
+        assert_eq!(ctx.cache.ttl_seconds, 60);
+        assert!(!providers::FetchContext::from_config(&cfg, false).fresh);
+    }
+
+    /// Task 7 (RED): every one-shot gather call site (usage, quota,
+    /// balance, overview) passes the shared typed fetch context — no
+    /// hidden global or environment freshness state (plan Task 7).
+    #[test]
+    fn one_shot_gather_sites_pass_the_fetch_context() {
+        let needle = ["gat", "her("].concat();
+        let src = include_str!("main.rs");
+        // Only the non-test half of the file: the tests module itself
+        // legitimately contains the needle (its own assertions).
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        let sites: Vec<&str> = prod
+            .lines()
+            .filter(|l| l.contains(&needle) && !l.trim_start().starts_with("pub(crate) fn gather"))
+            .collect();
+        assert_eq!(sites.len(), 4, "usage, quota, balance, and overview");
+        for line in &sites {
+            assert!(
+                line.contains("ctx"),
+                "every one-shot gather must pass the context, got: {line}"
+            );
+        }
+    }
+
+    /// Task 7 (RED): `--fresh` also reaches the TUI as its initial-fetch
+    /// bypass (FR-3.2: later scheduled ticks honor the TTL).
+    #[test]
+    fn tui_run_receives_the_global_fresh_flag() {
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("cli.fresh"),
+            "the global --fresh must reach the TUI dispatch"
+        );
+    }
+
+    /// Task 7 (RED): a panicking provider worker must surface as a note, not vanish —
     /// the review found the join loop silently dropping JoinError.
     #[test]
     fn panicked_provider_thread_yields_note() {

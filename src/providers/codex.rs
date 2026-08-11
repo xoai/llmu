@@ -1,4 +1,4 @@
-use super::{Provider, QuotaFetch};
+use super::{FetchContext, Provider, QuotaFetch};
 use crate::{config::Config, http, types::*};
 use anyhow::Result;
 use chrono::{DateTime, Duration, DurationRound, Utc};
@@ -194,7 +194,15 @@ impl Provider for Codex {
         "ChatGPT-plan usage from $CODEX_HOME/sessions JSONL; 5h/weekly limits from log rate_limits + chatgpt.com wham/usage"
     }
 
-    fn usage(&self, cfg: &Config, since: DateTime<Utc>, until: DateTime<Utc>) -> Result<Fetch> {
+    fn usage(
+        &self,
+        cfg: &Config,
+        _ctx: &FetchContext,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<Fetch> {
+        // (Task 7: codex usage is a local JSONL read — cache-ineligible;
+        // the context is accepted for trait uniformity.)
         // (hour, model) -> aggregate
         let mut agg: HashMap<(DateTime<Utc>, String), UsageEvent> = HashMap::new();
 
@@ -298,7 +306,7 @@ impl Provider for Codex {
         })
     }
 
-    fn quotas(&self, cfg: &Config) -> Result<QuotaFetch> {
+    fn quotas(&self, cfg: &Config, ctx: &FetchContext) -> Result<QuotaFetch> {
         // Preferred: the live wham/usage endpoint via Codex's own OAuth.
         let mut wham_err: Option<String> = None;
         if let Some(home) = cfg.codex.home_dir() {
@@ -316,9 +324,17 @@ impl Provider for Codex {
                         if !acct.is_empty() {
                             headers.push(("ChatGPT-Account-Id", acct));
                         }
-                        match http::get_json("https://chatgpt.com/backend-api/wham/usage", &headers)
-                        {
-                            Ok(v) => {
+                        match http::get_json_cached(
+                            &ctx.cache,
+                            ctx.fresh,
+                            "https://chatgpt.com/backend-api/wham/usage",
+                            &headers,
+                        ) {
+                            Ok(cj) => {
+                                let v = cj.body;
+                                // A raw TTL hit must never re-age the
+                                // last-known-good quota cache (FR-3.10).
+                                let live = cj.origin == http::CacheOrigin::Live;
                                 let plan = v["plan_type"]
                                     .as_str()
                                     .unwrap_or("ChatGPT plan")
@@ -348,7 +364,11 @@ impl Provider for Codex {
                                     }
                                 }
                                 if !out.is_empty() {
-                                    return Ok(QuotaFetch::live(out));
+                                    return Ok(QuotaFetch {
+                                        snapshots: out,
+                                        notes: vec![],
+                                        refresh_last_known_good: live,
+                                    });
                                 }
                                 wham_err = Some(
                                     "wham/usage responded but no rate-limit windows parsed \

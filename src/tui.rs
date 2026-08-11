@@ -42,6 +42,31 @@ struct Snap {
     net: bool, // was this a full network refresh?
 }
 
+/// Raw-cache bypass lifetime for the TUI (FR-3.2): a one-shot `--fresh`
+/// applies only to the initial full network fetch; each `r` keypress
+/// bypasses exactly its next full network fetch and then clears.
+/// Local-only ticks never consume the state (they do not call `take`),
+/// and scheduled network ticks otherwise honor the TTL. Pure — the
+/// freshness decision is testable without a terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FreshState {
+    pending: bool,
+}
+
+impl FreshState {
+    fn new(initial: bool) -> Self {
+        FreshState { pending: initial }
+    }
+
+    /// Consume the state for one full network fetch. `forced` is the
+    /// one-shot `r` keypress flag (already swapped clear by the caller).
+    fn take(&mut self, forced: bool) -> bool {
+        let fresh = self.pending || forced;
+        self.pending = false;
+        fresh
+    }
+}
+
 fn provider_color(id: &str) -> Color {
     match id {
         "anthropic" | "claude" => Color::Magenta,
@@ -64,7 +89,13 @@ fn pct_color(p: f64) -> Color {
     }
 }
 
-pub fn run(cfg: Config, since_spec: String, net_secs: u64, local_secs: u64) -> Result<()> {
+pub fn run(
+    cfg: Config,
+    since_spec: String,
+    net_secs: u64,
+    local_secs: u64,
+    fresh_initial: bool,
+) -> Result<()> {
     let (tx, rx) = mpsc::channel::<Snap>();
     let stop = Arc::new(AtomicBool::new(false));
     let force = Arc::new(AtomicBool::new(false));
@@ -80,6 +111,10 @@ pub fn run(cfg: Config, since_spec: String, net_secs: u64, local_secs: u64) -> R
             // Fire a full fetch immediately, locals in between.
             let mut last_net = Instant::now() - netd;
             let mut last_local = Instant::now();
+            // FR-3.2: a one-shot --fresh bypasses only the initial full
+            // network fetch; `r` bypasses exactly one more. Scheduled
+            // ticks honor the TTL; local-only ticks never consume it.
+            let mut fresh_state = FreshState::new(fresh_initial);
             // Non-local state kept from the last network tick.
             let mut api_events: Vec<UsageEvent> = vec![];
             let mut billed: Vec<BilledCost> = vec![];
@@ -99,7 +134,9 @@ pub fn run(cfg: Config, since_spec: String, net_secs: u64, local_secs: u64) -> R
                 };
 
                 if !is_paused && (forced || last_net.elapsed() >= netd) {
-                    let g = crate::gather(&cfg, since, now, None, true, true, true);
+                    let fresh = fresh_state.take(forced);
+                    let ctx = crate::providers::FetchContext::from_config(&cfg, fresh);
+                    let g = crate::gather(&cfg, &ctx, since, now, None, true, true, true);
                     api_events = g
                         .events
                         .iter()
@@ -128,8 +165,11 @@ pub fn run(cfg: Config, since_spec: String, net_secs: u64, local_secs: u64) -> R
                 } else if !is_paused && last_local.elapsed() >= locald {
                     // Local-only: codex provider (file-based); the Claude
                     // Code transcript collector always runs inside gather.
+                    // No network happens here, so the freshness bypass is
+                    // neither consumed nor required (FR-3.2).
                     let filt = ["codex".to_string()];
-                    let l = crate::gather(&cfg, since, now, Some(&filt), true, false, false);
+                    let ctx = crate::providers::FetchContext::from_config(&cfg, false);
+                    let l = crate::gather(&cfg, &ctx, since, now, Some(&filt), true, false, false);
                     let mut events = api_events.clone();
                     events.extend(
                         l.events
@@ -217,7 +257,6 @@ pub fn run(cfg: Config, since_spec: String, net_secs: u64, local_secs: u64) -> R
     terminal.show_cursor()?;
     res
 }
-
 fn draw(
     f: &mut Frame,
     d: &Dashboard,
@@ -548,4 +587,59 @@ fn draw(
             .style(Style::new().dim()),
         footer[1],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Task 7 (RED): a one-shot `--fresh` bypasses only the initial full
+    /// network fetch; later scheduled ticks honor the TTL (FR-3.2).
+    #[test]
+    fn fresh_bypasses_only_the_initial_full_fetch() {
+        let mut s = FreshState::new(true);
+        assert!(s.take(false), "the initial network tick bypasses");
+        assert!(!s.take(false), "scheduled ticks honor the TTL");
+        assert!(!s.take(false));
+    }
+
+    /// Task 7 (RED): `r` bypasses exactly the next full network fetch
+    /// and then clears (FR-3.2); a later `r` re-arms it.
+    #[test]
+    fn r_bypasses_exactly_one_fetch_then_clears() {
+        let mut s = FreshState::new(false);
+        assert!(s.take(true), "the forced fetch bypasses");
+        assert!(!s.take(false), "the next scheduled tick honors the TTL");
+        assert!(s.take(true), "a later r re-arms the bypass");
+        assert!(!s.take(false));
+    }
+
+    /// Task 7 (RED): local-only ticks neither consume nor require the
+    /// network bypass — the pending initial bypass survives until the
+    /// first full network fetch.
+    #[test]
+    fn local_only_ticks_do_not_consume_the_bypass() {
+        let mut s = FreshState::new(true);
+        // (local ticks never call take)
+        assert!(s.take(false), "the first full fetch still bypasses");
+        assert!(!s.take(false));
+    }
+
+    /// Task 7 (RED): both TUI gather paths thread the typed fetch
+    /// context; the network tick derives it from config plus the
+    /// per-tick freshness decision, the local-only tick from config
+    /// alone.
+    #[test]
+    fn tui_gather_sites_pass_the_fetch_context() {
+        let needle = ["crate::", "gat", "her("].concat();
+        let src = include_str!("tui.rs");
+        let sites: Vec<&str> = src.lines().filter(|l| l.contains(&needle)).collect();
+        assert_eq!(sites.len(), 2, "network tick + local-only tick");
+        for line in &sites {
+            assert!(
+                line.contains("&ctx"),
+                "every TUI gather must pass the context, got: {line}"
+            );
+        }
+    }
 }
