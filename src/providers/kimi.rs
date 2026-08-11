@@ -1,4 +1,4 @@
-use super::Provider;
+use super::{Provider, QuotaFetch};
 use crate::{config::Config, http, types::*};
 use anyhow::Result;
 
@@ -20,10 +20,10 @@ impl Provider for Kimi {
     /// STRINGS ("limit":"100"); `usage` is the weekly meter (resetTime
     /// RFC3339), `limits[]` are windowed meters whose `window` is
     /// {duration, timeUnit: TIME_UNIT_MINUTE|HOUR|DAY|WEEK}.
-    fn quotas(&self, cfg: &Config) -> Result<Vec<QuotaSnapshot>> {
+    fn quotas(&self, cfg: &Config) -> Result<QuotaFetch> {
         let key = match cfg.kimi.code_key() {
             Some(k) => k,
-            None => return Ok(vec![]),
+            None => return Ok(QuotaFetch::default()),
         };
         let auth = format!("Bearer {key}");
         let v = http::get_json(
@@ -43,7 +43,7 @@ impl Provider for Kimi {
                  (payload drift?) — rerun with LLMU_DEBUG=1 to see the raw response"
             );
         }
-        Ok(out)
+        Ok(QuotaFetch::live(out))
     }
 
     fn balances(&self, cfg: &Config) -> Result<Vec<BalanceSnapshot>> {

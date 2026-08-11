@@ -1,4 +1,4 @@
-use super::Provider;
+use super::{Provider, QuotaFetch};
 use crate::{config::Config, http, types::*};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -53,7 +53,7 @@ impl Provider for ClaudeSub {
         "Pro/Max live session + weekly quotas via api.anthropic.com/api/oauth/usage (Claude Code OAuth token)"
     }
 
-    fn quotas(&self, cfg: &Config) -> Result<Vec<QuotaSnapshot>> {
+    fn quotas(&self, cfg: &Config) -> Result<QuotaFetch> {
         // Token source: Claude Code's credentials file, else a directly
         // configured/discovered access token (e.g. OpenCode's).
         let (token, sub_type) = match cfg.claude.credentials_path() {
@@ -72,7 +72,7 @@ impl Provider for ClaudeSub {
             }
             None => match &cfg.claude.access_token {
                 Some(t) => (t.clone(), None),
-                None => return Ok(vec![]),
+                None => return Ok(QuotaFetch::default()),
             },
         };
 
@@ -123,6 +123,6 @@ impl Provider for ClaudeSub {
                 }
             }
         }
-        Ok(out)
+        Ok(QuotaFetch::live(out))
     }
 }

@@ -11,6 +11,35 @@ use crate::{config::Config, http, types::*};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 
+/// Everything one provider quota fetch returns.
+///
+/// `refresh_last_known_good` is the freshness provenance that keeps the
+/// last-known-good quota cache honest (AD-1, FR-3.10): `gather` rewrites
+/// that cache only for nonempty snapshots observed live over the network
+/// in this call. Cached-origin rows (raw TTL hits, Task 7) carry `false`
+/// so old data can never be re-aged.
+#[derive(Debug, Default)]
+pub struct QuotaFetch {
+    pub snapshots: Vec<QuotaSnapshot>,
+    /// Diagnostic notes surfaced alongside quota rows (e.g. skipped
+    /// meters); gathered and printed as-is.
+    pub notes: Vec<String>,
+    /// True only when every remote response underlying `snapshots` was
+    /// observed live in this call.
+    pub refresh_last_known_good: bool,
+}
+
+impl QuotaFetch {
+    /// Rows observed live over the network in this call.
+    pub fn live(snapshots: Vec<QuotaSnapshot>) -> Self {
+        QuotaFetch {
+            snapshots,
+            notes: vec![],
+            refresh_last_known_good: true,
+        }
+    }
+}
+
 /// Every provider implements the same tiny surface; unsupported
 /// capabilities just return empty vectors.
 pub trait Provider: Sync {
@@ -22,8 +51,8 @@ pub trait Provider: Sync {
     fn usage(&self, _cfg: &Config, _since: DateTime<Utc>, _until: DateTime<Utc>) -> Result<Fetch> {
         Ok(Fetch::default())
     }
-    fn quotas(&self, _cfg: &Config) -> Result<Vec<QuotaSnapshot>> {
-        Ok(vec![])
+    fn quotas(&self, _cfg: &Config) -> Result<QuotaFetch> {
+        Ok(QuotaFetch::default())
     }
     fn balances(&self, _cfg: &Config) -> Result<Vec<BalanceSnapshot>> {
         Ok(vec![])
@@ -72,5 +101,90 @@ pub(crate) fn collect_billed_pages(
         if !v["has_more"].as_bool().unwrap_or(false) || page.is_none() {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::claude_sub::ClaudeSub;
+    use super::codex::Codex;
+    use super::glm::Glm;
+    use super::kimi::Kimi;
+    use super::*;
+
+    fn snapshot(provider: &str) -> QuotaSnapshot {
+        QuotaSnapshot {
+            provider: provider.into(),
+            plan: "pro".into(),
+            window: "5h".into(),
+            used: 10.0,
+            limit: 100.0,
+            unit: "%".into(),
+            resets_at: None,
+        }
+    }
+
+    /// Default/empty quota results must never refresh the last-known-good
+    /// cache (AD-1 / FR-3.10: empty results set the marker false).
+    #[test]
+    fn default_quota_fetch_is_empty_and_never_refreshes() {
+        let f = QuotaFetch::default();
+        assert!(f.snapshots.is_empty());
+        assert!(f.notes.is_empty());
+        assert!(!f.refresh_last_known_good);
+    }
+
+    /// The live constructor marks rows observed over the network this call.
+    #[test]
+    fn live_quota_fetch_marks_rows_for_cache_refresh() {
+        let f = QuotaFetch::live(vec![snapshot("claude")]);
+        assert_eq!(f.snapshots.len(), 1);
+        assert!(f.notes.is_empty());
+        assert!(f.refresh_last_known_good);
+    }
+
+    /// Every current override adapts: with no credentials the empty
+    /// default (marker false) is returned instead of an empty vector.
+    #[test]
+    fn claude_quotas_without_credentials_return_empty_default() {
+        let mut cfg = Config::default();
+        // Block the real ~/.claude discovery so the test never reads the
+        // user's credentials file or calls the network.
+        cfg.claude.credentials = Some("/nonexistent/llmu-claude-test".into());
+        cfg.claude.access_token = None;
+        let f = ClaudeSub.quotas(&cfg).unwrap();
+        assert!(f.snapshots.is_empty());
+        assert!(!f.refresh_last_known_good);
+    }
+
+    #[test]
+    fn kimi_quotas_without_credentials_return_empty_default() {
+        // Key discovery falls back to KIMI_CODE_API_KEY; pin it empty so
+        // the test is hermetic regardless of the developer's environment.
+        std::env::set_var("KIMI_CODE_API_KEY", "");
+        let f = Kimi.quotas(&Config::default()).unwrap();
+        assert!(f.snapshots.is_empty());
+        assert!(!f.refresh_last_known_good);
+    }
+
+    #[test]
+    fn glm_quotas_without_credentials_return_empty_default() {
+        std::env::set_var("ZAI_API_KEY", "");
+        let f = Glm.quotas(&Config::default()).unwrap();
+        assert!(f.snapshots.is_empty());
+        assert!(!f.refresh_last_known_good);
+    }
+
+    /// Codex with no auth.json and no session logs keeps its existing
+    /// error — the override adapts without changing failure behavior.
+    #[test]
+    fn codex_quotas_without_credentials_keep_existing_error() {
+        let mut cfg = Config::default();
+        cfg.codex.home = Some("/nonexistent/llmu-codex-test".into());
+        let e = Codex.quotas(&cfg).unwrap_err().to_string();
+        assert!(
+            e.contains("no auth.json token and no rate_limits in session logs"),
+            "existing codex quota error must survive: {e}"
+        );
     }
 }

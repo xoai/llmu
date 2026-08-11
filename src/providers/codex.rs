@@ -1,4 +1,4 @@
-use super::Provider;
+use super::{Provider, QuotaFetch};
 use crate::{config::Config, http, types::*};
 use anyhow::Result;
 use chrono::{DateTime, Duration, DurationRound, Utc};
@@ -298,7 +298,7 @@ impl Provider for Codex {
         })
     }
 
-    fn quotas(&self, cfg: &Config) -> Result<Vec<QuotaSnapshot>> {
+    fn quotas(&self, cfg: &Config) -> Result<QuotaFetch> {
         // Preferred: the live wham/usage endpoint via Codex's own OAuth.
         let mut wham_err: Option<String> = None;
         if let Some(home) = cfg.codex.home_dir() {
@@ -348,7 +348,7 @@ impl Provider for Codex {
                                     }
                                 }
                                 if !out.is_empty() {
-                                    return Ok(out);
+                                    return Ok(QuotaFetch::live(out));
                                 }
                                 wham_err = Some(
                                     "wham/usage responded but no rate-limit windows parsed \
@@ -381,7 +381,7 @@ impl Provider for Codex {
                 }
             }
             if !out.is_empty() {
-                return Ok(out);
+                return Ok(QuotaFetch::live(out));
             }
         }
         // Nothing worked: say so instead of rendering nothing.

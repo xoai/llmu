@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
 use clap::{Args, Parser, Subcommand};
 use config::Config;
+use providers::QuotaFetch;
 use report::{Group, Period, QuotaStyle};
 use types::*;
 
@@ -148,6 +149,39 @@ fn absorb_fetch(out: &mut ProviderFetch, f: Fetch) {
     out.notes.extend(f.notes);
 }
 
+/// Move one provider's quota fetch into the worker output. Rows replace
+/// whatever the worker had; notes append — QuotaFetch notes carry quota
+/// diagnostics that must not vanish. The last-known-good cache write is
+/// queued only for nonempty snapshots observed live this call
+/// (`refresh_last_known_good`, AD-1 / FR-3.10): cached-origin rows must
+/// never re-age the cache timestamp.
+fn absorb_quota(out: &mut ProviderFetch, id: &'static str, f: QuotaFetch) {
+    out.notes.extend(f.notes);
+    out.quotas = f.snapshots;
+    if !out.quotas.is_empty() && f.refresh_last_known_good {
+        out.to_cache.push((id, out.quotas.clone()));
+    }
+}
+
+/// Quota failure path: serve the last-known-good meters (age-labeled)
+/// when a cache entry exists, else a plain error note. Cached rows are
+/// cached origin and never queue another cache write.
+fn quota_failure(
+    out: &mut ProviderFetch,
+    id: &'static str,
+    e: anyhow::Error,
+    cached: Option<Vec<QuotaSnapshot>>,
+) {
+    match cached {
+        Some(cached) => {
+            out.notes
+                .push(format!("{id}: quota: {e} — showing cached meters"));
+            out.quotas = cached;
+        }
+        None => out.notes.push(format!("{id}: quota: {e}")),
+    }
+}
+
 fn merge_provider(
     g: &mut Gathered,
     id: &str,
@@ -211,22 +245,10 @@ pub(crate) fn gather(
                     }
                     if want_quota {
                         match p.quotas(cfg) {
-                            Ok(q) => {
-                                if !q.is_empty() {
-                                    out.to_cache.push((p.id(), q.clone()));
-                                }
-                                out.quotas = q;
+                            Ok(f) => absorb_quota(&mut out, p.id(), f),
+                            Err(e) => {
+                                quota_failure(&mut out, p.id(), e, store::cached_quotas(p.id()))
                             }
-                            Err(e) => match store::cached_quotas(p.id()) {
-                                Some(cached) => {
-                                    out.notes.push(format!(
-                                        "{}: quota: {e} — showing cached meters",
-                                        p.id()
-                                    ));
-                                    out.quotas = cached;
-                                }
-                                None => out.notes.push(format!("{}: quota: {e}", p.id())),
-                            },
                         }
                     }
                     if want_balance {
@@ -644,6 +666,107 @@ mod tests {
             out.notes,
             vec!["pre-existing".to_string(), "quota row skipped".to_string()]
         );
+    }
+
+    /// Default/empty quota results must never queue a last-known-good
+    /// cache write (FR-3.10: empty results set the marker false).
+    #[test]
+    fn absorb_quota_empty_default_never_queues_cache() {
+        let mut out = ProviderFetch::default();
+        absorb_quota(&mut out, "claude", QuotaFetch::default());
+        assert!(out.quotas.is_empty());
+        assert!(out.to_cache.is_empty());
+        assert!(out.notes.is_empty());
+    }
+
+    /// Live nonempty rows land in the output AND queue the cache write.
+    #[test]
+    fn absorb_quota_live_rows_land_and_queue_cache() {
+        let mut out = ProviderFetch::default();
+        absorb_quota(&mut out, "glm", QuotaFetch::live(vec![quota("glm")]));
+        assert_eq!(out.quotas.len(), 1);
+        assert_eq!(out.to_cache.len(), 1);
+        assert_eq!(out.to_cache[0].0, "glm");
+        assert_eq!(out.to_cache[0].1.len(), 1);
+    }
+
+    /// Cached-origin rows (marker false — e.g. Task 7 raw TTL hits) land
+    /// but never queue a cache write: a TTL hit must not re-age the
+    /// last-known-good data.
+    #[test]
+    fn absorb_quota_cached_origin_rows_never_queue_cache() {
+        let mut out = ProviderFetch::default();
+        let f = QuotaFetch {
+            snapshots: vec![quota("claude")],
+            notes: vec![],
+            refresh_last_known_good: false,
+        };
+        absorb_quota(&mut out, "claude", f);
+        assert_eq!(out.quotas.len(), 1);
+        assert!(out.to_cache.is_empty());
+    }
+
+    /// Provider diagnostic notes (e.g. skipped rows) survive into the
+    /// worker output alongside quota rows.
+    #[test]
+    fn absorb_quota_appends_provider_notes() {
+        let mut out = ProviderFetch {
+            notes: vec!["pre-existing".into()],
+            ..Default::default()
+        };
+        let f = QuotaFetch {
+            snapshots: vec![],
+            notes: vec!["quota row skipped".into()],
+            refresh_last_known_good: true,
+        };
+        absorb_quota(&mut out, "claude", f);
+        assert_eq!(
+            out.notes,
+            vec!["pre-existing".to_string(), "quota row skipped".to_string()]
+        );
+    }
+
+    /// The existing error fallback stays: cached rows win with the age
+    /// label, and — being cached origin — never queue a refresh.
+    #[test]
+    fn quota_failure_falls_back_to_cached_quotas_with_label() {
+        let mut out = ProviderFetch::default();
+        let cached = vec![quota("claude")];
+        quota_failure(
+            &mut out,
+            "claude",
+            anyhow::anyhow!(
+                "oauth/usage rate-limited (this endpoint throttles hard) — retry in a few minutes"
+            ),
+            Some(cached),
+        );
+        assert_eq!(out.quotas.len(), 1);
+        assert_eq!(
+            out.notes,
+            vec![
+                "claude: quota: oauth/usage rate-limited (this endpoint throttles hard) — retry in a few minutes — showing cached meters".to_string()
+            ]
+        );
+        assert!(out.to_cache.is_empty());
+    }
+
+    /// Without a cache entry the error surfaces as a plain note and no
+    /// rows or cache writes are produced.
+    #[test]
+    fn quota_failure_without_cache_emits_error_note_only() {
+        let mut out = ProviderFetch::default();
+        quota_failure(
+            &mut out,
+            "glm",
+            anyhow::anyhow!("GLM key is valid but has no Coding Plan subscription"),
+            None,
+        );
+        assert_eq!(
+            out.notes,
+            vec!["glm: quota: GLM key is valid but has no Coding Plan subscription".to_string()]
+        );
+        assert!(out.quotas.is_empty());
+        assert!(out.to_cache.is_empty());
     }
 
     #[test]

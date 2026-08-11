@@ -1,4 +1,4 @@
-use super::Provider;
+use super::{Provider, QuotaFetch};
 use crate::{config::Config, http, types::*};
 use anyhow::Result;
 use chrono::{DateTime, TimeZone, Utc};
@@ -150,10 +150,10 @@ impl Provider for Glm {
         })
     }
 
-    fn quotas(&self, cfg: &Config) -> Result<Vec<QuotaSnapshot>> {
+    fn quotas(&self, cfg: &Config) -> Result<QuotaFetch> {
         let key = match cfg.glm.key() {
             Some(k) => k,
-            None => return Ok(vec![]),
+            None => return Ok(QuotaFetch::default()),
         };
         let base = cfg.glm.base();
         let v = http::get_json(
@@ -203,7 +203,7 @@ impl Provider for Glm {
                  (payload drift?) — rerun with LLMU_DEBUG=1 to see the raw response"
             );
         }
-        Ok(out)
+        Ok(QuotaFetch::live(out))
     }
 }
 
