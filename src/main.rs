@@ -18,7 +18,7 @@ use providers::{FetchContext, QuotaFetch};
 use report::{Group, Period, QuotaStyle};
 use types::*;
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(
     name = "llmu",
     version,
@@ -37,7 +37,7 @@ struct Cli {
     cmd: Option<Cmd>,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum Cmd {
     /// Write a sample config file
     Init,
@@ -49,6 +49,9 @@ enum Cmd {
     Balance {
         #[arg(long)]
         json: bool,
+        /// Emit rows as CSV (RFC 4180, UTF-8, LF)
+        #[arg(long, conflicts_with = "json")]
+        csv: bool,
         /// Offline daily balance history from the local balances.jsonl
         /// (no provider requests, no snapshot append)
         #[arg(long)]
@@ -58,6 +61,9 @@ enum Cmd {
     Quota {
         #[arg(long)]
         json: bool,
+        /// Emit rows as CSV (RFC 4180, UTF-8, LF)
+        #[arg(long, conflicts_with = "json")]
+        csv: bool,
     },
     /// Live auto-refreshing dashboard (alias: watch)
     #[command(visible_alias = "watch")]
@@ -73,7 +79,7 @@ enum Cmd {
     },
 }
 
-#[derive(Args)]
+#[derive(Args, Debug)]
 struct UsageArgs {
     /// Window start: 7d, 24h, mtd, wtd, or YYYY-MM-DD
     #[arg(long, default_value = "7d")]
@@ -99,6 +105,9 @@ struct UsageArgs {
     /// Emit aggregated rows as JSON (for scripting)
     #[arg(long)]
     json: bool,
+    /// Emit aggregated rows as CSV (RFC 4180, UTF-8, LF)
+    #[arg(long, conflicts_with = "json")]
+    csv: bool,
 }
 
 pub(crate) fn parse_since(s: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
@@ -396,6 +405,8 @@ fn main() -> Result<()> {
             let rows = report::aggregate(&g.events, period, &groups);
             if a.json {
                 println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else if a.csv {
+                print!("{}", report::render_usage_csv(&groups, &rows));
             } else {
                 print!(
                     "{}",
@@ -422,13 +433,15 @@ fn main() -> Result<()> {
             }
         }
 
-        Cmd::Balance { json, history } => handle_balance(&cfg, &ctx, now, json, history)?,
+        Cmd::Balance { json, csv, history } => handle_balance(&cfg, &ctx, now, json, csv, history)?,
 
-        Cmd::Quota { json } => {
+        Cmd::Quota { json, csv } => {
             let since = now - Duration::hours(6);
             let g = gather(&cfg, &ctx, since, now, None, false, true, false);
             if json {
                 println!("{}", serde_json::to_string_pretty(&g.quotas)?);
+            } else if csv {
+                print!("{}", report::render_quota_csv(&g.quotas));
             } else if g.quotas.is_empty() {
                 println!("no quota data available");
             } else {
@@ -463,6 +476,7 @@ fn handle_balance(
     ctx: &FetchContext,
     now: DateTime<Utc>,
     json: bool,
+    csv: bool,
     history: bool,
 ) -> Result<()> {
     if history {
@@ -479,7 +493,7 @@ fn handle_balance(
                 hist.skipped
             );
         }
-        print!("{}", history_payload(&hist, json)?);
+        print!("{}", history_payload(&hist, json, csv)?);
         return Ok(());
     }
     let mut g = gather(cfg, ctx, now, now, None, false, false, true);
@@ -489,6 +503,8 @@ fn handle_balance(
     }
     if json {
         println!("{}", serde_json::to_string_pretty(&g.balances)?);
+    } else if csv {
+        print!("{}", report::render_balance_csv(&g.balances));
     } else if g.balances.is_empty() {
         println!("no balance sources configured (deepseek / kimi)");
     } else {
@@ -510,11 +526,15 @@ fn handle_balance(
 }
 
 /// The complete stdout payload for `balance --history` (FR-2.7): JSON
-/// emits the normalized rows as an array; the table renders the same
-/// rows. Malformed-record counts are a stderr note, never stdout.
-fn history_payload(hist: &store::BalanceHistory, json: bool) -> Result<String> {
+/// emits the normalized rows as an array, CSV the same rows as a
+/// spreadsheet, and the table renders the same rows. Malformed-record
+/// counts are a stderr note, never stdout. Empty results keep the
+/// header in CSV mode and the human empty message otherwise (FR-1.7).
+fn history_payload(hist: &store::BalanceHistory, json: bool, csv: bool) -> Result<String> {
     if json {
         Ok(serde_json::to_string_pretty(&hist.rows)? + "\n")
+    } else if csv {
+        Ok(report::render_balance_history_csv(&hist.rows))
     } else if hist.rows.is_empty() {
         Ok("no balance history (llmu/balances.jsonl missing or empty)\n".to_string())
     } else {
@@ -960,7 +980,7 @@ mod tests {
             rows: hist_rows(),
             skipped: 2,
         };
-        let payload = history_payload(&hist, true).unwrap();
+        let payload = history_payload(&hist, true, false).unwrap();
         let v: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON payload");
         let rows = v.as_array().unwrap();
         assert_eq!(rows.len(), 1);
@@ -981,10 +1001,10 @@ mod tests {
             skipped: 0,
         };
         assert_eq!(
-            history_payload(&hist, false).unwrap(),
+            history_payload(&hist, false, false).unwrap(),
             "no balance history (llmu/balances.jsonl missing or empty)\n"
         );
-        assert_eq!(history_payload(&hist, true).unwrap(), "[]\n");
+        assert_eq!(history_payload(&hist, true, false).unwrap(), "[]\n");
     }
 
     #[test]
@@ -993,7 +1013,7 @@ mod tests {
             rows: hist_rows(),
             skipped: 0,
         };
-        let payload = history_payload(&hist, false).unwrap();
+        let payload = history_payload(&hist, false, false).unwrap();
         assert!(payload.contains("2026-08-01"));
         assert!(payload.contains("7.50"));
         assert!(payload.contains("2.50"));

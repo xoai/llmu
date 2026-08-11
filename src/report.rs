@@ -289,6 +289,167 @@ pub fn render_balance_history(rows: &[BalanceHistoryRow]) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// CSV output (FR-1, Task 8): shared RFC 4180 rendering plus the
+// command serializers, all over the same normalized rows the table and
+// JSON modes use. UTF-8, LF line endings, one header row, no new
+// dependencies.
+// ---------------------------------------------------------------------------
+
+/// RFC 4180 field escaping: quote only when the field contains a comma,
+/// double quote, CR, or LF; embedded quotes are doubled.
+pub fn csv_field(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\r') || s.contains('\n') {
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('"');
+        for c in s.chars() {
+            if c == '"' {
+                out.push('"');
+            }
+            out.push(c);
+        }
+        out.push('"');
+        out
+    } else {
+        s.to_string()
+    }
+}
+
+/// One CSV record: escaped fields joined by commas, LF-terminated.
+pub fn csv_row(fields: &[String]) -> String {
+    let mut out = String::new();
+    for (i, f) in fields.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&csv_field(f));
+    }
+    out.push('\n');
+    out
+}
+
+/// Shared renderer: exactly one header row plus the given rows. Empty
+/// `rows` still emit the header (FR-1.7), so every command prints a
+/// parseable CSV even with no data.
+pub fn render_csv(header: &[&str], rows: &[Vec<String>]) -> String {
+    let header: Vec<String> = header.iter().map(|h| h.to_string()).collect();
+    let mut out = csv_row(&header);
+    for row in rows {
+        out.push_str(&csv_row(row));
+    }
+    out
+}
+
+/// FR-1.4 usage CSV: consumes the same aggregated rows as the table and
+/// JSON modes. The group columns use the exact lowercase user-facing
+/// names in the user's `--group-by` argument order; numeric cells are
+/// machine values (no thousands separators, shortest float round-trip,
+/// lowercase booleans). Billed-cost rows are never added (FR-1.4).
+pub fn render_usage_csv(groups: &[Group], rows: &[Row]) -> String {
+    let mut header: Vec<&str> = vec!["period"];
+    header.extend(groups.iter().map(|g| match g {
+        Group::Provider => "provider",
+        Group::Model => "model",
+        Group::Source => "source",
+    }));
+    header.extend([
+        "requests",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "total_tokens",
+        "tool_calls",
+        "est_cost_usd",
+        "has_cost",
+    ]);
+    let rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| {
+            let mut cells = r.keys.clone();
+            cells.extend([
+                r.totals.requests.to_string(),
+                r.totals.input_tokens.to_string(),
+                r.totals.output_tokens.to_string(),
+                r.totals.cache_read_tokens.to_string(),
+                r.totals.cache_write_tokens.to_string(),
+                r.total_tokens.to_string(),
+                r.totals.tool_calls.to_string(),
+                r.totals.est_cost_usd.to_string(),
+                r.totals.has_cost.to_string(),
+            ]);
+            cells
+        })
+        .collect();
+    render_csv(&header, &rows)
+}
+
+/// FR-1.5 balance CSV: `provider,total,granted,topped_up,currency`.
+pub fn render_balance_csv(balances: &[BalanceSnapshot]) -> String {
+    let header = ["provider", "total", "granted", "topped_up", "currency"];
+    let rows: Vec<Vec<String>> = balances
+        .iter()
+        .map(|b| {
+            vec![
+                b.provider.clone(),
+                b.total.to_string(),
+                b.granted.to_string(),
+                b.topped_up.to_string(),
+                b.currency.clone(),
+            ]
+        })
+        .collect();
+    render_csv(&header, &rows)
+}
+
+/// FR-1.6 quota CSV: `provider,plan,window,used,limit,unit,resets_at`.
+/// `resets_at` is RFC 3339 when known, empty otherwise.
+pub fn render_quota_csv(quotas: &[QuotaSnapshot]) -> String {
+    let header = [
+        "provider", "plan", "window", "used", "limit", "unit", "resets_at",
+    ];
+    let rows: Vec<Vec<String>> = quotas
+        .iter()
+        .map(|q| {
+            vec![
+                q.provider.clone(),
+                q.plan.clone(),
+                q.window.clone(),
+                q.used.to_string(),
+                q.limit.to_string(),
+                q.unit.clone(),
+                q.resets_at.map(|r| r.to_rfc3339()).unwrap_or_default(),
+            ]
+        })
+        .collect();
+    render_csv(&header, &rows)
+}
+
+/// FR-2.7 history CSV: `from,to,provider,currency,opening,closing,
+/// spent,funded` over the same normalized rows the table and JSON modes
+/// use.
+pub fn render_balance_history_csv(rows: &[BalanceHistoryRow]) -> String {
+    let header = [
+        "from", "to", "provider", "currency", "opening", "closing", "spent", "funded",
+    ];
+    let rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| {
+            vec![
+                r.from.to_string(),
+                r.to.to_string(),
+                r.provider.clone(),
+                r.currency.clone(),
+                r.opening.to_string(),
+                r.closing.to_string(),
+                r.spent.to_string(),
+                r.funded.to_string(),
+            ]
+        })
+        .collect();
+    render_csv(&header, &rows)
+}
+
 /// Rendering style for one quota row: `Command` matches `llmu quota`,
 /// `Overview` matches the bare `llmu` landing view. The two views
 /// differ only in indentation, resets decoration, and the limit==0
