@@ -346,6 +346,9 @@ impl Config {
 # env vars and from Claude Code / Codex / OpenCode / kimi-cli files already
 # on this machine (`llmu providers` shows what was found and from where).
 # Set keys here only to override discovery. Precedence: this file > env > discovered.
+# Discovery is read-only except a validated OAuth refresh of a supported
+# plaintext Gemini CLI / Claude Code credential file (see docs/providers.md);
+# encrypted stores, keychains, and access-only tokens are never touched.
 
 [anthropic]
 # Org Admin API key (sk-ant-admin-...)      env: ANTHROPIC_ADMIN_KEY
@@ -372,6 +375,14 @@ impl Config {
 [gemini]
 # JSONL file of per-request usageMetadata your app appends (see README).
 # usage_log = "~/logs/gemini_usage.jsonl"
+#
+# Code Assist quotas auto-discover Gemini CLI's plaintext OAuth credentials
+# (${GEMINI_CLI_HOME:-$HOME}/.gemini/oauth_creds.json). Override the file or
+# the cloud project here; refresh is the ONLY credential write llmu performs,
+# and encrypted/keychain stores (sibling gemini-credentials.json) are never
+# read or modified.
+# credentials = "~/.gemini/oauth_creds.json"
+# project = "my-cloud-project"  # else GOOGLE_CLOUD_PROJECT, then GOOGLE_CLOUD_PROJECT_ID
 
 [claude_code]
 enabled = true
@@ -389,8 +400,9 @@ enabled = true
 # home = "~/.codex"
 
 [http_cache]
-# Optional TTL (seconds) for raw HTTP GET/JSON response caching.
-# Zero (default) disables cache reads and writes entirely.
+# Optional TTL (seconds) for caching successful JSON responses of eligible
+# side-effect-free GET requests only — never OAuth exchanges, POSTs, or
+# local-file reads. Zero (default) disables cache reads and writes entirely.
 # ttl_seconds = 300
 
 # USD per 1M tokens: [input, output, cache_read, cache_write]
