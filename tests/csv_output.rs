@@ -162,10 +162,13 @@ impl Sandbox {
 
 /// Four transcript lines: two known-priced Claude models plus two
 /// RFC-4180 escape exercises (a model containing LF, and one containing
-/// comma + quotes). All timestamps are recent so both the 7d usage
-/// window and the 5h local quota window see them.
-fn fixture_lines(now: chrono::DateTime<chrono::Utc>) -> Vec<String> {
-    let t = |h: i64| (now - chrono::Duration::hours(h)).to_rfc3339();
+/// comma + quotes). `base` is the newest instant; the events sit at
+/// `base - 1h` down to `base - 4h`. The usage test passes a fixed base
+/// that straddles midnight UTC, so the exact-match output also proves
+/// `aggregate` sorts the prior period first (FR-1.4); the quota test
+/// passes `Utc::now()` so the 5h local quota window sees every event.
+fn fixture_lines(base: chrono::DateTime<chrono::Utc>) -> Vec<String> {
+    let t = |h: i64| (base - chrono::Duration::hours(h)).to_rfc3339();
     let mk = |ts: String, model: String, input: u64, output: u64, cr: u64, cw: u64| {
         serde_json::json!({
             "timestamp": ts,
@@ -192,31 +195,44 @@ fn fixture_lines(now: chrono::DateTime<chrono::Utc>) -> Vec<String> {
     ]
 }
 
+/// Fixed instants straddling midnight UTC (2026-08-01T22:00/23:00Z and
+/// 2026-08-02T00:00/01:00Z), so the deterministic prior-period-first
+/// row order is exactly the case that used to flake around 01:00-03:59
+/// UTC with now-relative timestamps.
+fn fixed_fixture_base() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339("2026-08-02T02:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc)
+}
+
 #[test]
 fn usage_csv_emits_exact_machine_header_and_rows() {
     let sb = Sandbox::new("usage");
-    let now = chrono::Utc::now();
-    sb.write_logs(&fixture_lines(now));
-    let out = sb.run(&["usage", "--csv", "--group-by", "source,model"]);
+    sb.write_logs(&fixture_lines(fixed_fixture_base()));
+    let out = sb.run(&[
+        "usage",
+        "--csv",
+        "--group-by",
+        "source,model",
+        "--since",
+        "2026-07-01",
+    ]);
     assert!(
         out.status.success(),
         "exit {:?}, stderr: {}",
         out.status.code(),
         sb.stderr(&out)
     );
-    let day = |h: i64| (now - chrono::Duration::hours(h)).format("%Y-%m-%d");
-    let expected = format!(
-        "period,source,model,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,total_tokens,tool_calls,est_cost_usd,has_cost\n\
-         {},local,claude-haiku-4-5,1,200000,0,0,0,200000,0,0.2,true\n\
-         {},local,claude-sonnet-4-5,1,1000000,0,0,0,1000000,0,3,true\n\
-         {},local,\"lf\nmodel\",1,1,1,1,1,4,0,0,false\n\
-         {},local,\"my, \"\"weird\"\" model\",1,2,3,4,5,14,0,0,false\n",
-        day(2),
-        day(1),
-        day(3),
-        day(4),
+    let expected = "period,source,model,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,total_tokens,tool_calls,est_cost_usd,has_cost\n\
+         2026-08-01,local,\"lf\nmodel\",1,1,1,1,1,4,0,0,false\n\
+         2026-08-01,local,\"my, \"\"weird\"\" model\",1,2,3,4,5,14,0,0,false\n\
+         2026-08-02,local,claude-haiku-4-5,1,200000,0,0,0,200000,0,0.2,true\n\
+         2026-08-02,local,claude-sonnet-4-5,1,1000000,0,0,0,1000000,0,3,true\n";
+    assert_eq!(
+        sb.stdout(&out),
+        expected,
+        "exact ordered output: the 08-01 period rows must sort before the 08-02 rows (FR-1.4)"
     );
-    assert_eq!(sb.stdout(&out), expected);
     assert!(
         !sb.stdout(&out).contains("Billed"),
         "usage CSV must never add billed-cost rows (FR-1.4)"
@@ -275,8 +291,7 @@ fn balance_csv_empty_results_still_emit_header_and_never_mutate_the_store() {
 #[test]
 fn quota_csv_emits_local_rows_and_keeps_headers_on_empty() {
     let sb = Sandbox::new("quota-rows");
-    let now = chrono::Utc::now();
-    sb.write_logs(&fixture_lines(now));
+    sb.write_logs(&fixture_lines(chrono::Utc::now()));
     let out = sb.run(&["quota", "--csv"]);
     assert!(out.status.success());
     assert_eq!(

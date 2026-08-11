@@ -18,7 +18,7 @@ use providers::{FetchContext, QuotaFetch};
 use report::{Group, Period, QuotaStyle};
 use types::*;
 
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(
     name = "llmu",
     version,
@@ -37,7 +37,7 @@ struct Cli {
     cmd: Option<Cmd>,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand)]
 enum Cmd {
     /// Write a sample config file
     Init,
@@ -79,7 +79,7 @@ enum Cmd {
     },
 }
 
-#[derive(Args, Debug)]
+#[derive(Args)]
 struct UsageArgs {
     /// Window start: 7d, 24h, mtd, wtd, or YYYY-MM-DD
     #[arg(long, default_value = "7d")]
@@ -1075,7 +1075,9 @@ mod tests {
             &["llmu", "quota", "--csv", "--json"],
         ];
         for args in cases {
-            let err = Cli::try_parse_from(*args).unwrap_err();
+            let err = Cli::try_parse_from(*args)
+                .err()
+                .expect("--json --csv must be rejected by clap");
             assert!(
                 err.to_string().contains("cannot be used with"),
                 "--json --csv must be a clap conflict, got: {err}"
@@ -1087,19 +1089,22 @@ mod tests {
     /// combines freely with `--csv`.
     #[test]
     fn csv_flags_parse_on_every_report_command() {
-        let usage = Cli::try_parse_from(["llmu", "usage", "--csv"]).unwrap();
-        let Cmd::Usage(a) = usage.cmd.unwrap() else {
-            panic!("usage subcommand")
+        let usage =
+            Cli::try_parse_from(["llmu", "usage", "--csv"]).expect("usage --csv must parse");
+        let Some(Cmd::Usage(a)) = usage.cmd else {
+            panic!("expected the usage subcommand")
         };
         assert!(a.csv && !a.json);
-        let balance = Cli::try_parse_from(["llmu", "balance", "--history", "--csv"]).unwrap();
-        let Cmd::Balance { csv, json, history } = balance.cmd.unwrap() else {
-            panic!("balance subcommand")
+        let balance = Cli::try_parse_from(["llmu", "balance", "--history", "--csv"])
+            .expect("balance --history --csv must parse");
+        let Some(Cmd::Balance { csv, json, history }) = balance.cmd else {
+            panic!("expected the balance subcommand")
         };
         assert!(csv && history && !json);
-        let quota = Cli::try_parse_from(["llmu", "quota", "--csv"]).unwrap();
-        let Cmd::Quota { csv, json } = quota.cmd.unwrap() else {
-            panic!("quota subcommand")
+        let quota =
+            Cli::try_parse_from(["llmu", "quota", "--csv"]).expect("quota --csv must parse");
+        let Some(Cmd::Quota { csv, json }) = quota.cmd else {
+            panic!("expected the quota subcommand")
         };
         assert!(csv && !json);
     }
