@@ -44,6 +44,10 @@ enum Cmd {
     Balance {
         #[arg(long)]
         json: bool,
+        /// Offline daily balance history from the local balances.jsonl
+        /// (no provider requests, no snapshot append)
+        #[arg(long)]
+        history: bool,
     },
     /// Subscription quota / burn (local Claude Code window, GLM plan, ...)
     Quota {
@@ -408,29 +412,7 @@ fn main() -> Result<()> {
             }
         }
 
-        Cmd::Balance { json } => {
-            let g = gather(&cfg, now, now, None, false, false, true);
-            store::record_balances(&g.balances).ok();
-            if json {
-                println!("{}", serde_json::to_string_pretty(&g.balances)?);
-            } else if g.balances.is_empty() {
-                println!("no balance sources configured (deepseek / kimi)");
-            } else {
-                println!(
-                    "{:<10} {:>12} {:>12} {:>12}  currency",
-                    "provider", "total", "granted", "topped-up"
-                );
-                for b in &g.balances {
-                    println!(
-                        "{:<10} {:>12.2} {:>12.2} {:>12.2}  {}",
-                        b.provider, b.total, b.granted, b.topped_up, b.currency
-                    );
-                }
-            }
-            for n in &g.notes {
-                eprintln!("note: {n}");
-            }
-        }
+        Cmd::Balance { json, history } => handle_balance(&cfg, now, json, history)?,
 
         Cmd::Quota { json } => {
             let since = now - Duration::hours(6);
@@ -459,6 +441,69 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `llmu balance` dispatch. The `--history` branch (FR-2.1) reads only
+/// the offline `llmu/balances.jsonl` store: it makes no provider requests
+/// and appends no snapshot. The ordinary branch snapshots fetched
+/// balances and surfaces write failures instead of discarding them
+/// (FR-2.9).
+fn handle_balance(cfg: &Config, now: DateTime<Utc>, json: bool, history: bool) -> Result<()> {
+    if history {
+        let hist = match store::read_balance_history() {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("note: cannot read balance history: {e}");
+                return Ok(());
+            }
+        };
+        if hist.skipped > 0 {
+            eprintln!(
+                "note: skipped {} malformed balance-history record(s)",
+                hist.skipped
+            );
+        }
+        print!("{}", history_payload(&hist, json)?);
+        return Ok(());
+    }
+    let mut g = gather(cfg, now, now, None, false, false, true);
+    if let Err(e) = store::record_balances(&g.balances) {
+        g.notes
+            .push(format!("failed to append balance snapshot: {e}"));
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&g.balances)?);
+    } else if g.balances.is_empty() {
+        println!("no balance sources configured (deepseek / kimi)");
+    } else {
+        println!(
+            "{:<10} {:>12} {:>12} {:>12}  currency",
+            "provider", "total", "granted", "topped-up"
+        );
+        for b in &g.balances {
+            println!(
+                "{:<10} {:>12.2} {:>12.2} {:>12.2}  {}",
+                b.provider, b.total, b.granted, b.topped_up, b.currency
+            );
+        }
+    }
+    for n in &g.notes {
+        eprintln!("note: {n}");
+    }
+    Ok(())
+}
+
+/// The complete stdout payload for `balance --history` (FR-2.7): JSON
+/// emits the normalized rows as an array; the table renders the same
+/// rows. Malformed-record counts are a stderr note, never stdout.
+fn history_payload(hist: &store::BalanceHistory, json: bool) -> Result<String> {
+    if json {
+        Ok(serde_json::to_string_pretty(&hist.rows)? + "\n")
+    } else if hist.rows.is_empty() {
+        Ok("no balance history (llmu/balances.jsonl missing or empty)\n".to_string())
+    } else {
+        Ok(ansi::table(&report::render_balance_history(&hist.rows)))
+    }
 }
 
 /// Bare `llmu`: the zero-config landing view. Auto-discovers whatever
@@ -827,6 +872,107 @@ mod tests {
             include_str!("providers/openai.rs"),
             "api.openai.com",
             "Bearer",
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Offline balance history dispatch (FR-2, FR-2.9): RED contracts.
+    // -------------------------------------------------------------------
+
+    fn hist_rows() -> Vec<BalanceHistoryRow> {
+        vec![BalanceHistoryRow {
+            from: chrono::NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+            to: chrono::NaiveDate::from_ymd_opt(2026, 8, 2).unwrap(),
+            provider: "deepseek".into(),
+            currency: "USD".into(),
+            opening: 10.0,
+            closing: 7.5,
+            spent: 2.5,
+            funded: 0.0,
+        }]
+    }
+
+    #[test]
+    fn balance_history_json_payload_is_an_array_of_rows() {
+        let hist = store::BalanceHistory {
+            rows: hist_rows(),
+            skipped: 2,
+        };
+        let payload = history_payload(&hist, true).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON payload");
+        let rows = v.as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["from"], "2026-08-01");
+        assert_eq!(rows[0]["to"], "2026-08-02");
+        assert_eq!(rows[0]["provider"], "deepseek");
+        assert_eq!(rows[0]["spent"], 2.5);
+        assert!(
+            !payload.contains("skipped"),
+            "the malformed-record count is a stderr note, never part of JSON"
+        );
+    }
+
+    #[test]
+    fn balance_history_empty_payload_prints_empty_message() {
+        let hist = store::BalanceHistory {
+            rows: vec![],
+            skipped: 0,
+        };
+        assert_eq!(
+            history_payload(&hist, false).unwrap(),
+            "no balance history (llmu/balances.jsonl missing or empty)\n"
+        );
+        assert_eq!(history_payload(&hist, true).unwrap(), "[]\n");
+    }
+
+    #[test]
+    fn balance_history_table_payload_renders_the_rows() {
+        let hist = store::BalanceHistory {
+            rows: hist_rows(),
+            skipped: 0,
+        };
+        let payload = history_payload(&hist, false).unwrap();
+        assert!(payload.contains("2026-08-01"));
+        assert!(payload.contains("7.50"));
+        assert!(payload.contains("2.50"));
+    }
+
+    /// The history branch reads the store and returns before any network
+    /// gather or snapshot append can run (FR-2.1: no provider requests,
+    /// no append).
+    #[test]
+    fn balance_history_dispatch_never_gathers_or_appends() {
+        let src = include_str!("main.rs");
+        let after = src.split("if history {").nth(1).expect("history branch");
+        let branch = after.split("return Ok(())").next().expect("branch end");
+        assert!(
+            branch.contains("store::read_balance_history"),
+            "the history branch must read the offline store"
+        );
+        assert!(
+            !branch.contains("gather("),
+            "the history branch must never call gather (no network)"
+        );
+        assert!(
+            !branch.contains("record_balances("),
+            "the history branch must never append a snapshot"
+        );
+    }
+
+    /// FR-2.9: ordinary `llmu balance` snapshot-write failures surface as
+    /// a note instead of the old silent `.ok()` discard. The needle is
+    /// built by concatenation so this test's own source cannot satisfy it.
+    #[test]
+    fn balance_snapshot_write_failures_are_surfaced() {
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("failed to append balance snapshot"),
+            "snapshot-write failures must carry a note (FR-2.9)"
+        );
+        let discard = ["record_balances(&g.balances)", ".ok()"].concat();
+        assert!(
+            !src.contains(&discard),
+            "the silent discard must be gone (FR-2.9)"
         );
     }
 }

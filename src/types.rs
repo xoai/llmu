@@ -89,6 +89,23 @@ pub struct BalanceSnapshot {
     pub topped_up: f64,
 }
 
+/// One interval between consecutive observed UTC daily closes within a
+/// provider/currency balance series (FR-2.4). `from` and `to` are the
+/// actual UTC dates, so missing days stay visible rather than being
+/// synthesized. Decreases set `spent` only, increases `funded` only,
+/// equality zeroes both; different currencies are never combined.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BalanceHistoryRow {
+    pub from: chrono::NaiveDate,
+    pub to: chrono::NaiveDate,
+    pub provider: String,
+    pub currency: String,
+    pub opening: f64,
+    pub closing: f64,
+    pub spent: f64,
+    pub funded: f64,
+}
+
 /// Everything one provider fetch returns.
 #[derive(Debug, Default)]
 pub struct Fetch {

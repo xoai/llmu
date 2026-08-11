@@ -233,6 +233,62 @@ pub fn render_table(period: Period, groups: &[Group], rows: &[Row]) -> String {
     out
 }
 
+/// Deterministic aligned table over the normalized balance-history rows
+/// (FR-2.7): `from`/`to`/`provider`/`currency` left-aligned, money
+/// columns right-aligned with two decimals, header and no totals row.
+pub fn render_balance_history(rows: &[BalanceHistoryRow]) -> String {
+    let mut cells: Vec<Vec<String>> = vec![[
+        "from", "to", "provider", "currency", "opening", "closing", "spent", "funded",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()];
+    for r in rows {
+        cells.push(vec![
+            r.from.to_string(),
+            r.to.to_string(),
+            r.provider.clone(),
+            r.currency.clone(),
+            format!("{:.2}", r.opening),
+            format!("{:.2}", r.closing),
+            format!("{:.2}", r.spent),
+            format!("{:.2}", r.funded),
+        ]);
+    }
+    let cols = cells[0].len();
+    let mut widths = vec![0usize; cols];
+    for row in &cells {
+        for (i, c) in row.iter().enumerate() {
+            widths[i] = widths[i].max(c.chars().count());
+        }
+    }
+    let mut out = String::new();
+    for (ri, row) in cells.iter().enumerate() {
+        let mut line = String::new();
+        for (i, c) in row.iter().enumerate() {
+            let pad = widths[i].saturating_sub(c.chars().count());
+            if i < 4 {
+                line.push_str(c);
+                line.push_str(&" ".repeat(pad));
+            } else {
+                line.push_str(&" ".repeat(pad));
+                line.push_str(c);
+            }
+            if i + 1 < cols {
+                line.push_str("  ");
+            }
+        }
+        out.push_str(line.trim_end());
+        out.push('\n');
+        if ri == 0 {
+            let sep: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
+            out.push_str(&sep.join("  "));
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// Rendering style for one quota row: `Command` matches `llmu quota`,
 /// `Overview` matches the bare `llmu` landing view. The two views
 /// differ only in indentation, resets decoration, and the limit==0
@@ -391,5 +447,51 @@ mod tests {
             render_quota_with_color(&limit_zero(), QuotaStyle::Overview, false),
             "  codex    prolite                  last 7d: 100 requests"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Offline balance history table (FR-2.7): RED contract.
+    // -------------------------------------------------------------------
+
+    fn hist_row() -> BalanceHistoryRow {
+        BalanceHistoryRow {
+            from: chrono::NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+            to: chrono::NaiveDate::from_ymd_opt(2026, 8, 2).unwrap(),
+            provider: "deepseek".into(),
+            currency: "USD".into(),
+            opening: 10.0,
+            closing: 7.5,
+            spent: 2.5,
+            funded: 0.0,
+        }
+    }
+
+    /// Exact table bytes for one decrease row: keys left-aligned, money
+    /// right-aligned, header separated, trailing newline.
+    #[test]
+    fn render_balance_history_matches_exact_output() {
+        let expected =
+            "from        to          provider  currency  opening  closing  spent  funded\n\
+         ----------  ----------  --------  --------  -------  -------  -----  ------\n\
+         2026-08-01  2026-08-02  deepseek  USD         10.00     7.50   2.50    0.00\n";
+        assert_eq!(render_balance_history(&[hist_row()]), expected);
+    }
+
+    /// Every row must appear in table order with its own values.
+    #[test]
+    fn render_balance_history_lists_rows_in_order() {
+        let mut second = hist_row();
+        second.provider = "kimi".into();
+        second.to = chrono::NaiveDate::from_ymd_opt(2026, 8, 3).unwrap();
+        second.opening = 5.0;
+        second.closing = 7.0;
+        second.spent = 0.0;
+        second.funded = 2.0;
+        let s = render_balance_history(&[hist_row(), second]);
+        let deepseek = s.find("deepseek").unwrap();
+        let kimi = s.find("kimi").unwrap();
+        assert!(deepseek < kimi, "rows render in given order");
+        assert!(s.contains("7.50") && s.contains("2.50") && s.contains("0.00"));
+        assert!(s.contains("2.00"));
     }
 }
