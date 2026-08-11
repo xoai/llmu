@@ -1037,4 +1037,92 @@ mod tests {
             "the silent discard must be gone (FR-2.9)"
         );
     }
+
+    // -------------------------------------------------------------------
+    // CSV output dispatch (FR-1, Task 8): RED clap conflict and payload
+    // contracts.
+    // -------------------------------------------------------------------
+
+    /// FR-1.2: clap itself rejects `--json --csv` on every report
+    /// command — before any config/provider read or store mutation.
+    #[test]
+    fn csv_conflicts_with_json_at_parse_time() {
+        let cases: &[&[&str]] = &[
+            &["llmu", "usage", "--json", "--csv"],
+            &["llmu", "usage", "--csv", "--json"],
+            &["llmu", "balance", "--json", "--csv"],
+            &["llmu", "balance", "--history", "--json", "--csv"],
+            &["llmu", "quota", "--csv", "--json"],
+        ];
+        for args in cases {
+            let err = Cli::try_parse_from(*args).unwrap_err();
+            assert!(
+                err.to_string().contains("cannot be used with"),
+                "--json --csv must be a clap conflict, got: {err}"
+            );
+        }
+    }
+
+    /// FR-1.1: `--csv` parses on usage, balance, quota; `--history`
+    /// combines freely with `--csv`.
+    #[test]
+    fn csv_flags_parse_on_every_report_command() {
+        let usage = Cli::try_parse_from(["llmu", "usage", "--csv"]).unwrap();
+        let Cmd::Usage(a) = usage.cmd.unwrap() else {
+            panic!("usage subcommand")
+        };
+        assert!(a.csv && !a.json);
+        let balance = Cli::try_parse_from(["llmu", "balance", "--history", "--csv"]).unwrap();
+        let Cmd::Balance { csv, json, history } = balance.cmd.unwrap() else {
+            panic!("balance subcommand")
+        };
+        assert!(csv && history && !json);
+        let quota = Cli::try_parse_from(["llmu", "quota", "--csv"]).unwrap();
+        let Cmd::Quota { csv, json } = quota.cmd.unwrap() else {
+            panic!("quota subcommand")
+        };
+        assert!(csv && !json);
+    }
+
+    /// The rejection must happen before `Config::load`, which precedes
+    /// every provider read, network call, and balance-store mutation.
+    #[test]
+    fn csv_conflict_is_rejected_before_config_or_provider_work() {
+        let src = include_str!("main.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        let parse = prod
+            .find("Cli::parse()")
+            .expect("main must parse the CLI first");
+        let config = prod
+            .find("Config::load")
+            .expect("main must load the config");
+        assert!(
+            parse < config,
+            "clap must reject --json --csv before any config/provider read (FR-1.2)"
+        );
+    }
+
+    /// FR-2.7/FR-1.7: `balance --history --csv` renders the same
+    /// normalized rows as JSON/table, and empty history still emits the
+    /// header.
+    #[test]
+    fn history_csv_payload_emits_rows_or_header() {
+        let hist = store::BalanceHistory {
+            rows: hist_rows(),
+            skipped: 0,
+        };
+        assert_eq!(
+            history_payload(&hist, false, true).unwrap(),
+            "from,to,provider,currency,opening,closing,spent,funded\n\
+             2026-08-01,2026-08-02,deepseek,USD,10,7.5,2.5,0\n"
+        );
+        let empty = store::BalanceHistory {
+            rows: vec![],
+            skipped: 0,
+        };
+        assert_eq!(
+            history_payload(&empty, false, true).unwrap(),
+            "from,to,provider,currency,opening,closing,spent,funded\n"
+        );
+    }
 }
