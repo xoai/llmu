@@ -207,7 +207,7 @@ interval with the actual UTC dates — `from`, `to`, `opening`, `closing`,
 `spent`, and `funded` — so missing days stay visible as gaps instead of
 being synthesized. A decrease sets `spent`, an increase sets `funded`,
 and equality sets both to zero; currencies are never combined or
-converted. malformed/non-finite records are skipped and summarized once
+converted. Malformed/non-finite records are skipped and summarized once
 in a stderr note with their count. A missing file is empty history; any
 other read failure (permissions, disk) is surfaced as an error, never
 silently treated as empty.
