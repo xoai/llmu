@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Live watch mode now renders quota rows beyond the first six when terminal
+  space permits; compact terminals report the number of additional rows
+  instead of silently hiding later providers such as GLM.
+
 ## [0.1.1] - 2026-08-11
 
 ### Added
