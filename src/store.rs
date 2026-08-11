@@ -51,21 +51,25 @@ pub struct BalanceHistory {
 }
 
 /// Balance history from the platform data directory's
-/// `llmu/balances.jsonl` (FR-2.1). A missing file is an empty history.
-pub fn read_balance_history() -> BalanceHistory {
+/// `llmu/balances.jsonl` (FR-2.1). A missing file is an empty history;
+/// any other read failure (permissions, directory in the file's place,
+/// disk) is an error so the CLI can surface it instead of silently
+/// pretending history is empty (FR-2.8, no-silent-failure rule).
+pub fn read_balance_history() -> Result<BalanceHistory> {
     read_balance_history_in(&data_dir())
 }
 
-pub(crate) fn read_balance_history_in(dir: &std::path::Path) -> BalanceHistory {
+pub(crate) fn read_balance_history_in(dir: &std::path::Path) -> Result<BalanceHistory> {
     let path = dir.join("balances.jsonl");
     let raw = match std::fs::read_to_string(&path) {
         Ok(raw) => raw,
-        Err(_) => {
-            return BalanceHistory {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BalanceHistory {
                 rows: vec![],
                 skipped: 0,
-            }
+            })
         }
+        Err(e) => return Err(e.into()),
     };
     // Daily close per (provider, currency, UTC date): the record with the
     // latest timestamp wins; equal timestamps pick the later physical
@@ -122,7 +126,7 @@ pub(crate) fn read_balance_history_in(dir: &std::path::Path) -> BalanceHistory {
             .then_with(|| a.currency.cmp(&b.currency))
             .then_with(|| a.from.cmp(&b.from))
     });
-    BalanceHistory { rows, skipped }
+    Ok(BalanceHistory { rows, skipped })
 }
 
 /// Daily close per (provider, currency, UTC date): the observed record
@@ -318,7 +322,7 @@ mod tests {
     #[test]
     fn missing_history_file_is_empty_history() {
         let dir = tmp_dir("hist-missing");
-        let h = read_balance_history_in(&dir);
+        let h = read_balance_history_in(&dir).unwrap();
         assert!(h.rows.is_empty());
         assert_eq!(h.skipped, 0);
         let _ = std::fs::remove_dir_all(&dir);
@@ -341,7 +345,7 @@ mod tests {
                 hist("2026-08-03T00:00:00Z", "deepseek", "USD", 8.0),
             ],
         );
-        let h = read_balance_history_in(&dir);
+        let h = read_balance_history_in(&dir).unwrap();
         assert_eq!(h.skipped, 7);
         assert_eq!(h.rows.len(), 1);
         assert_eq!(h.rows[0].from.to_string(), "2026-08-01");
@@ -362,7 +366,7 @@ mod tests {
                 hist("2026-08-02T23:00:00Z", "deepseek", "USD", 9.5),
             ],
         );
-        let h = read_balance_history_in(&dir);
+        let h = read_balance_history_in(&dir).unwrap();
         assert_eq!(h.rows.len(), 1);
         assert_eq!(h.rows[0].opening, 8.0);
         assert_eq!(h.rows[0].closing, 9.5);
@@ -381,7 +385,7 @@ mod tests {
                 hist("2026-08-03T12:00:00Z", "deepseek", "USD", 6.0),
             ],
         );
-        let h = read_balance_history_in(&dir);
+        let h = read_balance_history_in(&dir).unwrap();
         assert_eq!(h.rows.len(), 2);
         assert_eq!(h.rows[0].closing, 8.0);
         let _ = std::fs::remove_dir_all(&dir);
@@ -401,8 +405,8 @@ mod tests {
             &d2,
             &[ordered[2].clone(), ordered[0].clone(), ordered[1].clone()],
         );
-        let a = read_balance_history_in(&d1);
-        let b = read_balance_history_in(&d2);
+        let a = read_balance_history_in(&d1).unwrap();
+        let b = read_balance_history_in(&d2).unwrap();
         assert_eq!(a.rows, b.rows);
         assert_eq!(a.skipped, b.skipped);
         let _ = std::fs::remove_dir_all(&d1);
@@ -423,7 +427,7 @@ mod tests {
                 hist("2026-08-02T00:00:00Z", "deepseek", "CNY", 4.0),
             ],
         );
-        let h = read_balance_history_in(&dir);
+        let h = read_balance_history_in(&dir).unwrap();
         assert_eq!(h.rows.len(), 3);
         for r in &h.rows {
             match (r.provider.as_str(), r.currency.as_str()) {
@@ -456,7 +460,7 @@ mod tests {
                 hist("2026-08-04T00:00:00Z", "deepseek", "USD", 8.0),
             ],
         );
-        let h = read_balance_history_in(&dir);
+        let h = read_balance_history_in(&dir).unwrap();
         assert_eq!(h.rows.len(), 2);
         assert_eq!(h.rows[0].to.to_string(), "2026-08-02");
         assert_eq!(h.rows[1].from.to_string(), "2026-08-02");
@@ -478,7 +482,7 @@ mod tests {
                 hist("2026-08-02T00:00:00Z", "flat", "USD", 6.0),
             ],
         );
-        let h = read_balance_history_in(&dir);
+        let h = read_balance_history_in(&dir).unwrap();
         assert_eq!(h.rows.len(), 3);
         let by = |p: &str| h.rows.iter().find(|r| r.provider == p).unwrap();
         assert_eq!(by("down").spent, 3.0);
@@ -504,7 +508,7 @@ mod tests {
                 hist("2026-08-04T00:00:00Z", "alpha", "CNY", 3.5),
             ],
         );
-        let h = read_balance_history_in(&dir);
+        let h = read_balance_history_in(&dir).unwrap();
         let keys: Vec<(String, String, String, String)> = h
             .rows
             .iter()
@@ -550,9 +554,26 @@ mod tests {
             &dir,
             &[hist("2026-08-01T00:00:00Z", "deepseek", "USD", 10.0)],
         );
-        let h = read_balance_history_in(&dir);
+        let h = read_balance_history_in(&dir).unwrap();
         assert!(h.rows.is_empty());
         assert_eq!(h.skipped, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FR-2.8 / no-silent-failure: only `ErrorKind::NotFound` is an empty
+    /// history. A deterministic non-NotFound read failure — a directory
+    /// at the balances.jsonl file path yields `IsADirectory` on every
+    /// platform without permission games — must surface as an error,
+    /// never masquerade as an empty history.
+    #[test]
+    fn unreadable_history_file_is_surfaced_not_empty() {
+        let dir = tmp_dir("hist-unreadable");
+        std::fs::create_dir_all(dir.join("balances.jsonl")).unwrap();
+        let r = read_balance_history_in(&dir);
+        assert!(
+            r.is_err(),
+            "an unreadable balances.jsonl must surface an error"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

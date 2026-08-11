@@ -450,7 +450,13 @@ fn main() -> Result<()> {
 /// (FR-2.9).
 fn handle_balance(cfg: &Config, now: DateTime<Utc>, json: bool, history: bool) -> Result<()> {
     if history {
-        let hist = store::read_balance_history();
+        let hist = match store::read_balance_history() {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("note: cannot read balance history: {e}");
+                return Ok(());
+            }
+        };
         if hist.skipped > 0 {
             eprintln!(
                 "note: skipped {} malformed balance-history record(s)",

@@ -206,6 +206,32 @@ fn missing_history_file_is_an_empty_history() {
 }
 
 #[test]
+fn unreadable_history_file_is_reported_not_misleading() {
+    let sb = Sandbox::new("unreadable");
+    // A directory in the balances.jsonl file's place is a deterministic
+    // non-NotFound read failure on every platform (no permission games).
+    fs::create_dir_all(sb.balances_path()).unwrap();
+    let out = sb.run(&["balance", "--history"]);
+    assert!(out.status.success());
+    assert!(
+        !sb.stdout(&out).contains("missing or empty"),
+        "an unreadable history file must not claim 'missing or empty'"
+    );
+    let stderr = sb.stderr(&out);
+    assert!(
+        stderr.contains("note:") && stderr.contains("balance history"),
+        "the read failure must surface as a stderr note, got: {stderr:?}"
+    );
+    assert!(
+        fs::metadata(sb.balances_path())
+            .map(|m| m.is_dir())
+            .unwrap_or(false),
+        "the history path must remain untouched (no append, no network)"
+    );
+    let _ = fs::remove_dir_all(&sb.dir);
+}
+
+#[test]
 fn history_json_derives_daily_intervals_deterministically() {
     let sb = Sandbox::new("json");
     sb.write_history(&fixture_lines());
