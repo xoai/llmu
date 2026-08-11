@@ -1,5 +1,6 @@
 mod ansi;
 mod config;
+mod credentials;
 mod discover;
 mod http;
 mod local;
