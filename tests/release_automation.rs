@@ -11,7 +11,8 @@
 //!   resolve-release, build, publish), default-branch trigger, manual
 //!   recovery input, exact five-target matrix, aggregate draft publication.
 //! * `release-please-config.json` / `.release-please-manifest.json` —
-//!   skip-changelog, draft, force-tag-creation, root package at 0.1.0.
+//!   skip-changelog, draft, force-tag-creation, root package version synchronized
+//!   with Cargo.toml.
 //! * `README.md` — release-PR lifecycle documentation.
 //!
 //! Everything is std-only. Tests must fail because the finalizer / config /
@@ -60,6 +61,10 @@ fn manifest_path() -> PathBuf {
     repo_root().join(".release-please-manifest.json")
 }
 
+fn cargo_path() -> PathBuf {
+    repo_root().join("Cargo.toml")
+}
+
 fn readme_path() -> PathBuf {
     repo_root().join("README.md")
 }
@@ -79,6 +84,10 @@ fn config_text() -> String {
 
 fn manifest_text() -> String {
     read_named(&manifest_path(), ".release-please-manifest.json")
+}
+
+fn cargo_text() -> String {
+    read_named(&cargo_path(), "Cargo.toml")
 }
 
 fn readme_text() -> String {
@@ -215,6 +224,29 @@ fn json_key_value(text: &str, key: &str, value: &str) -> bool {
         from = idx + 1;
     }
     false
+}
+
+fn cargo_package_version(text: &str) -> Option<String> {
+    let mut in_package = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line == "[package]" {
+            in_package = true;
+            continue;
+        }
+        if in_package && line.starts_with('[') {
+            break;
+        }
+        if in_package {
+            let Some(rest) = line.strip_prefix("version") else {
+                continue;
+            };
+            let rest = rest.trim_start().strip_prefix('=')?.trim_start();
+            let quoted = rest.strip_prefix('"')?;
+            return quoted.find('"').map(|end| quoted[..end].to_string());
+        }
+    }
+    None
 }
 
 /// Exactly two-space-indented `key:` lines at the `jobs:` level.
@@ -1136,13 +1168,20 @@ fn release_please_config_skip_changelog_draft_forced_tags() {
     );
 }
 
-/// .release-please-manifest.json initializes the root package at 0.1.0.
+/// The mutable Release Please state must advance in lockstep with Cargo.toml.
 #[test]
-fn release_please_manifest_initializes_llmu_at_0_1_0() {
+fn release_please_manifest_matches_cargo_package_version() {
     let m = manifest_text();
+    let version = cargo_package_version(&cargo_text())
+        .expect("Cargo.toml must declare the root [package] version");
+    let parts: Vec<&str> = version.split('.').collect();
     assert!(
-        json_key_value(&m, ".", "0.1.0"),
-        ".release-please-manifest.json must initialize the root package at 0.1.0"
+        parts.len() == 3 && parts.iter().all(|part| part.parse::<u64>().is_ok()),
+        "Cargo.toml package version must be numeric semver, got {version}"
+    );
+    assert!(
+        json_key_value(&m, ".", &version),
+        ".release-please-manifest.json root version must match Cargo.toml ({version})"
     );
 }
 
