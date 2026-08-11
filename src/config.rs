@@ -38,11 +38,6 @@ pub struct HttpCacheCfg {
     /// Entry lifetime in seconds; 0 disables caching (default).
     pub ttl_seconds: u64,
 }
-impl HttpCacheCfg {
-    pub fn enabled(&self) -> bool {
-        self.ttl_seconds > 0
-    }
-}
 
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
@@ -495,17 +490,14 @@ mod tests {
     fn http_cache_defaults_to_disabled() {
         let c = cfg();
         assert_eq!(c.http_cache.ttl_seconds, 0);
-        assert!(!c.http_cache.enabled());
         let parsed: Config = toml::from_str("").expect("empty config parses");
         assert_eq!(parsed.http_cache.ttl_seconds, 0);
-        assert!(!parsed.http_cache.enabled());
     }
 
     #[test]
     fn http_cache_parses_positive_ttl() {
         let c: Config = toml::from_str("[http_cache]\nttl_seconds = 300\n").unwrap();
         assert_eq!(c.http_cache.ttl_seconds, 300);
-        assert!(c.http_cache.enabled());
     }
 
     #[test]
