@@ -79,6 +79,9 @@ jobs:
         id: pending-pr
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # This step deliberately precedes checkout, so gh cannot infer the
+          # repository from local Git metadata.
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           json="$(gh pr list --label "autorelease: pending" --state open --json number,headRefName,isDraft --jq '.[0] // empty')"
@@ -209,7 +212,9 @@ jobs:
 
   build:
     needs: resolve-release
-    if: needs.resolve-release.outputs.tag != ''
+    # Manual dispatch intentionally skips release-please. `always()` prevents
+    # that skipped ancestor from suppressing a successfully resolved build.
+    if: always() && needs.resolve-release.result == 'success' && needs.resolve-release.outputs.tag != ''
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -278,7 +283,9 @@ jobs:
 
   publish:
     needs: [resolve-release, build]
-    if: needs.resolve-release.outputs.tag != ''
+    # Keep the same manual-dispatch override, but publish only after both
+    # direct dependencies completed successfully.
+    if: always() && needs.resolve-release.result == 'success' && needs.build.result == 'success' && needs.resolve-release.outputs.tag != ''
     runs-on: ubuntu-latest
     permissions:
       contents: write

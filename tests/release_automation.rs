@@ -902,6 +902,10 @@ fn build_job_needs_resolve_release_and_guards_tag() {
         "build must explicitly guard on a non-empty resolved tag before matrix dispatch"
     );
     assert!(
+        b.contains("always()") && b.contains("needs.resolve-release.result == 'success'"),
+        "build must override the intentionally skipped release-please dependency chain during manual recovery while still requiring resolve-release to succeed"
+    );
+    assert!(
         b.contains("ref: ${{") && b.contains("outputs.tag"),
         "build must check out the exact resolved tag, not the moving default branch"
     );
@@ -960,6 +964,12 @@ fn publish_job_aggregates_downloads_validates_and_undrafts_last() {
     assert!(
         p.contains("needs.resolve-release.outputs.tag") && p.contains("!= ''"),
         "publish must guard on a non-empty resolved tag"
+    );
+    assert!(
+        p.contains("always()")
+            && p.contains("needs.resolve-release.result == 'success'")
+            && p.contains("needs.build.result == 'success'"),
+        "publish must override manual-dispatch skip propagation while still requiring both direct dependencies to succeed"
     );
     assert!(
         p.contains("download-artifact@v4"),
@@ -1413,6 +1423,10 @@ fn release_please_job_captures_pending_pr_and_falls_back_when_prs_created_false(
     assert!(
         pre_action.contains("GITHUB_OUTPUT"),
         "the captured PR number and head branch must be persisted to step outputs (e.g. `echo \"number=..\" >> \"$GITHUB_OUTPUT\"`) before the action"
+    );
+    assert!(
+        rp.contains("GH_REPO: ${{ github.repository }}"),
+        "the pre-checkout `gh pr list` step must bind GH_REPO explicitly because no local Git repository exists yet"
     );
 
     // Fallback half: with `prs_created` false, the captured values drive the
