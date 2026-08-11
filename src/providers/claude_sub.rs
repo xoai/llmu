@@ -599,6 +599,20 @@ mod tests {
                     let (mut sock, _) = listener.accept().unwrap();
                     let buf = read_request(&mut sock);
                     let req = parse_request(&buf);
+                    // The fixture enforces the request contract: a scripted
+                    // response is consumed only by the method/path it names,
+                    // so a wrong request fails loudly instead of silently
+                    // receiving a mismatched response.
+                    assert_eq!(
+                        req.method, r.method,
+                        "fixture: request method {} did not match scripted {}",
+                        req.method, r.method
+                    );
+                    assert_eq!(
+                        req.path, r.path,
+                        "fixture: request path {} did not match scripted {}",
+                        req.path, r.path
+                    );
                     r2.lock().unwrap().push(req);
                     if let Some(h) = r.hook.take() {
                         h();
