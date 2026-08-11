@@ -74,11 +74,12 @@ fn report_renders_balance_history_table() {
     );
 }
 
+/// Task 6 wrote this guard before Task 8 landed: it now protects only
+/// the balance-history data layer (types/store), which stays CSV-free;
+/// Task 8 owns CSV output in main.rs/report.rs (FR-1).
 #[test]
 fn csv_belongs_to_task_8_and_is_not_introduced_here() {
     for f in [
-        "src/main.rs",
-        "src/report.rs",
         "src/types.rs",
         "src/store.rs",
     ] {
