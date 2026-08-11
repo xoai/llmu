@@ -265,7 +265,13 @@ fn draw(
     net_updated: Option<DateTime<Utc>>,
     paused: bool,
 ) {
-    let gauge_h = (d.quotas.len().min(6) as u16 + 3).max(4); // header + borders
+    // Keep the five non-quota layout rows below at their declared minimums.
+    const NON_QUOTA_MIN_H: u16 = 3 + 4 + 9 + 6 + 2;
+    let quota_rows = u16::try_from(d.quotas.len()).unwrap_or(u16::MAX);
+    let requested_quota_h = quota_rows.saturating_add(3).max(4); // header + borders
+    let available_quota_h = f.size().height.saturating_sub(NON_QUOTA_MIN_H).max(4);
+    let gauge_h = requested_quota_h.min(available_quota_h);
+    let visible_quota_rows = gauge_h.saturating_sub(3) as usize;
     let chunks = Layout::vertical([
         Constraint::Length(3),       // header
         Constraint::Length(4),       // activity sparkline (24h)
@@ -476,7 +482,13 @@ fn draw(
     );
 
     // --- quotas: data table with a separate progress-bar column ---
-    let qblock = Block::bordered().title(" subscription quotas ");
+    let hidden_quota_rows = d.quotas.len().saturating_sub(visible_quota_rows);
+    let quota_title = if hidden_quota_rows == 0 {
+        " subscription quotas ".to_string()
+    } else {
+        format!(" subscription quotas ({hidden_quota_rows} more) ")
+    };
+    let qblock = Block::bordered().title(quota_title);
     let inner = qblock.inner(chunks[4]);
     f.render_widget(qblock, chunks[4]);
     if d.quotas.is_empty() {
@@ -489,7 +501,7 @@ fn draw(
         let qrows: Vec<ratatui::widgets::Row> = d
             .quotas
             .iter()
-            .take(6)
+            .take(visible_quota_rows)
             .map(|q| {
                 let pcol = provider_color(&q.provider);
                 if q.limit > 0.0 {
@@ -592,6 +604,72 @@ fn draw(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn quota(provider: &str, window: &str) -> QuotaSnapshot {
+        QuotaSnapshot {
+            provider: provider.into(),
+            plan: "test plan".into(),
+            window: window.into(),
+            used: 1.0,
+            limit: 10.0,
+            unit: "credits".into(),
+            resets_at: None,
+        }
+    }
+
+    #[test]
+    fn quota_panel_renders_rows_beyond_the_first_six() {
+        let d = Dashboard {
+            quotas: vec![
+                quota("claude", "5h"),
+                quota("claude", "7d"),
+                quota("codex", "5h"),
+                quota("codex", "7d"),
+                quota("kimi", "5h"),
+                quota("kimi", "7d"),
+                quota("glm", "5h"),
+                quota("glm", "1w"),
+            ],
+            ..Default::default()
+        };
+        let backend = ratatui::backend::TestBackend::new(160, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|f| draw(f, &d, Period::Day, None, None, false))
+            .unwrap();
+
+        let rendered = terminal.backend().to_string();
+        assert_eq!(
+            rendered.matches("glm").count(),
+            2,
+            "the quota panel silently dropped GLM rows:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn compact_quota_panel_reports_overflow_and_keeps_the_footer() {
+        let d = Dashboard {
+            quotas: (0..12).map(|n| quota("glm", &format!("{n}h"))).collect(),
+            ..Default::default()
+        };
+        let backend = ratatui::backend::TestBackend::new(160, 33);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|f| draw(f, &d, Period::Day, None, None, false))
+            .unwrap();
+
+        let rendered = terminal.backend().to_string();
+        assert!(
+            rendered.contains("subscription quotas (6 more)"),
+            "quota overflow must be explicit:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("q quit"),
+            "quota rows must not crowd the footer off-screen:\n{rendered}"
+        );
+    }
 
     /// Task 7 (RED): a one-shot `--fresh` bypasses only the initial full
     /// network fetch; later scheduled ticks honor the TTL (FR-3.2).
