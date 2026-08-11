@@ -3,8 +3,14 @@
 //! Most of what llmu needs already exists on the machine, written by the
 //! CLIs people use. On every run, unset config fields are filled from
 //! (in order): explicit config.toml > env vars > credential files of
-//! other tools. Everything is READ-ONLY and best-effort; provenance is
-//! recorded so `llmu providers` can show where each credential came from.
+//! other tools. Discovery is READ-ONLY and best-effort — llmu never
+//! creates, deletes, or overwrites a credential — with one explicit
+//! exception: a supported plaintext Gemini CLI / Claude Code OAuth file
+//! may be refreshed (rotated tokens persisted atomically, unknown fields
+//! preserved, mode 0600, llmu-only lock plus compare-and-swap; see
+//! docs/providers.md). Access-only OpenCode tokens, encrypted stores,
+//! and keychains are never mutated. Provenance is recorded so
+//! `llmu providers` can show where each credential came from.
 //!
 //! Sources probed:
 //! - env: ANTHROPIC_ADMIN_KEY / ANTHROPIC_API_KEY (only if sk-ant-admin…),

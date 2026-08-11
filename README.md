@@ -65,7 +65,10 @@ rate-limits aggressively. Tune with `--local-refresh` / `--refresh`
 (floor 15 s for network). The view: 24 h tokens/hour sparkline, per-period
 bar chart, per-provider colored model table, threshold-colored quota
 gauges (green < 60 % < yellow < 85 % < red), balances. Keys: `q` quit,
-`d/w/m` period, `r` force a network refresh, `p` pause.
+`d/w/m` period, `r` force a network refresh (bypasses the optional HTTP
+cache for exactly that fetch), `p` pause. `llmu --fresh tui` bypasses the
+raw cache only for the initial full network fetch; later scheduled
+refreshes honor the TTL.
 
 Plain CLI output is colorized too when stdout is a terminal; `NO_COLOR`
 disables it, `CLICOLOR_FORCE=1` forces it (e.g. through a pager).
@@ -73,9 +76,12 @@ disables it, `CLICOLOR_FORCE=1` forces it (e.g. through a pager).
 ## Zero config
 
 Bare `llmu` works with no setup: it auto-detects credentials and logs that
-other tools already left on the machine (read-only, never written or sent
-anywhere except the provider's own API) and shows quotas + a 7-day summary
-immediately. Detected sources:
+other tools already left on the machine — read-only discovery, sent only to
+the provider's own API — and shows quotas + a 7-day summary
+immediately. The one exception to read-only discovery is a validated OAuth
+refresh of a supported plaintext Gemini CLI or Claude Code credential file
+(see `docs/providers.md`); API keys, encrypted stores, and OpenCode access
+tokens are never touched. Detected sources:
 
 | Source | What it unlocks |
 |--------|-----------------|
@@ -85,10 +91,12 @@ immediately. Detected sources:
 | `$CODEX_HOME` (`~/.codex`) sessions + `auth.json` | ChatGPT-plan usage + 5h/weekly limits |
 | OpenCode `auth.json` (`~/.local/share/opencode`, override: `OPENCODE_DATA_DIR`) | DeepSeek / Z.ai / Moonshot keys, Claude OAuth fallback |
 | kimi-cli `~/.kimi/credentials/*.json` (override: `KIMI_SHARE_DIR`) | Kimi For Coding quota |
+| `~/.gemini/oauth_creds.json` (override: `[gemini] credentials` / `GEMINI_CLI_HOME`) | Gemini Code Assist quotas (plaintext OAuth, auto-refreshed; encrypted/keychain stores unsupported) |
 | env vars | `ANTHROPIC_ADMIN_KEY`, `OPENAI_ADMIN_KEY`, `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`/`KIMI_API_KEY`, `KIMI_CODE_API_KEY`, `ZAI_API_KEY`/`ZHIPU_API_KEY`, `ANTHROPIC_AUTH_TOKEN`+`ANTHROPIC_BASE_URL`; plain `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` are used only when admin-grade (`sk-ant-admin…`/`sk-admin…`) |
 
 Precedence: explicit `config.toml` > env vars > discovered files.
-`llmu providers` shows exactly where every credential came from.
+`llmu providers` shows exactly where every credential came from, labeled
+read-only except supported plaintext OAuth refresh.
 
 
 ## The honest data-availability matrix
@@ -106,7 +114,7 @@ normalizes three record types instead of pretending everything is uniform:
 | DeepSeek | ❌ (no history API) | ❌ | ✅ `/user/balance` (granted vs topped-up, CNY/USD) | – |
 | Kimi / Moonshot | ❌ | ❌ | ✅ `/v1/users/me/balance` (cash/voucher/available) | ✅ Kimi For Coding weekly + windowed limits via `api.kimi.com/coding/v1/usages` |
 | GLM (Z.ai / bigmodel.cn) | ⚠️ model-usage endpoint (best effort) | ❌ | – | ✅ Coding-Plan session/weekly % + tool quota via `/api/monitor/usage/quota/limit` |
-| Gemini API | ⚠️ client-side: log `usageMetadata` per response | via Google Cloud Billing only | – | – |
+| Gemini API | ⚠️ client-side: log `usageMetadata` per response | via Google Cloud Billing only | – | ✅ Code Assist quotas via Gemini CLI OAuth (auto-refreshed) |
 
 Legend: ✅ official API · ⚠️ workaround (local logs / undocumented endpoint) · ❌ not exposed.
 
@@ -118,7 +126,7 @@ Consequences baked into the design:
   "Billed" section. Totals never double-count.
 - **Balance-only providers get a snapshot store.** Every `llmu balance`
   appends to `~/.local/share/llmu/balances.jsonl`; day-over-day deltas are a
-  derived spend series (roadmap: `llmu balance --history`).
+  derived spend series (`llmu balance --history`).
 - **Subscription usage comes from local logs**, the same way ccusage does it:
   Claude Code writes per-message token usage into JSONL transcripts; llmu
   parses, dedupes on `(message.id, requestId)`, and buckets hourly so the
@@ -137,6 +145,12 @@ Pricing for cost *estimates* lives in `[pricing]` as
 tokens — longest matching prefix wins, defaults ship in the binary but should
 be verified against provider pricing pages.
 
+`[http_cache] ttl_seconds` opts into raw HTTP GET caching (zero disables it —
+see "Optional HTTP response cache"). `[gemini]` accepts optional
+`credentials` and `project` overrides for Code Assist quotas (see
+`docs/providers.md`). Credential discovery stays read-only except validated
+plaintext Gemini/Claude OAuth refresh.
+
 ## CLI reference
 
 ```
@@ -149,7 +163,76 @@ llmu usage
   --model sonnet                        substring model filter
   --source api|local                    billing API vs local logs
   --json                                aggregated rows as JSON
+  --csv                                 same rows as RFC 4180 CSV (conflicts with --json)
+llmu balance
+  --json | --csv                        snapshot rows (conflict with each other)
+  --history                             offline daily history from balances.jsonl
+                                        (JSON/CSV/table; no network, no append)
+llmu quota
+  --json | --csv                        quota rows (conflict with each other)
+llmu --fresh <command>                  bypass the optional HTTP cache for one run
+llmu --fresh tui                        bypass only the initial full network fetch
 ```
+
+## CSV output
+
+`usage`, `balance`, `quota`, and `balance --history` accept `--csv`:
+UTF-8, LF line endings, RFC 4180 field escaping (comma, quote, CR, LF),
+machine numeric cells (shortest float round-trip, no thousands
+separators), lowercase booleans, and exactly one header row — empty
+results still emit the header. Notes always stay on stderr and never
+contaminate CSV (or JSON) stdout. `--csv` conflicts with `--json`, and
+clap rejects the combination before any provider request or store
+mutation.
+
+- `usage --csv`: `period`, the `--group-by` columns in argument order
+  (exact lowercase names `provider`, `model`, or `source`), then
+  `requests`, `input_tokens`, `output_tokens`, `cache_read_tokens`,
+  `cache_write_tokens`, `total_tokens`, `tool_calls`, `est_cost_usd`,
+  `has_cost`.
+- `balance --csv`: `provider,total,granted,topped_up,currency`
+- `quota --csv`: `provider,plan,window,used,limit,unit,resets_at`
+  (`resets_at` is RFC 3339 or empty)
+- `balance --history --csv`: `from,to,provider,currency,opening,closing,spent,funded`
+
+## Offline balance history
+
+`llmu balance --history` reads the snapshots every `llmu balance` appends
+to the platform data directory's `llmu/balances.jsonl`. It is fully
+offline: no provider requests, appends no snapshot. Records group by
+(provider, currency, UTC date); the record with the latest timestamp is
+that day's close, with ties broken by the later JSONL line. Consecutive
+daily closes within a provider/currency series produce one row per
+interval with the actual UTC dates — `from`, `to`, `opening`, `closing`,
+`spent`, and `funded` — so missing days stay visible as gaps instead of
+being synthesized. A decrease sets `spent`, an increase sets `funded`,
+and equality sets both to zero; currencies are never combined or
+converted. Malformed/non-finite records are skipped and summarized once
+in a stderr note with their count. A missing file is empty history; any
+other read failure (permissions, disk) is surfaced as an error, never
+silently treated as empty.
+
+## Optional HTTP response cache
+
+`[http_cache] ttl_seconds = 0` is the default and disables cache reads
+and writes entirely. With a positive TTL, llmu stores the successful
+JSON response of each individually opted-in, side-effect-free GET request
+under the platform cache directory `llmu/http` and replays it within the
+TTL. Eligibility is per call site: OAuth token exchanges, Gemini quota
+POSTs, failed responses, and local-file reads are never cached. Each
+entry is keyed by the lowercase SHA-256 of the uppercase method, URL, and
+every header pair (including `Authorization`), so one account can never
+receive another account's cached body and no raw URL, key, or token ever
+appears in filenames or entry metadata. Entries record their original
+observation time; expired, future-dated, or corrupt entries fall back to
+a live request with a one-line secret-free stderr note, and cache trouble
+never fails a successful response. A raw cache hit never advances the
+last-known-good quota cache's timestamp.
+
+The global `--fresh` flag bypasses cache reads for one-shot commands
+while still storing successful live responses. In the TUI it applies only
+to the initial full network fetch; each `r` keypress bypasses exactly its
+next full network fetch, and scheduled refreshes otherwise honor the TTL.
 
 ## Architecture
 
@@ -175,10 +258,10 @@ Adding a provider = one file implementing `Provider` with whichever of
 - [x] Kimi For Coding quota (`api.kimi.com/coding/v1/usages`)
 - [x] Claude Pro/Max live limits (`/api/oauth/usage` via Claude Code OAuth token)
 - [x] Codex CLI local session logs + ChatGPT-plan limits (`wham/usage`)
-- [ ] Gemini CLI / Code Assist quota (`cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary`; needs the Google OAuth refresh flow — see docs/providers.md)
-- [ ] Anthropic OAuth token auto-refresh (currently: rerun `claude` when expired)
-- [ ] `llmu balance --history` (spend deltas from snapshots)
-- [ ] `--csv` output; optional local response cache with TTL
+- [x] Gemini CLI / Code Assist quota (`loadCodeAssist` + `v1internal:retrieveUserQuota`; Gemini CLI plaintext OAuth credentials, auto-refreshed — see docs/providers.md)
+- [x] Anthropic OAuth token auto-refresh (proactive five-minute refresh + one reactive 401 retry for Claude Code file-backed credentials)
+- [x] `llmu balance --history` (spend deltas from snapshots)
+- [x] `--csv` output; optional local response cache with TTL (`[http_cache] ttl_seconds`)
 
 The endpoints marked "undocumented" were sourced from the providers' own CLIs and
 open-source trackers (openusage, CodexBar, kimi-cli, opencode-glm-quota); they can
@@ -193,8 +276,22 @@ itself with a `note:` on stderr instead of staying silent. The common ones:
   two unrelated credentials: the **For Coding** plan key (quota endpoint,
   auto-discovered from OpenCode/kimi-cli) and the **open-platform**
   `MOONSHOT_API_KEY` (wallet balance). Having one doesn't imply the other.
-- `claude: oauth/usage failed (401…)` — the Claude Code OAuth token
-  expired; open `claude` once and rerun.
+- `claude: oauth/usage 401 persists after one refresh — log in again with
+  Claude Code` — file-backed credentials retry once with a forced refresh;
+  if the 401 persists, the refresh token is invalid and only a new
+  `claude` login cures it. For OpenCode access tokens, refresh Anthropic
+  authentication in OpenCode or configure Claude Code credentials; llmu
+  cannot refresh direct access tokens.
+- `gemini: quota: Gemini CLI encrypted/keychain credential storage is
+  unsupported…` — `oauth_creds.json` is absent but the sibling
+  `gemini-credentials.json` encrypted marker exists. Run `gemini` once to
+  export plaintext credentials, or point `[gemini] credentials` at a
+  plaintext copy; llmu never reads or modifies encrypted stores.
+- `Code Assist onboarding is incomplete…` / `your account is ineligible…` —
+  run `gemini` to complete onboarding or validation; llmu never onboards
+  or mutates accounts.
+- `your Code Assist tier requires a project…` — set `[gemini] project` or
+  `GOOGLE_CLOUD_PROJECT` (a project returned by `loadCodeAssist` wins).
 - `codex: wham/usage failed… no rate_limits in session logs` — run
   `codex` once to refresh its token / produce a session.
 - `…responded but no meters were parsed (payload drift?)` — the
@@ -216,8 +313,8 @@ providers can't contribute:
 
 - **DeepSeek** exposes no usage/history API at all — only a wallet
   balance — so it can never appear in usage panels from its own API.
-- **Kimi** and **Claude Pro/Max** expose quota meters (percentages), not
-  per-model token histories.
+- **Kimi**, **Claude Pro/Max**, and **Gemini Code Assist** expose quota
+  meters (percentages or token units), not per-model token histories.
 
 **Routed coding plans are the exception that works.** If Claude Code is
 pointed at GLM / Kimi / DeepSeek via `ANTHROPIC_BASE_URL`, those requests

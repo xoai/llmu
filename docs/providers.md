@@ -89,9 +89,33 @@ Token: `.credentials.json` in `$CLAUDE_CONFIG_DIR` / `~/.claude` /
 export it and point `[claude].credentials` at the copy). Response:
 `five_hour`, `seven_day`, `seven_day_sonnet` → `{utilization, resets_at}`,
 plus `limits[]` entries of `kind: "weekly_scoped"` for model-scoped weekly
-meters. Aggressively rate-limited — llmu calls it once per run. 401 = token
-expired; running `claude` refreshes the file. Token refresh itself is
-`POST https://platform.claude.com/v1/oauth/token` (`grant_type=refresh_token`).
+meters. Aggressively rate-limited — llmu calls it once per run.
+
+OAuth refresh (file-backed `claudeAiOauth` entries only, FR-6):
+- Proactive refresh when the access token expires within five minutes
+  (`expiresAt <= now + 300000ms`) via
+  `POST https://platform.claude.com/v1/oauth/token` with
+  `grant_type=refresh_token`, the stored refresh token, the stored
+  `clientId` or the pinned public installed-app id
+  `9d1c250a-e61b-44d9-88ed-5944d1962f5e` (a public upstream constant
+  from Claude Code 2.1.227, not a user secret), and space-joined scopes.
+  No client secret and no bearer header are sent.
+- rotated `refresh_token` values are persisted back to the file
+  atomically: unknown fields preserved, Unix mode `0600`, an llmu-only
+  sibling lock, and a compare-and-swap immediately before replacement.
+  Any HTTP, validation, or concurrency failure leaves the file unchanged.
+- Exactly one reactive 401 retry: llmu re-reads the file, adopts a token
+  another process installed, or forces one refresh and retries once.
+  Usage 403/429/5xx never triggers a refresh or retry.
+- A transient proactive refresh failure falls back to the still-valid
+  access token with a warning. A refresh token expiring within three days
+  emits a warning without blocking an otherwise valid quota request.
+  Permanent failures (`invalid_grant`) preserve the file and tell the
+  user to log in again with Claude Code.
+- Direct access tokens (e.g. OpenCode's `auth.json` `anthropic` OAuth
+  entry) are never refreshed: a usage 401 says to refresh Anthropic
+  authentication in OpenCode or configure Claude Code credentials, and
+  never claims llmu can refresh an access-only token.
 
 ### ChatGPT plan / Codex CLI (wired: provider `codex`)
 
@@ -155,18 +179,43 @@ e.g. `{300, TIME_UNIT_MINUTE}` is the 5h session. Plan tier is
 Note the key is the *Kimi For Coding* credential, not the open-platform
 `sk-` key.
 
-### Gemini CLI / Code Assist (documented, not wired)
+### Gemini CLI / Code Assist (wired: provider `gemini`)
 
-Gemini CLI's quota comes from the internal Code Assist backend:
+Gemini's Code Assist quota comes from the internal Code Assist backend:
 
 ```
 POST https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist
-POST https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary
+POST https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota
 Authorization: Bearer <Google OAuth access token>
 ```
 
-The token lives in `~/.gemini/oauth_creds.json` (written by `gemini` login)
-but expires hourly, so a useful adapter must refresh it via
-`https://oauth2.googleapis.com/token` with gemini-cli's public OAuth client
-constants. Antigravity (Google's IDE) uses the same endpoints on
-`daily-cloudcode-pa.googleapis.com`. Planned; contributions welcome.
+`retrieveUserQuota` is the corrected endpoint (Gemini CLI v0.39.1 and
+current main). Migration note: the roadmap previously named the stale
+endpoint `retrieveUserQuotaSummary`; llmu never calls it.
+
+Credentials: Gemini CLI's plaintext `oauth_creds.json`
+(`${GEMINI_CLI_HOME:-$HOME}/.gemini/oauth_creds.json`, override
+`[gemini] credentials`). Tokens expire hourly, so llmu refreshes via
+`https://oauth2.googleapis.com/token` (`grant_type=refresh_token`) using
+Gemini CLI v0.39.1's public installed-app OAuth constants — client id
+`681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com`
+and client secret `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` — which are
+public upstream application identifiers, not user credentials. Refresh
+persists rotated tokens atomically back to the file: unknown fields
+preserved, Unix mode `0600`, llmu-only sibling lock plus compare-and-swap.
+An unexpired access token remains usable without a refresh token; an
+expired one without a refresh token says to run `gemini` again.
+
+Encrypted/keychain storage is unsupported in this release: if
+`oauth_creds.json` is absent but the sibling `gemini-credentials.json`
+marker exists (Gemini CLI v0.39.1's keychain fallback), llmu reports the
+limitation and never reads or mutates that store. Keychain-only storage
+without the marker is not detectable. llmu never calls `onboardUser` and
+never mutates account state: missing onboarding, ineligible tiers, and
+missing projects produce remediation to run `gemini` or set `[gemini]
+project` / `GOOGLE_CLOUD_PROJECT` (precedence: config >
+`GOOGLE_CLOUD_PROJECT` > `GOOGLE_CLOUD_PROJECT_ID`; a project returned by
+`loadCodeAssist` is authoritative). Malformed quota buckets are skipped
+with diagnostics; if none remain, llmu reports payload drift. API
+failures degrade through the last-known-good quota cache. Antigravity
+(Google's IDE) uses the same endpoints on `daily-cloudcode-pa.googleapis.com`.

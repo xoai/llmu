@@ -361,7 +361,7 @@ fn main() -> Result<()> {
             let mut prov = cfg.found.clone();
             prov.extend(discover::env_provenance());
             if !prov.is_empty() {
-                println!("\nauto-detected credentials (read-only):");
+                println!("\nauto-detected credentials (read-only except supported OAuth refresh):");
                 for (field, src) in &prov {
                     println!("  {field:<22} <- {src}");
                 }
