@@ -62,9 +62,26 @@ fn with_headers(mut req: ureq::Request, headers: &[(&str, &str)]) -> ureq::Reque
     req
 }
 
+/// Format the LLMU_DEBUG response line. GET keeps an 800-char body snippet
+/// for payload-drift diagnosis (existing behavior); POST never prints the
+/// response body — OAuth/refresh responses can carry access tokens, and
+/// secrets must never reach diagnostics (NFR Security). `status` is the
+/// status suffix ("200", "500", ...). Pure: the policy is testable without
+/// touching the process environment or capturing stderr.
+fn debug_snippet(method: &str, url: &str, status: &str, body: &str) -> String {
+    if method == "POST" {
+        return format!(
+            "[debug] {method} {url}\n[debug] {status}: response body suppressed (may contain credentials)"
+        );
+    }
+    let snip: String = body.chars().take(800).collect();
+    format!("[debug] {method} {url}\n[debug] {status}: {snip}")
+}
+
 /// Shared response mapping for GET and POST: parse a 2xx body as JSON,
 /// surface non-2xx as `HttpStatusError` with a one-line body snippet, and
-/// keep the LLMU_DEBUG dump on stderr. `method` only feeds the debug line.
+/// keep the LLMU_DEBUG dump on stderr. `method` feeds the debug line and
+/// its body policy (POST bodies are suppressed).
 fn finish(
     resp: Result<ureq::Response, ureq::Error>,
     method: &str,
@@ -74,16 +91,14 @@ fn finish(
         Ok(r) => {
             let body = r.into_string()?;
             if debug() {
-                let snip: String = body.chars().take(800).collect();
-                eprintln!("[debug] {method} {url}\n[debug] 200: {snip}");
+                eprintln!("{}", debug_snippet(method, url, "200", &body));
             }
             Ok(serde_json::from_str(&body)?)
         }
         Err(ureq::Error::Status(code, r)) => {
             let body = r.into_string().unwrap_or_default();
             if debug() {
-                let snip: String = body.chars().take(800).collect();
-                eprintln!("[debug] {method} {url}\n[debug] {code}: {snip}");
+                eprintln!("{}", debug_snippet(method, url, &code.to_string(), &body));
             }
             // Notes stay one line: collapse whitespace, cap length.
             let compact: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -895,6 +910,52 @@ mod tests {
         assert!(
             !body.contains("abc/def"),
             "form values must be percent-encoded, got: {body}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // debug output policy (NFR Security: no secrets in diagnostics)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn post_debug_lines_never_expose_response_body_or_token() {
+        let url = "https://oauth.example.test/token";
+        let token = "fake-access-token-12345";
+        let body = format!(r#"{{"access_token":"{token}","expires_in":3600}}"#);
+        for status in ["200", "400"] {
+            let line = debug_snippet("POST", url, status, &body);
+            assert!(
+                !line.contains(token),
+                "POST debug must never expose the token: {line}"
+            );
+            assert!(
+                !line.contains("expires_in"),
+                "POST debug must never expose the response body: {line}"
+            );
+            assert!(
+                line.contains("[debug] POST"),
+                "method context must remain: {line}"
+            );
+            assert!(line.contains(url), "URL context must remain: {line}");
+            assert!(line.contains(status), "status context must remain: {line}");
+            assert!(
+                line.contains("suppressed"),
+                "the suppression must be explicit, not silent: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn get_debug_lines_keep_payload_snippets() {
+        let body = r#"{"quota":{"used":1,"limit":10}}"#;
+        let line = debug_snippet("GET", "https://api.example.test/v1/quota", "200", body);
+        assert!(
+            line.contains(body),
+            "GET debug keeps the payload-drift body snippet: {line}"
+        );
+        assert!(
+            line.contains("[debug] GET"),
+            "method context must remain: {line}"
         );
     }
 

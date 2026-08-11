@@ -75,3 +75,20 @@ fn integration_tests_never_import_llmu() {
         "tests/http_cache.rs is a std-only contract and must not import llmu"
     );
 }
+
+#[test]
+fn post_debug_is_redacted_while_get_snippets_survive() {
+    let http = read("src/http.rs");
+    assert!(
+        http.contains("fn debug_snippet"),
+        "response debug output must be a pure formatter, testable without env mutation or stderr races"
+    );
+    assert!(
+        http.contains("suppressed") && http.contains("fn debug_snippet"),
+        "POST debug output must explicitly suppress the response body (NFR Security: tokens must never reach diagnostics)"
+    );
+    assert!(
+        http.contains("take(800)"),
+        "GET debug output keeps its payload-drift body snippet"
+    );
+}
