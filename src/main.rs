@@ -49,6 +49,9 @@ enum Cmd {
     Balance {
         #[arg(long)]
         json: bool,
+        /// Emit rows as CSV (RFC 4180, UTF-8, LF)
+        #[arg(long, conflicts_with = "json")]
+        csv: bool,
         /// Offline daily balance history from the local balances.jsonl
         /// (no provider requests, no snapshot append)
         #[arg(long)]
@@ -58,6 +61,9 @@ enum Cmd {
     Quota {
         #[arg(long)]
         json: bool,
+        /// Emit rows as CSV (RFC 4180, UTF-8, LF)
+        #[arg(long, conflicts_with = "json")]
+        csv: bool,
     },
     /// Live auto-refreshing dashboard (alias: watch)
     #[command(visible_alias = "watch")]
@@ -99,6 +105,9 @@ struct UsageArgs {
     /// Emit aggregated rows as JSON (for scripting)
     #[arg(long)]
     json: bool,
+    /// Emit aggregated rows as CSV (RFC 4180, UTF-8, LF)
+    #[arg(long, conflicts_with = "json")]
+    csv: bool,
 }
 
 pub(crate) fn parse_since(s: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
@@ -396,6 +405,8 @@ fn main() -> Result<()> {
             let rows = report::aggregate(&g.events, period, &groups);
             if a.json {
                 println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else if a.csv {
+                print!("{}", report::render_usage_csv(&groups, &rows));
             } else {
                 print!(
                     "{}",
@@ -422,13 +433,15 @@ fn main() -> Result<()> {
             }
         }
 
-        Cmd::Balance { json, history } => handle_balance(&cfg, &ctx, now, json, history)?,
+        Cmd::Balance { json, csv, history } => handle_balance(&cfg, &ctx, now, json, csv, history)?,
 
-        Cmd::Quota { json } => {
+        Cmd::Quota { json, csv } => {
             let since = now - Duration::hours(6);
             let g = gather(&cfg, &ctx, since, now, None, false, true, false);
             if json {
                 println!("{}", serde_json::to_string_pretty(&g.quotas)?);
+            } else if csv {
+                print!("{}", report::render_quota_csv(&g.quotas));
             } else if g.quotas.is_empty() {
                 println!("no quota data available");
             } else {
@@ -463,6 +476,7 @@ fn handle_balance(
     ctx: &FetchContext,
     now: DateTime<Utc>,
     json: bool,
+    csv: bool,
     history: bool,
 ) -> Result<()> {
     if history {
@@ -479,7 +493,7 @@ fn handle_balance(
                 hist.skipped
             );
         }
-        print!("{}", history_payload(&hist, json)?);
+        print!("{}", history_payload(&hist, json, csv)?);
         return Ok(());
     }
     let mut g = gather(cfg, ctx, now, now, None, false, false, true);
@@ -489,6 +503,8 @@ fn handle_balance(
     }
     if json {
         println!("{}", serde_json::to_string_pretty(&g.balances)?);
+    } else if csv {
+        print!("{}", report::render_balance_csv(&g.balances));
     } else if g.balances.is_empty() {
         println!("no balance sources configured (deepseek / kimi)");
     } else {
@@ -510,11 +526,15 @@ fn handle_balance(
 }
 
 /// The complete stdout payload for `balance --history` (FR-2.7): JSON
-/// emits the normalized rows as an array; the table renders the same
-/// rows. Malformed-record counts are a stderr note, never stdout.
-fn history_payload(hist: &store::BalanceHistory, json: bool) -> Result<String> {
+/// emits the normalized rows as an array, CSV the same rows as a
+/// spreadsheet, and the table renders the same rows. Malformed-record
+/// counts are a stderr note, never stdout. Empty results keep the
+/// header in CSV mode and the human empty message otherwise (FR-1.7).
+fn history_payload(hist: &store::BalanceHistory, json: bool, csv: bool) -> Result<String> {
     if json {
         Ok(serde_json::to_string_pretty(&hist.rows)? + "\n")
+    } else if csv {
+        Ok(report::render_balance_history_csv(&hist.rows))
     } else if hist.rows.is_empty() {
         Ok("no balance history (llmu/balances.jsonl missing or empty)\n".to_string())
     } else {
@@ -960,7 +980,7 @@ mod tests {
             rows: hist_rows(),
             skipped: 2,
         };
-        let payload = history_payload(&hist, true).unwrap();
+        let payload = history_payload(&hist, true, false).unwrap();
         let v: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON payload");
         let rows = v.as_array().unwrap();
         assert_eq!(rows.len(), 1);
@@ -981,10 +1001,10 @@ mod tests {
             skipped: 0,
         };
         assert_eq!(
-            history_payload(&hist, false).unwrap(),
+            history_payload(&hist, false, false).unwrap(),
             "no balance history (llmu/balances.jsonl missing or empty)\n"
         );
-        assert_eq!(history_payload(&hist, true).unwrap(), "[]\n");
+        assert_eq!(history_payload(&hist, true, false).unwrap(), "[]\n");
     }
 
     #[test]
@@ -993,7 +1013,7 @@ mod tests {
             rows: hist_rows(),
             skipped: 0,
         };
-        let payload = history_payload(&hist, false).unwrap();
+        let payload = history_payload(&hist, false, false).unwrap();
         assert!(payload.contains("2026-08-01"));
         assert!(payload.contains("7.50"));
         assert!(payload.contains("2.50"));
@@ -1035,6 +1055,99 @@ mod tests {
         assert!(
             !src.contains(&discard),
             "the silent discard must be gone (FR-2.9)"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // CSV output dispatch (FR-1, Task 8): RED clap conflict and payload
+    // contracts.
+    // -------------------------------------------------------------------
+
+    /// FR-1.2: clap itself rejects `--json --csv` on every report
+    /// command — before any config/provider read or store mutation.
+    #[test]
+    fn csv_conflicts_with_json_at_parse_time() {
+        let cases: &[&[&str]] = &[
+            &["llmu", "usage", "--json", "--csv"],
+            &["llmu", "usage", "--csv", "--json"],
+            &["llmu", "balance", "--json", "--csv"],
+            &["llmu", "balance", "--history", "--json", "--csv"],
+            &["llmu", "quota", "--csv", "--json"],
+        ];
+        for args in cases {
+            let err = Cli::try_parse_from(*args)
+                .err()
+                .expect("--json --csv must be rejected by clap");
+            assert!(
+                err.to_string().contains("cannot be used with"),
+                "--json --csv must be a clap conflict, got: {err}"
+            );
+        }
+    }
+
+    /// FR-1.1: `--csv` parses on usage, balance, quota; `--history`
+    /// combines freely with `--csv`.
+    #[test]
+    fn csv_flags_parse_on_every_report_command() {
+        let usage =
+            Cli::try_parse_from(["llmu", "usage", "--csv"]).expect("usage --csv must parse");
+        let Some(Cmd::Usage(a)) = usage.cmd else {
+            panic!("expected the usage subcommand")
+        };
+        assert!(a.csv && !a.json);
+        let balance = Cli::try_parse_from(["llmu", "balance", "--history", "--csv"])
+            .expect("balance --history --csv must parse");
+        let Some(Cmd::Balance { csv, json, history }) = balance.cmd else {
+            panic!("expected the balance subcommand")
+        };
+        assert!(csv && history && !json);
+        let quota =
+            Cli::try_parse_from(["llmu", "quota", "--csv"]).expect("quota --csv must parse");
+        let Some(Cmd::Quota { csv, json }) = quota.cmd else {
+            panic!("expected the quota subcommand")
+        };
+        assert!(csv && !json);
+    }
+
+    /// The rejection must happen before `Config::load`, which precedes
+    /// every provider read, network call, and balance-store mutation.
+    #[test]
+    fn csv_conflict_is_rejected_before_config_or_provider_work() {
+        let src = include_str!("main.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        let parse = prod
+            .find("Cli::parse()")
+            .expect("main must parse the CLI first");
+        let config = prod
+            .find("Config::load")
+            .expect("main must load the config");
+        assert!(
+            parse < config,
+            "clap must reject --json --csv before any config/provider read (FR-1.2)"
+        );
+    }
+
+    /// FR-2.7/FR-1.7: `balance --history --csv` renders the same
+    /// normalized rows as JSON/table, and empty history still emits the
+    /// header.
+    #[test]
+    fn history_csv_payload_emits_rows_or_header() {
+        let hist = store::BalanceHistory {
+            rows: hist_rows(),
+            skipped: 0,
+        };
+        assert_eq!(
+            history_payload(&hist, false, true).unwrap(),
+            "from,to,provider,currency,opening,closing,spent,funded\n\
+             2026-08-01,2026-08-02,deepseek,USD,10,7.5,2.5,0\n"
+        );
+        let empty = store::BalanceHistory {
+            rows: vec![],
+            skipped: 0,
+        };
+        assert_eq!(
+            history_payload(&empty, false, true).unwrap(),
+            "from,to,provider,currency,opening,closing,spent,funded\n"
         );
     }
 }

@@ -289,6 +289,173 @@ pub fn render_balance_history(rows: &[BalanceHistoryRow]) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// CSV output (FR-1, Task 8): shared RFC 4180 rendering plus the
+// command serializers, all over the same normalized rows the table and
+// JSON modes use. UTF-8, LF line endings, one header row, no new
+// dependencies.
+// ---------------------------------------------------------------------------
+
+/// RFC 4180 field escaping: quote only when the field contains a comma,
+/// double quote, CR, or LF; embedded quotes are doubled.
+pub fn csv_field(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\r') || s.contains('\n') {
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('"');
+        for c in s.chars() {
+            if c == '"' {
+                out.push('"');
+            }
+            out.push(c);
+        }
+        out.push('"');
+        out
+    } else {
+        s.to_string()
+    }
+}
+
+/// One CSV record: escaped fields joined by commas, LF-terminated.
+pub fn csv_row(fields: &[String]) -> String {
+    let mut out = String::new();
+    for (i, f) in fields.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&csv_field(f));
+    }
+    out.push('\n');
+    out
+}
+
+/// Shared renderer: exactly one header row plus the given rows. Empty
+/// `rows` still emit the header (FR-1.7), so every command prints a
+/// parseable CSV even with no data.
+pub fn render_csv(header: &[&str], rows: &[Vec<String>]) -> String {
+    let header: Vec<String> = header.iter().map(|h| h.to_string()).collect();
+    let mut out = csv_row(&header);
+    for row in rows {
+        out.push_str(&csv_row(row));
+    }
+    out
+}
+
+/// FR-1.4 usage CSV: consumes the same aggregated rows as the table and
+/// JSON modes. The group columns use the exact lowercase user-facing
+/// names in the user's `--group-by` argument order; numeric cells are
+/// machine values (no thousands separators, shortest float round-trip,
+/// lowercase booleans). Billed-cost rows are never added (FR-1.4).
+pub fn render_usage_csv(groups: &[Group], rows: &[Row]) -> String {
+    let mut header: Vec<&str> = vec!["period"];
+    header.extend(groups.iter().map(|g| match g {
+        Group::Provider => "provider",
+        Group::Model => "model",
+        Group::Source => "source",
+    }));
+    header.extend([
+        "requests",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "total_tokens",
+        "tool_calls",
+        "est_cost_usd",
+        "has_cost",
+    ]);
+    let rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| {
+            let mut cells = r.keys.clone();
+            cells.extend([
+                r.totals.requests.to_string(),
+                r.totals.input_tokens.to_string(),
+                r.totals.output_tokens.to_string(),
+                r.totals.cache_read_tokens.to_string(),
+                r.totals.cache_write_tokens.to_string(),
+                r.total_tokens.to_string(),
+                r.totals.tool_calls.to_string(),
+                r.totals.est_cost_usd.to_string(),
+                r.totals.has_cost.to_string(),
+            ]);
+            cells
+        })
+        .collect();
+    render_csv(&header, &rows)
+}
+
+/// FR-1.5 balance CSV: `provider,total,granted,topped_up,currency`.
+pub fn render_balance_csv(balances: &[BalanceSnapshot]) -> String {
+    let header = ["provider", "total", "granted", "topped_up", "currency"];
+    let rows: Vec<Vec<String>> = balances
+        .iter()
+        .map(|b| {
+            vec![
+                b.provider.clone(),
+                b.total.to_string(),
+                b.granted.to_string(),
+                b.topped_up.to_string(),
+                b.currency.clone(),
+            ]
+        })
+        .collect();
+    render_csv(&header, &rows)
+}
+
+/// FR-1.6 quota CSV: `provider,plan,window,used,limit,unit,resets_at`.
+/// `resets_at` is RFC 3339 when known, empty otherwise.
+pub fn render_quota_csv(quotas: &[QuotaSnapshot]) -> String {
+    let header = [
+        "provider",
+        "plan",
+        "window",
+        "used",
+        "limit",
+        "unit",
+        "resets_at",
+    ];
+    let rows: Vec<Vec<String>> = quotas
+        .iter()
+        .map(|q| {
+            vec![
+                q.provider.clone(),
+                q.plan.clone(),
+                q.window.clone(),
+                q.used.to_string(),
+                q.limit.to_string(),
+                q.unit.clone(),
+                q.resets_at.map(|r| r.to_rfc3339()).unwrap_or_default(),
+            ]
+        })
+        .collect();
+    render_csv(&header, &rows)
+}
+
+/// FR-2.7 history CSV: `from,to,provider,currency,opening,closing,
+/// spent,funded` over the same normalized rows the table and JSON modes
+/// use.
+pub fn render_balance_history_csv(rows: &[BalanceHistoryRow]) -> String {
+    let header = [
+        "from", "to", "provider", "currency", "opening", "closing", "spent", "funded",
+    ];
+    let rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| {
+            vec![
+                r.from.to_string(),
+                r.to.to_string(),
+                r.provider.clone(),
+                r.currency.clone(),
+                r.opening.to_string(),
+                r.closing.to_string(),
+                r.spent.to_string(),
+                r.funded.to_string(),
+            ]
+        })
+        .collect();
+    render_csv(&header, &rows)
+}
+
 /// Rendering style for one quota row: `Command` matches `llmu quota`,
 /// `Overview` matches the bare `llmu` landing view. The two views
 /// differ only in indentation, resets decoration, and the limit==0
@@ -493,5 +660,183 @@ mod tests {
         assert!(deepseek < kimi, "rows render in given order");
         assert!(s.contains("7.50") && s.contains("2.50") && s.contains("0.00"));
         assert!(s.contains("2.00"));
+    }
+
+    // -------------------------------------------------------------------
+    // CSV output (FR-1, Task 8): RED contracts for shared RFC 4180
+    // rendering and the command serializers.
+    // -------------------------------------------------------------------
+
+    fn usage_row(keys: Vec<&str>, est_cost_usd: f64, has_cost: bool) -> Row {
+        Row {
+            keys: keys.into_iter().map(|k| k.to_string()).collect(),
+            total_tokens: 4,
+            totals: Totals {
+                requests: 2,
+                input_tokens: 1_000_000,
+                output_tokens: 500,
+                cache_read_tokens: 200,
+                cache_write_tokens: 0,
+                tool_calls: 3,
+                est_cost_usd,
+                has_cost,
+            },
+        }
+    }
+
+    /// RFC 4180: quote only fields containing comma, quote, CR, or LF;
+    /// embedded quotes double.
+    #[test]
+    fn csv_field_quotes_comma_quote_cr_lf_and_doubles_embedded_quotes() {
+        assert_eq!(csv_field("plain"), "plain");
+        assert_eq!(csv_field(""), "");
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
+        assert_eq!(csv_field("a\"b"), "\"a\"\"b\"");
+        assert_eq!(csv_field("a\rb"), "\"a\rb\"");
+        assert_eq!(csv_field("a\nb"), "\"a\nb\"");
+        assert_eq!(csv_field("\"q,c\""), "\"\"\"q,c\"\"\"");
+    }
+
+    #[test]
+    fn csv_row_joins_fields_and_terminates_with_lf() {
+        let row = csv_row(&["a".to_string(), "b,1".to_string(), String::new()]);
+        assert_eq!(row, "a,\"b,1\",\n");
+    }
+
+    /// FR-1.4: the usage header is `period`, the selected groups in the
+    /// user's argument order with exact lowercase names, then the fixed
+    /// numeric columns. No billed-cost rows.
+    #[test]
+    fn usage_csv_uses_exact_lowercase_headers_in_group_order() {
+        let groups = [Group::Model, Group::Source];
+        let rows = vec![usage_row(
+            vec!["2026-08-11", "claude-sonnet-4-5", "local"],
+            3.0,
+            true,
+        )];
+        assert_eq!(
+            render_usage_csv(&groups, &rows),
+            "period,model,source,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,total_tokens,tool_calls,est_cost_usd,has_cost\n\
+             2026-08-11,claude-sonnet-4-5,local,2,1000000,500,200,0,4,3,3,true\n"
+        );
+    }
+
+    /// FR-1.9: integers unformatted (no thousands separators), finite
+    /// floats shortest round-trip Display, booleans lowercase.
+    #[test]
+    fn usage_csv_machine_values_are_shortest_round_trip() {
+        let groups = [Group::Provider];
+        let rows = vec![
+            usage_row(vec!["2026-08-11", "p1"], 12.34, true),
+            usage_row(vec!["2026-08-11", "p2"], 0.01056, true),
+            usage_row(vec!["2026-08-11", "p3"], 0.0, false),
+        ];
+        let csv = render_usage_csv(&groups, &rows);
+        assert_eq!(
+            csv,
+            "period,provider,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,total_tokens,tool_calls,est_cost_usd,has_cost\n\
+             2026-08-11,p1,2,1000000,500,200,0,4,3,12.34,true\n\
+             2026-08-11,p2,2,1000000,500,200,0,4,3,0.01056,true\n\
+             2026-08-11,p3,2,1000000,500,200,0,4,3,0,false\n"
+        );
+        assert!(
+            !csv.contains("1,000,000"),
+            "integers must never carry thousands separators (FR-1.9)"
+        );
+    }
+
+    /// FR-1.7: empty rows still emit exactly the header.
+    #[test]
+    fn usage_csv_empty_rows_still_emit_the_header() {
+        assert_eq!(
+            render_usage_csv(&[Group::Provider], &[]),
+            "period,provider,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,total_tokens,tool_calls,est_cost_usd,has_cost\n"
+        );
+    }
+
+    /// RFC 4180 escaping reaches the group cells (AS-6).
+    #[test]
+    fn usage_csv_escapes_group_values_rfc4180() {
+        let groups = [Group::Source];
+        let rows = vec![usage_row(
+            vec!["2026-08-11", "my, \"weird\" model"],
+            0.0,
+            false,
+        )];
+        let csv = render_usage_csv(&groups, &rows);
+        assert!(
+            csv.contains("\"my, \"\"weird\"\" model\""),
+            "comma+quote values must be quoted with doubled quotes, got: {csv}"
+        );
+    }
+
+    /// FR-1.5: balance CSV exact schema, shortest floats, header on empty.
+    #[test]
+    fn balance_csv_exact_schema_and_shortest_floats() {
+        let b = BalanceSnapshot {
+            provider: "deepseek".into(),
+            currency: "USD".into(),
+            total: 12.5,
+            granted: 10.0,
+            topped_up: 2.5,
+        };
+        assert_eq!(
+            render_balance_csv(&[b]),
+            "provider,total,granted,topped_up,currency\n\
+             deepseek,12.5,10,2.5,USD\n"
+        );
+        assert_eq!(
+            render_balance_csv(&[]),
+            "provider,total,granted,topped_up,currency\n"
+        );
+    }
+
+    /// FR-1.6: quota CSV exact schema; `resets_at` is RFC 3339 or empty;
+    /// header on empty.
+    #[test]
+    fn quota_csv_rfc3339_or_empty_resets_and_exact_schema() {
+        let with = QuotaSnapshot {
+            provider: "kimi".into(),
+            plan: "Kimi For Coding (standard)".into(),
+            window: "7d".into(),
+            used: 98.5,
+            limit: 100.0,
+            unit: "units".into(),
+            resets_at: Some(at("2026-08-14T07:49:00Z")),
+        };
+        let without = QuotaSnapshot {
+            provider: "codex".into(),
+            plan: "prolite".into(),
+            window: "5h".into(),
+            used: 10.0,
+            limit: 100.0,
+            unit: "%".into(),
+            resets_at: None,
+        };
+        assert_eq!(
+            render_quota_csv(&[with, without]),
+            "provider,plan,window,used,limit,unit,resets_at\n\
+             kimi,Kimi For Coding (standard),7d,98.5,100,units,2026-08-14T07:49:00+00:00\n\
+             codex,prolite,5h,10,100,%,\n"
+        );
+        assert_eq!(
+            render_quota_csv(&[]),
+            "provider,plan,window,used,limit,unit,resets_at\n"
+        );
+    }
+
+    /// FR-2.7: history CSV consumes the same normalized rows; header on
+    /// empty.
+    #[test]
+    fn history_csv_exact_schema_over_normalized_rows() {
+        assert_eq!(
+            render_balance_history_csv(&[hist_row()]),
+            "from,to,provider,currency,opening,closing,spent,funded\n\
+             2026-08-01,2026-08-02,deepseek,USD,10,7.5,2.5,0\n"
+        );
+        assert_eq!(
+            render_balance_history_csv(&[]),
+            "from,to,provider,currency,opening,closing,spent,funded\n"
+        );
     }
 }
