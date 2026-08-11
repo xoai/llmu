@@ -74,11 +74,14 @@ fn every_existing_quota_override_adapts_to_quota_fetch() {
 }
 
 #[test]
-fn gemini_keeps_the_default_until_task_four() {
+fn gemini_overrides_quotas_with_quota_fetch() {
+    // Flipped by Task 4: Gemini's first quotas override landed, carrying
+    // the same QuotaFetch contract every other provider adapted to in
+    // Task 3.
     let gem = read("src/providers/gemini.rs");
     assert!(
-        !gem.contains("fn quotas"),
-        "src/providers/gemini.rs must not override quotas yet — Gemini's first override lands in Task 4"
+        gem.contains("fn quotas(") && gem.contains("Result<QuotaFetch>"),
+        "src/providers/gemini.rs must override quotas with `Result<QuotaFetch>` (Task 4, AD-4)"
     );
 }
 

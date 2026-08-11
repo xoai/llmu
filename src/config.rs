@@ -189,11 +189,71 @@ impl CodexCfg {
     }
 }
 
+/// Gemini Code Assist: optional usage JSONL plus optional Code Assist
+/// credential and project overrides (FR-5.1). Quota discovery reads Gemini
+/// CLI's plaintext `oauth_creds.json`; an encrypted sibling marker is
+/// diagnosed, never mutated (FR-5.2).
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
 pub struct GeminiCfg {
     /// Optional JSONL log of per-request usageMetadata written by your app.
     pub usage_log: Option<PathBuf>,
+    /// Override path to Gemini CLI's plaintext OAuth credentials
+    /// (`oauth_creds.json`). Default:
+    /// `${GEMINI_CLI_HOME:-$HOME}/.gemini/oauth_creds.json` (FR-5.1).
+    pub credentials: Option<PathBuf>,
+    /// Code Assist cloud project override. Precedence: config >
+    /// `GOOGLE_CLOUD_PROJECT` > `GOOGLE_CLOUD_PROJECT_ID`; a project
+    /// returned by `loadCodeAssist` is authoritative (FR-5.5).
+    pub project: Option<String>,
+}
+impl GeminiCfg {
+    /// Credential store directory (FR-5.1): the explicit override's parent,
+    /// else `${GEMINI_CLI_HOME:-$HOME}/.gemini`.
+    fn credentials_dir(&self) -> Option<PathBuf> {
+        if let Some(p) = &self.credentials {
+            return expand_tilde(p).parent().map(PathBuf::from);
+        }
+        let home = env("GEMINI_CLI_HOME")
+            .map(PathBuf::from)
+            .or_else(|| dirs::home_dir())?;
+        Some(home.join(".gemini"))
+    }
+
+    /// Supported plaintext credential path when it exists (FR-5.2): an
+    /// explicit override, else the default `oauth_creds.json`. The
+    /// existence check makes discovery hermetic and keeps an explicit
+    /// override from silently falling back to `$HOME`.
+    pub fn credentials_path(&self) -> Option<PathBuf> {
+        let p = match &self.credentials {
+            Some(p) => expand_tilde(p),
+            None => self.credentials_dir()?.join("oauth_creds.json"),
+        };
+        p.exists().then_some(p)
+    }
+
+    /// Sibling encrypted-store marker (FR-5.2): Gemini CLI `v0.39.1`
+    /// writes keychain-fallback credentials encrypted to
+    /// `gemini-credentials.json` next to `oauth_creds.json`. Presence with
+    /// no plaintext file means encrypted/keychain storage is unsupported
+    /// in this release; llmu never reads or mutates that store.
+    pub fn encrypted_marker_path(&self) -> Option<PathBuf> {
+        let p = match &self.credentials {
+            Some(p) => expand_tilde(p).with_file_name("gemini-credentials.json"),
+            None => self.credentials_dir()?.join("gemini-credentials.json"),
+        };
+        p.exists().then_some(p)
+    }
+
+    /// Effective project (FR-5.5): config, then `GOOGLE_CLOUD_PROJECT`,
+    /// then `GOOGLE_CLOUD_PROJECT_ID`. A `loadCodeAssist`-returned
+    /// project is authoritative and resolved in the provider, not here.
+    pub fn project_override(&self) -> Option<String> {
+        self.project
+            .clone()
+            .or_else(|| env("GOOGLE_CLOUD_PROJECT"))
+            .or_else(|| env("GOOGLE_CLOUD_PROJECT_ID"))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -452,5 +512,95 @@ mod tests {
     fn http_cache_section_appears_in_sample() {
         assert!(Config::sample().contains("[http_cache]"));
         assert!(Config::sample().contains("ttl_seconds"));
+    }
+
+    // -------------------------------------------------------------------
+    // Gemini Code Assist credential/project discovery (FR-5.1, FR-5.2, FR-5.5)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn gemini_default_credential_path_honors_gemini_cli_home() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmu-gemini-home-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join(".gemini")).unwrap();
+        std::fs::write(dir.join(".gemini/oauth_creds.json"), b"{}").unwrap();
+        std::env::set_var("GEMINI_CLI_HOME", &dir);
+        let c = Config::default();
+        let got = c
+            .gemini
+            .credentials_path()
+            .expect("default plaintext path exists");
+        assert_eq!(
+            got,
+            dir.join(".gemini/oauth_creds.json"),
+            "default credential path is ${{GEMINI_CLI_HOME:-$HOME}}/.gemini/oauth_creds.json (FR-5.1)"
+        );
+        std::env::remove_var("GEMINI_CLI_HOME");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gemini_credentials_and_marker_resolve_next_to_override() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmu-gemini-marker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Only the encrypted sibling marker exists — no plaintext file.
+        std::fs::write(dir.join("gemini-credentials.json"), b"iv:tag:enc").unwrap();
+        let c = Config {
+            gemini: GeminiCfg {
+                credentials: Some(dir.join("oauth_creds.json")),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            c.gemini.credentials_path().is_none(),
+            "an absent plaintext override must not claim supported credentials (FR-5.2)"
+        );
+        assert_eq!(
+            c.gemini.encrypted_marker_path(),
+            Some(dir.join("gemini-credentials.json")),
+            "the encrypted-store marker is the sibling gemini-credentials.json (FR-5.2)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gemini_project_precedence_config_env_then_env_id() {
+        let mut c = Config::default();
+        c.gemini.project = Some("cfg-proj".into());
+        std::env::set_var("GOOGLE_CLOUD_PROJECT", "env-proj");
+        std::env::set_var("GOOGLE_CLOUD_PROJECT_ID", "id-proj");
+        assert_eq!(
+            c.gemini.project_override().as_deref(),
+            Some("cfg-proj"),
+            "config beats env (FR-5.5)"
+        );
+        c.gemini.project = None;
+        assert_eq!(
+            c.gemini.project_override().as_deref(),
+            Some("env-proj"),
+            "GOOGLE_CLOUD_PROJECT beats GOOGLE_CLOUD_PROJECT_ID (FR-5.5)"
+        );
+        std::env::remove_var("GOOGLE_CLOUD_PROJECT");
+        assert_eq!(
+            c.gemini.project_override().as_deref(),
+            Some("id-proj"),
+            "GOOGLE_CLOUD_PROJECT_ID is the last fallback (FR-5.5)"
+        );
+        std::env::remove_var("GOOGLE_CLOUD_PROJECT_ID");
+        assert!(c.gemini.project_override().is_none());
     }
 }
