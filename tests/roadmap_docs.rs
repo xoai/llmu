@@ -255,7 +255,12 @@ fn config_sample_documents_cache_gemini_and_mutation_boundary() {
         .split("pub fn sample")
         .nth(1)
         .expect("Config::sample body");
-    for needle in ["[http_cache]", "ttl_seconds", "oauth_creds.json", "GOOGLE_CLOUD_PROJECT"] {
+    for needle in [
+        "[http_cache]",
+        "ttl_seconds",
+        "oauth_creds.json",
+        "GOOGLE_CLOUD_PROJECT",
+    ] {
         assert!(
             sample.contains(needle),
             "Config::sample must document {needle} (FR-7.3)"
@@ -380,7 +385,13 @@ fn public_oauth_identifiers_are_labeled_as_public() {
 #[test]
 fn changelog_unreleased_covers_roadmap_features_and_constraints() {
     let c = read("CHANGELOG.md");
-    let unrel = section(&c, "## [Unreleased]");
+    let unrel = c
+        .split("## [Unreleased]")
+        .nth(1)
+        .expect("Unreleased section")
+        .split("\n## [")
+        .next()
+        .expect("Unreleased body");
     for needle in [
         "Gemini",
         "retrieveUserQuota",
