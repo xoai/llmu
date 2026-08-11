@@ -7,6 +7,10 @@
 //! the contract does not exist yet: no global `--fresh`, no typed
 //! fetch-context, no per-call-site cache opt-in, no TUI freshness state
 //! machine.
+//!
+//! Task 10 adds a narrow contract: `CachedJson` must keep its public
+//! `observed_at_ms` provenance (FR-3.10) and no blanket module/crate
+//! `allow(dead_code)` may be introduced to suppress it.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -160,4 +164,38 @@ fn integration_tests_never_import_llmu() {
         !me.contains(&use_llmu) && !me.contains(&module_path),
         "tests/cache_wiring.rs is a std-only contract and must not import llmu"
     );
+}
+
+#[test]
+fn cached_json_keeps_public_observation_provenance() {
+    let http = read("src/http.rs");
+    assert!(
+        http.contains("pub struct CachedJson"),
+        "src/http.rs must keep the public CachedJson cache-provenance struct (FR-3.10)"
+    );
+    assert!(
+        http.contains("pub body: serde_json::Value")
+            && http.contains("pub origin: CacheOrigin")
+            && http.contains("pub observed_at_ms: u64"),
+        "src/http.rs must keep public body/origin/observed_at_ms on CachedJson (FR-3.10)"
+    );
+}
+
+#[test]
+fn no_blanket_dead_code_suppression_for_cache_provenance() {
+    for f in ["src/http.rs", "src/config.rs"] {
+        let src = read(f);
+        assert!(
+            !src.contains("#![allow(dead_code)]"),
+            "{f} must not blanket-suppress dead_code at crate/module level (plan Task 10)"
+        );
+        let module_item_allows: Vec<&str> = src
+            .lines()
+            .filter(|l| l.trim_start() == *l && l.starts_with("#[allow(dead_code)]"))
+            .collect();
+        assert!(
+            module_item_allows.is_empty(),
+            "{f} must not blanket-allow dead_code on module-level items, got: {module_item_allows:?} (plan Task 10)"
+        );
+    }
 }

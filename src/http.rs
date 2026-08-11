@@ -143,6 +143,12 @@ pub enum CacheOrigin {
 pub struct CachedJson {
     pub body: serde_json::Value,
     pub origin: CacheOrigin,
+    /// Original observation time (ms since epoch): the network response time
+    /// on a live fetch, the stored value on a cache hit. Kept public because
+    /// it is the cache-provenance surface consumers use to distinguish a
+    /// replayed hit from fresh data (FR-3.10); current providers consume
+    /// `CacheOrigin`, so this field stays for that public surface.
+    #[allow(dead_code)]
     pub observed_at_ms: u64,
 }
 
@@ -265,7 +271,7 @@ fn write_entry(dir: &Path, key: &str, observed: u64, body: &serde_json::Value) -
     use std::io::Write;
     f.write_all(&data)?;
     f.sync_all()?;
-    fs::rename(&tmp, &dir.join(key))?;
+    fs::rename(&tmp, dir.join(key))?;
     Ok(())
 }
 
