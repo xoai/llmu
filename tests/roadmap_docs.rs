@@ -390,15 +390,16 @@ fn public_oauth_identifiers_are_labeled_as_public() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn changelog_unreleased_covers_roadmap_features_and_constraints() {
+fn changelog_release_section_covers_roadmap_features_and_constraints() {
     let c = read("CHANGELOG.md");
-    let unrel = c
-        .split("## [Unreleased]")
-        .nth(1)
-        .expect("Unreleased section")
+    // Before release, these notes live under Unreleased. The release finalizer
+    // moves that same body into a dated version section, so locate the section
+    // by its roadmap-specific endpoint rather than pinning mutable lifecycle
+    // state forever.
+    let notes = c
         .split("\n## [")
-        .next()
-        .expect("Unreleased body");
+        .find(|section| section.contains("retrieveUserQuota"))
+        .expect("one changelog section must contain the roadmap release notes");
     for needle in [
         "Gemini",
         "retrieveUserQuota",
@@ -411,8 +412,8 @@ fn changelog_unreleased_covers_roadmap_features_and_constraints() {
         "read-only",
     ] {
         assert!(
-            unrel.contains(needle),
-            "CHANGELOG Unreleased must cover {needle} (FR-7)"
+            notes.contains(needle),
+            "one CHANGELOG release section must cover {needle} (FR-7)"
         );
     }
 }
