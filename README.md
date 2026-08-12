@@ -17,6 +17,10 @@ No async runtime, no database, no daemon. Blocking HTTP (`ureq` + rustls),
 OS threads for parallel fetches, in-memory aggregation, `ratatui` for the
 dashboard. Release binary is a few MB, cold start is milliseconds.
 
+## Demo
+
+![llmu interactive dashboard](screenshot.png)
+
 ## Install
 
 ### Prebuilt binaries
