@@ -99,11 +99,7 @@ fn qwen_provider_source_declares_usage_configured_and_capabilities() {
 
 #[test]
 fn qwen_sources_contain_no_http_or_console_session_markers() {
-    for rel in [
-        "src/providers/qwen.rs",
-        "src/config.rs",
-        "src/discover.rs",
-    ] {
+    for rel in ["src/providers/qwen.rs", "src/config.rs", "src/discover.rs"] {
         let src = read(rel);
         for needle in [
             "use crate::http",

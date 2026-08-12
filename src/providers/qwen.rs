@@ -203,13 +203,21 @@ impl Provider for Qwen {
     /// FR-6: configured when any credential class is present or a
     /// supported local usage file exists.
     fn configured(&self, cfg: &Config) -> bool {
-        let has_key = cfg.qwen.standard_key.as_deref().is_some_and(|k| !k.is_empty())
+        let has_key = cfg
+            .qwen
+            .standard_key
+            .as_deref()
+            .is_some_and(|k| !k.is_empty())
             || cfg
                 .qwen
                 .coding_plan_key
                 .as_deref()
                 .is_some_and(|k| !k.is_empty())
-            || cfg.qwen.token_plan_key.as_deref().is_some_and(|k| !k.is_empty());
+            || cfg
+                .qwen
+                .token_plan_key
+                .as_deref()
+                .is_some_and(|k| !k.is_empty());
         if has_key {
             return true;
         }
@@ -284,8 +292,7 @@ impl Provider for Qwen {
                     // Cost estimated only when the user's pricing table
                     // matches the model (FR-3); no built-in Qwen price
                     // guesses exist.
-                    let cost_usd =
-                        cfg.estimate_cost(&rec.model, uncached, output, rec.cached, 0);
+                    let cost_usd = cfg.estimate_cost(&rec.model, uncached, output, rec.cached, 0);
                     out.push((
                         rec.ts,
                         rec.model.clone(),
@@ -386,15 +393,21 @@ impl Provider for Qwen {
         // Deterministic order (FR-3/FR-4): timestamp, model id, then the
         // stable request/session id.
         out.sort_by(|a, b| {
-            a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2))
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
         });
         let events = out.into_iter().map(|(_, _, _, e)| e).collect();
         let mut notes = vec![];
         if skipped > 0 {
-            notes.push(format!("qwen: skipped {skipped} malformed local usage record(s)"));
+            notes.push(format!(
+                "qwen: skipped {skipped} malformed local usage record(s)"
+            ));
         }
         if unreadable > 0 {
-            notes.push(format!("qwen: skipped {unreadable} unreadable local usage file(s)"));
+            notes.push(format!(
+                "qwen: skipped {unreadable} unreadable local usage file(s)"
+            ));
         }
         Ok(Fetch {
             events,
@@ -510,8 +523,7 @@ mod tests {
     }
 
     fn usage(cfg: &Config) -> Fetch {
-        Qwen
-            .usage(cfg, &FetchContext::default(), dt(SINCE), dt(UNTIL))
+        Qwen.usage(cfg, &FetchContext::default(), dt(SINCE), dt(UNTIL))
             .unwrap()
     }
 
@@ -543,25 +555,85 @@ mod tests {
                 // UTC month 08 inside the 2026-07 file: the writer's local
                 // month named the file, so enumeration must not derive
                 // files from UTC months (AC-3).
-                &req("id-jul", "s-jul", "2026-08-01T00:30:00Z", "qwen-max", 20, 20, 0, 0, 40),
-                &req("id-jul-out", "s-jul-out", "2026-07-31T23:59:59Z", "qwen-max", 100, 100, 0, 0, 200),
+                &req(
+                    "id-jul",
+                    "s-jul",
+                    "2026-08-01T00:30:00Z",
+                    "qwen-max",
+                    20,
+                    20,
+                    0,
+                    0,
+                    40,
+                ),
+                &req(
+                    "id-jul-out",
+                    "s-jul-out",
+                    "2026-07-31T23:59:59Z",
+                    "qwen-max",
+                    100,
+                    100,
+                    0,
+                    0,
+                    200,
+                ),
             ],
         );
         write_lines(
             &runtime.join("usage"),
             "token-usage-2026-08.jsonl",
             &[
-                &req("id-a", "s-a", "2026-08-01T00:00:00Z", "qwen-max", 1500, 800, 1000, 200, 2500),
-                &req("id-b", "s-b", "2026-08-31T23:30:00Z", "Qwen-Plus", 300, 50, 300, 0, 350),
+                &req(
+                    "id-a",
+                    "s-a",
+                    "2026-08-01T00:00:00Z",
+                    "qwen-max",
+                    1500,
+                    800,
+                    1000,
+                    200,
+                    2500,
+                ),
+                &req(
+                    "id-b",
+                    "s-b",
+                    "2026-08-31T23:30:00Z",
+                    "Qwen-Plus",
+                    300,
+                    50,
+                    300,
+                    0,
+                    350,
+                ),
                 // UTC month 09 inside the 2026-08 file and outside
                 // [since, until): enumerated, then range-filtered.
-                &req("id-c", "s-c", "2026-09-01T00:10:00Z", "qwen-turbo", 10, 20, 0, 0, 30),
+                &req(
+                    "id-c",
+                    "s-c",
+                    "2026-09-01T00:10:00Z",
+                    "qwen-turbo",
+                    10,
+                    20,
+                    0,
+                    0,
+                    30,
+                ),
             ],
         );
         write_lines(
             &runtime.join("usage"),
             "token-usage-2026-09.jsonl",
-            &[&req("id-d", "s-d", "2026-09-05T00:00:00Z", "qwen-max", 10, 20, 0, 0, 30)],
+            &[&req(
+                "id-d",
+                "s-d",
+                "2026-09-05T00:00:00Z",
+                "qwen-max",
+                10,
+                20,
+                0,
+                0,
+                30,
+            )],
         );
         let f = usage(&cfg);
         let rows: Vec<_> = f.events.iter().map(row).collect();
@@ -569,9 +641,33 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                ("2026-08-01T00:00:00+00:00".into(), "qwen-max".into(), 1, 500, 1000, 1000, 0),
-                ("2026-08-01T00:30:00+00:00".into(), "qwen-max".into(), 1, 20, 20, 0, 0),
-                ("2026-08-31T23:30:00+00:00".into(), "Qwen-Plus".into(), 1, 0, 50, 300, 0),
+                (
+                    "2026-08-01T00:00:00+00:00".into(),
+                    "qwen-max".into(),
+                    1,
+                    500,
+                    1000,
+                    1000,
+                    0
+                ),
+                (
+                    "2026-08-01T00:30:00+00:00".into(),
+                    "qwen-max".into(),
+                    1,
+                    20,
+                    20,
+                    0,
+                    0
+                ),
+                (
+                    "2026-08-31T23:30:00+00:00".into(),
+                    "Qwen-Plus".into(),
+                    1,
+                    0,
+                    50,
+                    300,
+                    0
+                ),
             ]
         );
         for e in &f.events {
@@ -591,10 +687,50 @@ mod tests {
             &dir.join("runtime/usage"),
             "token-usage-2026-08.jsonl",
             &[
-                &req("e1", "s1", "2026-07-31T23:59:59.999Z", "qwen-max", 1, 1, 0, 0, 2),
-                &req("e2", "s2", "2026-08-01T00:00:00.000Z", "qwen-max", 1, 1, 0, 0, 2),
-                &req("e3", "s3", "2026-08-31T23:59:59.999Z", "qwen-max", 1, 1, 0, 0, 2),
-                &req("e4", "s4", "2026-09-01T00:00:00.000Z", "qwen-max", 1, 1, 0, 0, 2),
+                &req(
+                    "e1",
+                    "s1",
+                    "2026-07-31T23:59:59.999Z",
+                    "qwen-max",
+                    1,
+                    1,
+                    0,
+                    0,
+                    2,
+                ),
+                &req(
+                    "e2",
+                    "s2",
+                    "2026-08-01T00:00:00.000Z",
+                    "qwen-max",
+                    1,
+                    1,
+                    0,
+                    0,
+                    2,
+                ),
+                &req(
+                    "e3",
+                    "s3",
+                    "2026-08-31T23:59:59.999Z",
+                    "qwen-max",
+                    1,
+                    1,
+                    0,
+                    0,
+                    2,
+                ),
+                &req(
+                    "e4",
+                    "s4",
+                    "2026-09-01T00:00:00.000Z",
+                    "qwen-max",
+                    1,
+                    1,
+                    0,
+                    0,
+                    2,
+                ),
             ],
         );
         let f = usage(&cfg);
@@ -613,14 +749,44 @@ mod tests {
         write_lines(
             &dir.join("runtime/usage"),
             "token-usage-2026-08.jsonl",
-            &[&req("dup", "s-dup", "2026-08-10T00:00:00Z", "qwen-max", 100, 1, 0, 0, 101)],
+            &[&req(
+                "dup",
+                "s-dup",
+                "2026-08-10T00:00:00Z",
+                "qwen-max",
+                100,
+                1,
+                0,
+                0,
+                101,
+            )],
         );
         write_lines(
             &dir.join("runtime/usage"),
             "token-usage-2026-09.jsonl",
             &[
-                &req("dup", "s-dup2", "2026-08-20T00:00:00Z", "qwen-max", 999, 1, 0, 0, 1000),
-                &req("solo", "s-solo", "2026-08-21T00:00:00Z", "qwen-max", 7, 1, 0, 0, 8),
+                &req(
+                    "dup",
+                    "s-dup2",
+                    "2026-08-20T00:00:00Z",
+                    "qwen-max",
+                    999,
+                    1,
+                    0,
+                    0,
+                    1000,
+                ),
+                &req(
+                    "solo",
+                    "s-solo",
+                    "2026-08-21T00:00:00Z",
+                    "qwen-max",
+                    7,
+                    1,
+                    0,
+                    0,
+                    8,
+                ),
             ],
         );
         let f = usage(&cfg);
@@ -644,16 +810,49 @@ mod tests {
             &dir.join("runtime/usage"),
             "token-usage-2026-08.jsonl",
             &[
-                &req("m1", "s1", "2026-08-02T00:00:00Z", "qwen-max", 1, 1, 0, 0, 2),
-                &req("m2", "s2", "2026-08-03T00:00:00Z", "QWEN-PLUS", 1, 1, 0, 0, 2),
+                &req(
+                    "m1",
+                    "s1",
+                    "2026-08-02T00:00:00Z",
+                    "qwen-max",
+                    1,
+                    1,
+                    0,
+                    0,
+                    2,
+                ),
+                &req(
+                    "m2",
+                    "s2",
+                    "2026-08-03T00:00:00Z",
+                    "QWEN-PLUS",
+                    1,
+                    1,
+                    0,
+                    0,
+                    2,
+                ),
                 &req("m3", "s3", "2026-08-04T00:00:00Z", "gpt-4o", 1, 1, 0, 0, 2),
-                &req("m4", "s4", "2026-08-05T00:00:00Z", "deepseek-chat", 1, 1, 0, 0, 2),
+                &req(
+                    "m4",
+                    "s4",
+                    "2026-08-05T00:00:00Z",
+                    "deepseek-chat",
+                    1,
+                    1,
+                    0,
+                    0,
+                    2,
+                ),
                 &req("m5", "s5", "2026-08-06T00:00:00Z", "", 1, 1, 0, 0, 2),
             ],
         );
         let f = usage(&cfg);
         let models: Vec<_> = f.events.iter().map(|e| e.model.clone()).collect();
-        assert_eq!(models, vec!["qwen-max".to_string(), "QWEN-PLUS".to_string()]);
+        assert_eq!(
+            models,
+            vec!["qwen-max".to_string(), "QWEN-PLUS".to_string()]
+        );
         assert!(f.notes.is_empty(), "model filtering is silent");
     }
 
@@ -668,8 +867,28 @@ mod tests {
             &dir.join("runtime/usage"),
             "token-usage-2026-08.jsonl",
             &[
-                &req("n1", "s1", "2026-08-02T00:00:00Z", "qwen-max", 1500, 800, 1000, 200, 2500),
-                &req("n2", "s2", "2026-08-03T00:00:00Z", "qwen-max", 300, 50, 300, 0, 350),
+                &req(
+                    "n1",
+                    "s1",
+                    "2026-08-02T00:00:00Z",
+                    "qwen-max",
+                    1500,
+                    800,
+                    1000,
+                    200,
+                    2500,
+                ),
+                &req(
+                    "n2",
+                    "s2",
+                    "2026-08-03T00:00:00Z",
+                    "qwen-max",
+                    300,
+                    50,
+                    300,
+                    0,
+                    350,
+                ),
             ],
         );
         let f = usage(&cfg);
@@ -677,8 +896,24 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                ("2026-08-02T00:00:00+00:00".into(), "qwen-max".into(), 1, 500, 1000, 1000, 0),
-                ("2026-08-03T00:00:00+00:00".into(), "qwen-max".into(), 1, 0, 50, 300, 0),
+                (
+                    "2026-08-02T00:00:00+00:00".into(),
+                    "qwen-max".into(),
+                    1,
+                    500,
+                    1000,
+                    1000,
+                    0
+                ),
+                (
+                    "2026-08-03T00:00:00+00:00".into(),
+                    "qwen-max".into(),
+                    1,
+                    0,
+                    50,
+                    300,
+                    0
+                ),
             ]
         );
         assert_eq!(
@@ -697,8 +932,28 @@ mod tests {
             &dir.join("runtime/usage"),
             "token-usage-2026-08.jsonl",
             &[
-                &req("o1", "s1", "2026-08-02T00:00:00Z", "qwen-max", u64::MAX, u64::MAX, 10, 100, u64::MAX),
-                &req("o2", "s2", "2026-08-03T00:00:00Z", "qwen-max", u64::MAX, u64::MAX, u64::MAX, 5, u64::MAX),
+                &req(
+                    "o1",
+                    "s1",
+                    "2026-08-02T00:00:00Z",
+                    "qwen-max",
+                    u64::MAX,
+                    u64::MAX,
+                    10,
+                    100,
+                    u64::MAX,
+                ),
+                &req(
+                    "o2",
+                    "s2",
+                    "2026-08-03T00:00:00Z",
+                    "qwen-max",
+                    u64::MAX,
+                    u64::MAX,
+                    u64::MAX,
+                    5,
+                    u64::MAX,
+                ),
             ],
         );
         write(
@@ -718,11 +973,35 @@ mod tests {
             rows,
             vec![
                 // input MAX - 10; output MAX + 100 saturates at MAX.
-                ("2026-08-02T00:00:00+00:00".into(), "qwen-max".into(), 1, u64::MAX - 10, u64::MAX, 10, 0),
+                (
+                    "2026-08-02T00:00:00+00:00".into(),
+                    "qwen-max".into(),
+                    1,
+                    u64::MAX - 10,
+                    u64::MAX,
+                    10,
+                    0
+                ),
                 // input MAX - MAX = 0; output MAX + 5 saturates at MAX.
-                ("2026-08-03T00:00:00+00:00".into(), "qwen-max".into(), 1, 0, u64::MAX, u64::MAX, 0),
+                (
+                    "2026-08-03T00:00:00+00:00".into(),
+                    "qwen-max".into(),
+                    1,
+                    0,
+                    u64::MAX,
+                    u64::MAX,
+                    0
+                ),
                 // legacy: same saturating semantics.
-                ("2026-08-04T00:00:00+00:00".into(), "qwen-max".into(), 1, 0, u64::MAX, u64::MAX, 0),
+                (
+                    "2026-08-04T00:00:00+00:00".into(),
+                    "qwen-max".into(),
+                    1,
+                    0,
+                    u64::MAX,
+                    u64::MAX,
+                    0
+                ),
             ]
         );
     }
@@ -740,11 +1019,31 @@ mod tests {
             &dir.join("runtime/usage"),
             "token-usage-2026-08.jsonl",
             &[
-                &req("z1", "s1", "2026-08-10T00:00:00Z", "qwen-z", 10, 1, 0, 0, 11),
+                &req(
+                    "z1",
+                    "s1",
+                    "2026-08-10T00:00:00Z",
+                    "qwen-z",
+                    10,
+                    1,
+                    0,
+                    0,
+                    11,
+                ),
                 &req("a2", "s2", "2026-08-05T00:00:00Z", "qwen-a", 2, 1, 0, 0, 3),
                 &req("a1", "s3", "2026-08-05T00:00:00Z", "qwen-a", 1, 1, 0, 0, 2),
                 &req("b1", "s4", "2026-08-05T00:00:00Z", "qwen-b", 3, 1, 0, 0, 4),
-                &req("z2", "s5", "2026-08-10T00:00:00Z", "qwen-z", 20, 1, 0, 0, 21),
+                &req(
+                    "z2",
+                    "s5",
+                    "2026-08-10T00:00:00Z",
+                    "qwen-z",
+                    20,
+                    1,
+                    0,
+                    0,
+                    21,
+                ),
             ],
         );
         let f = usage(&cfg);
@@ -754,11 +1053,51 @@ mod tests {
             vec![
                 // Same ts + model: a1 (input 1) precedes a2 (input 2) by
                 // stable request id despite a2 appearing first in the file.
-                ("2026-08-05T00:00:00+00:00".into(), "qwen-a".into(), 1, 1, 1, 0, 0),
-                ("2026-08-05T00:00:00+00:00".into(), "qwen-a".into(), 1, 2, 1, 0, 0),
-                ("2026-08-05T00:00:00+00:00".into(), "qwen-b".into(), 1, 3, 1, 0, 0),
-                ("2026-08-10T00:00:00+00:00".into(), "qwen-z".into(), 1, 10, 1, 0, 0),
-                ("2026-08-10T00:00:00+00:00".into(), "qwen-z".into(), 1, 20, 1, 0, 0),
+                (
+                    "2026-08-05T00:00:00+00:00".into(),
+                    "qwen-a".into(),
+                    1,
+                    1,
+                    1,
+                    0,
+                    0
+                ),
+                (
+                    "2026-08-05T00:00:00+00:00".into(),
+                    "qwen-a".into(),
+                    1,
+                    2,
+                    1,
+                    0,
+                    0
+                ),
+                (
+                    "2026-08-05T00:00:00+00:00".into(),
+                    "qwen-b".into(),
+                    1,
+                    3,
+                    1,
+                    0,
+                    0
+                ),
+                (
+                    "2026-08-10T00:00:00+00:00".into(),
+                    "qwen-z".into(),
+                    1,
+                    10,
+                    1,
+                    0,
+                    0
+                ),
+                (
+                    "2026-08-10T00:00:00+00:00".into(),
+                    "qwen-z".into(),
+                    1,
+                    20,
+                    1,
+                    0,
+                    0
+                ),
             ],
             "id tiebreak (a1 < a2) must order same-ts same-model records over file order"
         );
@@ -805,7 +1144,11 @@ mod tests {
             2,
             "only in-window legacy summaries emit (below since and at until excluded)"
         );
-        assert_eq!(input, vec![20, 30], "exactly since and just below until included");
+        assert_eq!(
+            input,
+            vec![20, 30],
+            "exactly since and just below until included"
+        );
         assert!(f.notes.is_empty());
     }
 
@@ -859,7 +1202,15 @@ mod tests {
         let rows: Vec<_> = f.events.iter().map(row).collect();
         assert_eq!(
             rows,
-            vec![("2026-08-10T00:00:00+00:00".into(), "qwen-max".into(), 1, 100, 50, 0, 0)],
+            vec![(
+                "2026-08-10T00:00:00+00:00".into(),
+                "qwen-max".into(),
+                1,
+                100,
+                50,
+                0,
+                0
+            )],
             "valid Qwen entry survives; invalid Qwen entry and non-Qwen model emit nothing"
         );
         assert_eq!(
@@ -869,9 +1220,18 @@ mod tests {
         );
         let note = &f.notes[0];
         for leaked in [
-            "abc", "qwen-turbo", "glm", "usage_record", "home", "runtime", "settings",
+            "abc",
+            "qwen-turbo",
+            "glm",
+            "usage_record",
+            "home",
+            "runtime",
+            "settings",
         ] {
-            assert!(!note.contains(leaked), "note must not leak `{leaked}`: {note}");
+            assert!(
+                !note.contains(leaked),
+                "note must not leak `{leaked}`: {note}"
+            );
         }
     }
 
@@ -891,21 +1251,42 @@ mod tests {
             &runtime.join("usage_record.jsonl"),
             &format!(
                 "{}\n",
-                legacy("s-rt", dt("2026-08-10T00:00:00Z").timestamp_millis(), &[("qwen-max", 1, 10, 10, 0, 0, 20)])
+                legacy(
+                    "s-rt",
+                    dt("2026-08-10T00:00:00Z").timestamp_millis(),
+                    &[("qwen-max", 1, 10, 10, 0, 0, 20)]
+                )
             ),
         );
         let f = usage(&cfg);
-        assert!(f.events.is_empty(), "legacy must not fall back to the runtime directory");
+        assert!(
+            f.events.is_empty(),
+            "legacy must not fall back to the runtime directory"
+        );
         assert!(f.notes.is_empty());
 
         // Runtime ledger still works with only runtime_dir configured.
         write_lines(
             &runtime.join("usage"),
             "token-usage-2026-08.jsonl",
-            &[&req("r1", "s1", "2026-08-10T00:00:00Z", "qwen-max", 1, 1, 0, 0, 2)],
+            &[&req(
+                "r1",
+                "s1",
+                "2026-08-10T00:00:00Z",
+                "qwen-max",
+                1,
+                1,
+                0,
+                0,
+                2,
+            )],
         );
         let f = usage(&cfg);
-        assert_eq!(f.events.len(), 1, "runtime ledger unaffected by home-only legacy rule");
+        assert_eq!(
+            f.events.len(),
+            1,
+            "runtime ledger unaffected by home-only legacy rule"
+        );
 
         // Only home configured: runtime may fall back to home, and home
         // serves the legacy ledger.
@@ -914,18 +1295,36 @@ mod tests {
         write_lines(
             &home.join("usage"),
             "token-usage-2026-08.jsonl",
-            &[&req("r2", "s2", "2026-08-11T00:00:00Z", "qwen-max", 2, 2, 0, 0, 4)],
+            &[&req(
+                "r2",
+                "s2",
+                "2026-08-11T00:00:00Z",
+                "qwen-max",
+                2,
+                2,
+                0,
+                0,
+                4,
+            )],
         );
         write(
             &home.join("usage_record.jsonl"),
             &format!(
                 "{}\n",
-                legacy("s-h", dt("2026-08-12T00:00:00Z").timestamp_millis(), &[("qwen-max", 3, 30, 30, 0, 0, 60)])
+                legacy(
+                    "s-h",
+                    dt("2026-08-12T00:00:00Z").timestamp_millis(),
+                    &[("qwen-max", 3, 30, 30, 0, 0, 60)]
+                )
             ),
         );
         let f = usage(&cfg2);
         let inputs: Vec<_> = f.events.iter().map(|e| e.input_tokens).collect();
-        assert_eq!(inputs, vec![2, 30], "home serves runtime fallback and legacy ledger");
+        assert_eq!(
+            inputs,
+            vec![2, 30],
+            "home serves runtime fallback and legacy ledger"
+        );
     }
 
     /// FR-4: legacy epoch-ms + nested per-model events with the same
@@ -956,8 +1355,24 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                ("2026-08-10T12:34:56+00:00".into(), "qwen-max".into(), 3, 800, 600, 200, 0),
-                ("2026-08-10T12:34:56+00:00".into(), "qwen-plus".into(), 1, 0, 0, 400, 0),
+                (
+                    "2026-08-10T12:34:56+00:00".into(),
+                    "qwen-max".into(),
+                    3,
+                    800,
+                    600,
+                    200,
+                    0
+                ),
+                (
+                    "2026-08-10T12:34:56+00:00".into(),
+                    "qwen-plus".into(),
+                    1,
+                    0,
+                    0,
+                    400,
+                    0
+                ),
             ]
         );
     }
@@ -971,12 +1386,24 @@ mod tests {
             &dir.join("home/usage_record.jsonl"),
             &format!(
                 "{}\n{}\n",
-                legacy("s-leg", dt("2026-08-10T00:00:00Z").timestamp_millis(), &[("qwen-max", 3, 1000, 500, 200, 100, 1400)]),
-                legacy("s-leg", dt("2026-08-12T00:00:00Z").timestamp_millis(), &[("qwen-max", 7, 5000, 900, 1000, 300, 6200)]),
+                legacy(
+                    "s-leg",
+                    dt("2026-08-10T00:00:00Z").timestamp_millis(),
+                    &[("qwen-max", 3, 1000, 500, 200, 100, 1400)]
+                ),
+                legacy(
+                    "s-leg",
+                    dt("2026-08-12T00:00:00Z").timestamp_millis(),
+                    &[("qwen-max", 7, 5000, 900, 1000, 300, 6200)]
+                ),
             ),
         );
         let f = usage(&cfg);
-        assert_eq!(f.events.len(), 1, "repeated session keeps only the last record");
+        assert_eq!(
+            f.events.len(),
+            1,
+            "repeated session keeps only the last record"
+        );
         assert_eq!(f.events[0].start, dt("2026-08-12T00:00:00Z"));
         assert_eq!(f.events[0].requests, 7);
         assert_eq!(f.events[0].input_tokens, 4000, "5000 - 1000 cached");
@@ -994,18 +1421,50 @@ mod tests {
             &dir.join("runtime/usage"),
             "token-usage-2026-08.jsonl",
             &[
-                &req("r1", "s-common", "2026-08-10T00:00:00Z", "qwen-max", 10, 10, 0, 0, 20),
+                &req(
+                    "r1",
+                    "s-common",
+                    "2026-08-10T00:00:00Z",
+                    "qwen-max",
+                    10,
+                    10,
+                    0,
+                    0,
+                    20,
+                ),
                 // Accepted but outside [since, until): still marks the session.
-                &req("r2", "s-out", "2026-07-20T00:00:00Z", "qwen-max", 10, 10, 0, 0, 20),
+                &req(
+                    "r2",
+                    "s-out",
+                    "2026-07-20T00:00:00Z",
+                    "qwen-max",
+                    10,
+                    10,
+                    0,
+                    0,
+                    20,
+                ),
             ],
         );
         write(
             &dir.join("home/usage_record.jsonl"),
             &format!(
                 "{}\n{}\n{}\n",
-                legacy("s-common", dt("2026-08-11T00:00:00Z").timestamp_millis(), &[("qwen-max", 99, 9900, 9900, 0, 0, 19800)]),
-                legacy("s-out", dt("2026-08-12T00:00:00Z").timestamp_millis(), &[("qwen-max", 99, 9900, 9900, 0, 0, 19800)]),
-                legacy("s-other", dt("2026-08-13T00:00:00Z").timestamp_millis(), &[("qwen-max", 4, 400, 400, 100, 100, 600)]),
+                legacy(
+                    "s-common",
+                    dt("2026-08-11T00:00:00Z").timestamp_millis(),
+                    &[("qwen-max", 99, 9900, 9900, 0, 0, 19800)]
+                ),
+                legacy(
+                    "s-out",
+                    dt("2026-08-12T00:00:00Z").timestamp_millis(),
+                    &[("qwen-max", 99, 9900, 9900, 0, 0, 19800)]
+                ),
+                legacy(
+                    "s-other",
+                    dt("2026-08-13T00:00:00Z").timestamp_millis(),
+                    &[("qwen-max", 4, 400, 400, 100, 100, 600)]
+                ),
             ),
         );
         let f = usage(&cfg);
@@ -1036,7 +1495,17 @@ mod tests {
             &dir.join("runtime/usage"),
             "token-usage-2026-08.jsonl",
             &[
-                &req("good", "s-good", "2026-08-10T00:00:00Z", "qwen-max", 5, 5, 0, 0, 10),
+                &req(
+                    "good",
+                    "s-good",
+                    "2026-08-10T00:00:00Z",
+                    "qwen-max",
+                    5,
+                    5,
+                    0,
+                    0,
+                    10,
+                ),
                 "not json {{{",
                 r#"{"schemaVersion":2,"id":"f1","timestamp":"2026-08-10T00:00:00Z","sessionId":"s","model":"qwen-max","inputTokens":1,"outputTokens":1,"cachedTokens":0,"thoughtsTokens":0,"totalTokens":2}"#,
                 r#"{"schemaVersion":0,"id":"f2","timestamp":"2026-08-10T00:00:00Z","sessionId":"s","model":"qwen-max","inputTokens":1,"outputTokens":1,"cachedTokens":0,"thoughtsTokens":0,"totalTokens":2}"#,
@@ -1061,11 +1530,19 @@ mod tests {
                 r#"{"version":2,"sessionId":"l1","timestamp":1786878800000,"models":{}}"#,
                 r#"{"version":1,"sessionId":"l2","timestamp":-5,"models":{}}"#,
                 r#"{"version":1,"sessionId":"l3","timestamp":1786878800000}"#,
-                legacy("l-ok", dt("2026-08-15T00:00:00Z").timestamp_millis(), &[("qwen-max", 1, 10, 10, 0, 0, 20)]),
+                legacy(
+                    "l-ok",
+                    dt("2026-08-15T00:00:00Z").timestamp_millis(),
+                    &[("qwen-max", 1, 10, 10, 0, 0, 20)]
+                ),
             ),
         );
         let f = usage(&cfg);
-        assert_eq!(f.events.len(), 2, "one valid request + one valid legacy row");
+        assert_eq!(
+            f.events.len(),
+            2,
+            "one valid request + one valid legacy row"
+        );
         assert_eq!(
             f.notes,
             vec!["qwen: skipped 17 malformed local usage record(s)".to_string()],
@@ -1073,10 +1550,22 @@ mod tests {
         );
         let note = &f.notes[0];
         for leaked in [
-            "abc", "not-a-time", "-5", "1.5", "18446744073709551616", "not json",
-            "token-usage", "usage_record", "home", "runtime", "settings",
+            "abc",
+            "not-a-time",
+            "-5",
+            "1.5",
+            "18446744073709551616",
+            "not json",
+            "token-usage",
+            "usage_record",
+            "home",
+            "runtime",
+            "settings",
         ] {
-            assert!(!note.contains(leaked), "note must not leak `{leaked}`: {note}");
+            assert!(
+                !note.contains(leaked),
+                "note must not leak `{leaked}`: {note}"
+            );
         }
     }
 
@@ -1109,10 +1598,24 @@ mod tests {
         write_lines(
             &runtime.join("usage"),
             "token-usage-2026-12.jsonl",
-            &[&req("ok1", "s1", "2026-08-10T00:00:00Z", "qwen-max", 2, 2, 0, 0, 4)],
+            &[&req(
+                "ok1",
+                "s1",
+                "2026-08-10T00:00:00Z",
+                "qwen-max",
+                2,
+                2,
+                0,
+                0,
+                4,
+            )],
         );
         let f = usage(&cfg);
-        assert_eq!(f.events.len(), 1, "valid row survives malformed + unreadable files");
+        assert_eq!(
+            f.events.len(),
+            1,
+            "valid row survives malformed + unreadable files"
+        );
         assert_eq!(
             f.notes,
             vec![
@@ -1124,10 +1627,19 @@ mod tests {
         let dir_str = dir.display().to_string();
         for note in &f.notes {
             for leaked in [
-                "token-usage", "usage_record", "home", "runtime", "settings", "broken", "nope",
+                "token-usage",
+                "usage_record",
+                "home",
+                "runtime",
+                "settings",
+                "broken",
+                "nope",
                 dir_str.as_str(),
             ] {
-                assert!(!note.contains(leaked), "note must not leak `{leaked}`: {note}");
+                assert!(
+                    !note.contains(leaked),
+                    "note must not leak `{leaked}`: {note}"
+                );
             }
         }
     }
@@ -1174,14 +1686,31 @@ mod tests {
         write_lines(
             &runtime.join("usage"),
             "token-usage-2026-08.jsonl",
-            &[&req("c1", "s1", "2026-08-10T00:00:00Z", "qwen-max", 1, 1, 0, 0, 2)],
+            &[&req(
+                "c1",
+                "s1",
+                "2026-08-10T00:00:00Z",
+                "qwen-max",
+                1,
+                1,
+                0,
+                0,
+                2,
+            )],
         );
         assert!(Qwen.configured(&cfg), "request file alone configures");
 
         std::fs::remove_dir_all(&runtime).unwrap();
         write(
             &home.join("usage_record.jsonl"),
-            &format!("{}\n", legacy("s1", dt("2026-08-10T00:00:00Z").timestamp_millis(), &[("qwen-max", 1, 1, 1, 0, 0, 2)])),
+            &format!(
+                "{}\n",
+                legacy(
+                    "s1",
+                    dt("2026-08-10T00:00:00Z").timestamp_millis(),
+                    &[("qwen-max", 1, 1, 1, 0, 0, 2)]
+                )
+            ),
         );
         assert!(Qwen.configured(&cfg), "legacy file alone configures");
     }
@@ -1197,11 +1726,28 @@ mod tests {
         write_lines(
             &runtime.join("usage"),
             "token-usage-2026-08.jsonl",
-            &[&req("r1", "s1", "2026-08-10T00:00:00Z", "qwen-max", 1, 1, 0, 0, 2)],
+            &[&req(
+                "r1",
+                "s1",
+                "2026-08-10T00:00:00Z",
+                "qwen-max",
+                1,
+                1,
+                0,
+                0,
+                2,
+            )],
         );
         write(
             &home.join("usage_record.jsonl"),
-            &format!("{}\n", legacy("s2", dt("2026-08-11T00:00:00Z").timestamp_millis(), &[("qwen-max", 1, 1, 1, 0, 0, 2)])),
+            &format!(
+                "{}\n",
+                legacy(
+                    "s2",
+                    dt("2026-08-11T00:00:00Z").timestamp_millis(),
+                    &[("qwen-max", 1, 1, 1, 0, 0, 2)]
+                )
+            ),
         );
         write(&home.join("settings.json"), "{\"env\":{}}");
         let paths = [
