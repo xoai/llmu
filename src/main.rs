@@ -93,7 +93,7 @@ struct UsageArgs {
     /// Comma list of extra group keys: provider,model,source
     #[arg(long, default_value = "provider")]
     group_by: String,
-    /// Filter: comma list of providers (anthropic,openai,deepseek,kimi,glm,gemini)
+    /// Filter: comma list of providers (anthropic,openai,deepseek,kimi,glm,gemini,qwen)
     #[arg(long)]
     provider: Option<String>,
     /// Filter: substring match on model id
@@ -219,6 +219,18 @@ fn merge_provider(
     }
 }
 
+/// One shared `--provider` filter predicate (FR-6.1): a None filter admits
+/// every provider; a Some filter admits exactly the listed ids. Provider
+/// worker selection and the local Claude Code event path both go through
+/// it, so filtered-out routed rows (e.g. qwen* models served through an
+/// Anthropic-compatible route) never leak into reports or the rolling
+/// Claude quota.
+fn filter_admits(filter: Option<&[String]>, provider: &str) -> bool {
+    filter
+        .map(|f| f.iter().any(|x| x == provider))
+        .unwrap_or(true)
+}
+
 /// Fetch all sources in parallel with plain OS threads — no async runtime
 /// needed for a handful of REST calls. `ctx` threads the raw HTTP cache
 /// options and per-invocation freshness into every provider method
@@ -245,11 +257,7 @@ pub(crate) fn gather(
     let selected: Vec<&Box<dyn providers::Provider>> = provs
         .iter()
         .filter(|p| p.configured(cfg))
-        .filter(|p| {
-            provider_filter
-                .map(|f| f.iter().any(|x| x == p.id()))
-                .unwrap_or(true)
-        })
+        .filter(|p| filter_admits(provider_filter, p.id()))
         .collect();
 
     std::thread::scope(|s| {
@@ -303,13 +311,22 @@ pub(crate) fn gather(
         if let Some(h) = local_handle {
             match h.join() {
                 Ok(Ok(c)) => {
+                    // FR-6.1: `--provider` filters local Claude Code events
+                    // exactly like Provider::usage events — routed qwen*
+                    // rows are admitted only by a qwen filter, and rows
+                    // from excluded providers never feed the rolling
+                    // Claude quota or the usage report.
+                    let mut local_events = c.events;
+                    local_events.retain(|e| filter_admits(provider_filter, &e.provider));
                     if want_quota {
-                        if let Some(q) = local::claude_code::rolling_quota(&c.events, Utc::now()) {
+                        if let Some(q) =
+                            local::claude_code::rolling_quota(&local_events, Utc::now())
+                        {
                             g.quotas.push(q);
                         }
                     }
                     if want_usage {
-                        g.events.extend(c.events);
+                        g.events.extend(local_events);
                     }
                     g.notes.extend(c.notes);
                 }
@@ -671,6 +688,19 @@ mod tests {
             balances: vec![],
             notes: vec![],
         }
+    }
+
+    /// FR-6.1: the same `--provider` predicate that selects provider
+    /// workers also admits local Claude Code events — None admits all,
+    /// and a qwen filter admits qwen while excluding every other id.
+    #[test]
+    fn provider_filter_admits_shared_with_local_events() {
+        let qwen_only = Some(vec!["qwen".to_string(), "glm".to_string()]);
+        assert!(filter_admits(qwen_only.as_deref(), "qwen"));
+        assert!(filter_admits(qwen_only.as_deref(), "glm"));
+        assert!(!filter_admits(qwen_only.as_deref(), "anthropic"));
+        assert!(filter_admits(None, "anthropic"));
+        assert!(filter_admits(None, "qwen"));
     }
 
     fn quota(provider: &str) -> QuotaSnapshot {
