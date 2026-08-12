@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Live watch mode now preserves Claude Code, Codex, Gemini, and Qwen local
+  usage across the 3-second local refresh, including activity, daily token,
+  and per-model rows.
+
 ## [0.1.3] - 2026-08-12
 
 ### Added
