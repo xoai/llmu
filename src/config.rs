@@ -1,6 +1,10 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::{collections::HashMap, fs, path::PathBuf};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 fn env(k: &str) -> Option<String> {
     std::env::var(k).ok().filter(|s| !s.trim().is_empty())
@@ -23,6 +27,8 @@ pub struct Config {
     pub claude: ClaudeSubCfg,
     /// OpenAI Codex CLI (ChatGPT plan) — local session logs + wham usage endpoint.
     pub codex: CodexCfg,
+    /// QwenCloud / Alibaba Model Studio (FR-1).
+    pub qwen: QwenCfg,
     /// Optional HTTP response TTL cache (FR-3). Zero TTL disables it.
     pub http_cache: HttpCacheCfg,
     /// USD per 1M tokens: model-prefix -> [input, output, cache_read, cache_write]
@@ -266,6 +272,190 @@ impl Default for ClaudeCodeCfg {
     }
 }
 
+/// `[qwen]` — QwenCloud / Alibaba Model Studio configuration (FR-1).
+///
+/// The three credential classes are NOT interchangeable: standard /
+/// pay-as-you-go, Coding Plan, and Token Plan each have dedicated
+/// environment and settings names, and a plan class is never inferred
+/// from an `sk-sp-*` key prefix alone.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct QwenCfg {
+    /// Standard / pay-as-you-go API key.
+    /// Env: `DASHSCOPE_API_KEY`, then `BAILIAN_API_KEY`; settings
+    /// `env.DASHSCOPE_API_KEY`, then `env.BAILIAN_API_KEY` (FR-1).
+    pub standard_key: Option<String>,
+    /// Qwen Coding Plan API key. Only
+    /// `BAILIAN_CODING_PLAN_API_KEY` / settings
+    /// `env.BAILIAN_CODING_PLAN_API_KEY` — never a standard or Token
+    /// Plan source (FR-1).
+    pub coding_plan_key: Option<String>,
+    /// Qwen Token Plan API key. Only
+    /// `BAILIAN_TOKEN_PLAN_API_KEY` / settings
+    /// `env.BAILIAN_TOKEN_PLAN_API_KEY` — never a standard or Coding
+    /// Plan source (FR-1).
+    pub token_plan_key: Option<String>,
+    /// Qwen Code settings/home directory. Precedence: this override,
+    /// `QWEN_HOME`, `~/.qwen` (FR-1).
+    pub home: Option<PathBuf>,
+    /// Qwen Code runtime/output directory. Precedence: this override,
+    /// `QWEN_RUNTIME_DIR`, settings `advanced.runtimeOutputDir`, the
+    /// effective Qwen home (FR-1).
+    pub runtime_dir: Option<PathBuf>,
+}
+
+/// Typed values of Qwen Code's `${home}/settings.json` (FR-2). Unknown
+/// fields are ignored; a wrong-typed `env` / `advanced` fails the whole
+/// parse so discovery can skip the file untouched (AC-10).
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct QwenSettings {
+    /// The settings `env` block — exact credential key names only (FR-2).
+    pub env: HashMap<String, String>,
+    /// The settings `advanced` block.
+    pub advanced: QwenAdvanced,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct QwenAdvanced {
+    /// `advanced.runtimeOutputDir` — a relative value is anchored under
+    /// the effective Qwen home, never the process working directory
+    /// (FR-2).
+    #[serde(rename = "runtimeOutputDir")]
+    pub runtime_output_dir: Option<String>,
+}
+
+/// Injected environment lookup: returns `Some` only for set, non-empty
+/// values. Tests supply sandboxed lookups so no test reads the real
+/// process environment (hermetic discovery).
+pub(crate) type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+/// Resolve one Qwen credential class: explicit config, then each
+/// dedicated environment name, then the settings `env` block. Returns the
+/// value plus its provenance source string.
+fn qwen_key(
+    cfg: Option<&str>,
+    env_names: &[&str],
+    settings_names: &[&str],
+    env: EnvLookup,
+    settings: &QwenSettings,
+    settings_src: &str,
+) -> Option<(String, String)> {
+    if let Some(v) = cfg {
+        return Some((v.to_string(), "config".into()));
+    }
+    for name in env_names {
+        if let Some(v) = env(name) {
+            return Some((v, format!("env {name}")));
+        }
+    }
+    for name in settings_names {
+        if let Some(v) = settings.env.get(*name).filter(|v| !v.trim().is_empty()) {
+            return Some((v.clone(), format!("settings {settings_src}")));
+        }
+    }
+    None
+}
+
+/// Standard key: `DASHSCOPE_API_KEY`, then `BAILIAN_API_KEY` — env and
+/// settings in that order (FR-1). A value here is standard regardless of
+/// its prefix; plan classes are never inferred from `sk-sp-*` (AC-1).
+pub(crate) fn qwen_standard_key(
+    cfg: Option<&str>,
+    env: EnvLookup,
+    settings: &QwenSettings,
+    settings_src: &str,
+) -> Option<(String, String)> {
+    qwen_key(
+        cfg,
+        &["DASHSCOPE_API_KEY", "BAILIAN_API_KEY"],
+        &["DASHSCOPE_API_KEY", "BAILIAN_API_KEY"],
+        env,
+        settings,
+        settings_src,
+    )
+}
+
+/// Coding Plan key: `BAILIAN_CODING_PLAN_API_KEY` only (FR-1, AC-1).
+pub(crate) fn qwen_coding_plan_key(
+    cfg: Option<&str>,
+    env: EnvLookup,
+    settings: &QwenSettings,
+    settings_src: &str,
+) -> Option<(String, String)> {
+    qwen_key(
+        cfg,
+        &["BAILIAN_CODING_PLAN_API_KEY"],
+        &["BAILIAN_CODING_PLAN_API_KEY"],
+        env,
+        settings,
+        settings_src,
+    )
+}
+
+/// Token Plan key: `BAILIAN_TOKEN_PLAN_API_KEY` only (FR-1, AC-1).
+pub(crate) fn qwen_token_plan_key(
+    cfg: Option<&str>,
+    env: EnvLookup,
+    settings: &QwenSettings,
+    settings_src: &str,
+) -> Option<(String, String)> {
+    qwen_key(
+        cfg,
+        &["BAILIAN_TOKEN_PLAN_API_KEY"],
+        &["BAILIAN_TOKEN_PLAN_API_KEY"],
+        env,
+        settings,
+        settings_src,
+    )
+}
+
+/// Effective Qwen home: explicit config, `QWEN_HOME`, then the default
+/// `~/.qwen` (FR-1). The default is injected so tests never consult a
+/// real home directory (hermetic discovery).
+pub(crate) fn qwen_home(
+    cfg: Option<&Path>,
+    env: EnvLookup,
+    default_home: Option<&Path>,
+) -> Option<(PathBuf, String)> {
+    if let Some(p) = cfg {
+        return Some((expand_tilde(p), "config".into()));
+    }
+    if let Some(d) = env("QWEN_HOME") {
+        return Some((PathBuf::from(d), "env QWEN_HOME".into()));
+    }
+    default_home.map(|p| (p.to_path_buf(), "default ~/.qwen".into()))
+}
+
+/// Effective Qwen runtime directory: explicit config, `QWEN_RUNTIME_DIR`,
+/// settings `advanced.runtimeOutputDir`, then the effective Qwen home
+/// (FR-1). A relative settings output is anchored under the Qwen home —
+/// never the process working directory (FR-2).
+pub(crate) fn qwen_runtime(
+    cfg: Option<&Path>,
+    env: EnvLookup,
+    settings_runtime: Option<&str>,
+    settings_src: &str,
+    home: &Path,
+) -> Option<(PathBuf, String)> {
+    if let Some(p) = cfg {
+        return Some((expand_tilde(p), "config".into()));
+    }
+    if let Some(d) = env("QWEN_RUNTIME_DIR") {
+        return Some((PathBuf::from(d), "env QWEN_RUNTIME_DIR".into()));
+    }
+    if let Some(r) = settings_runtime.filter(|r| !r.trim().is_empty()) {
+        let p = PathBuf::from(r);
+        let p = if p.is_absolute() { p } else { home.join(p) };
+        return Some((
+            p,
+            format!("settings {settings_src} advanced.runtimeOutputDir"),
+        ));
+    }
+    Some((home.to_path_buf(), "qwen home".into()))
+}
+
 impl Config {
     pub fn default_path() -> PathBuf {
         dirs::config_dir()
@@ -398,6 +588,22 @@ enabled = true
 # quotas from the same logs + chatgpt.com wham/usage via ~/.codex/auth.json.
 enabled = true
 # home = "~/.codex"
+
+[qwen]
+# Qwen (Alibaba Cloud Model Studio / QwenCloud): usage from local Qwen Code
+# records only — no Qwen network call, no built-in price guesses, and no
+# console API. Three NON-interchangeable key classes; an sk-sp-* prefix
+# never identifies the plan class.
+# env: standard DASHSCOPE_API_KEY then BAILIAN_API_KEY; Coding Plan
+#      BAILIAN_CODING_PLAN_API_KEY only; Token Plan BAILIAN_TOKEN_PLAN_API_KEY only.
+# standard_key = ""
+# coding_plan_key = ""
+# token_plan_key = ""
+# Qwen home precedence: [qwen].home > QWEN_HOME > ~/.qwen
+# home = "~/.qwen"
+# Runtime precedence: [qwen].runtime_dir > QWEN_RUNTIME_DIR > settings
+# advanced.runtimeOutputDir (relative -> under the Qwen home) > Qwen home.
+# runtime_dir = ""
 
 [http_cache]
 # Optional TTL (seconds) for caching successful JSON responses of eligible
@@ -606,5 +812,366 @@ mod tests {
         );
         std::env::remove_var("GOOGLE_CLOUD_PROJECT_ID");
         assert!(c.gemini.project_override().is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // Qwen Cloud credential classes and path precedence (FR-1, AC-1, AC-2)
+    // -------------------------------------------------------------------
+
+    const QWEN_SETTINGS_SRC: &str = "/tmp/llmu-qwen/settings.json";
+
+    fn no_env(_k: &str) -> Option<String> {
+        None
+    }
+
+    fn envmap<'a>(pairs: &'a [(&'a str, &'a str)]) -> std::collections::HashMap<&'a str, &'a str> {
+        pairs.iter().copied().collect()
+    }
+
+    fn qwen_settings(pairs: &[(&str, &str)]) -> QwenSettings {
+        QwenSettings {
+            env: pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+            advanced: QwenAdvanced::default(),
+        }
+    }
+
+    fn runtime_settings(runtime: Option<&str>) -> QwenSettings {
+        QwenSettings {
+            env: std::collections::HashMap::new(),
+            advanced: QwenAdvanced {
+                runtime_output_dir: runtime.map(String::from),
+            },
+        }
+    }
+
+    #[test]
+    fn qwen_standard_key_prefers_config_then_env_then_settings() {
+        let envs = envmap(&[
+            ("DASHSCOPE_API_KEY", "env-dash"),
+            ("BAILIAN_API_KEY", "env-bailian"),
+        ]);
+        let env = |k: &str| envs.get(k).map(|v| v.to_string());
+        let settings = qwen_settings(&[
+            ("DASHSCOPE_API_KEY", "set-dash"),
+            ("BAILIAN_API_KEY", "set-bailian"),
+        ]);
+
+        let (v, src) =
+            qwen_standard_key(Some("cfg-key"), &env, &settings, QWEN_SETTINGS_SRC).unwrap();
+        assert_eq!(v, "cfg-key");
+        assert_eq!(
+            src, "config",
+            "explicit config precedes env and settings (FR-1)"
+        );
+
+        let (v, src) = qwen_standard_key(None, &env, &settings, QWEN_SETTINGS_SRC).unwrap();
+        assert_eq!(v, "env-dash");
+        assert_eq!(
+            src, "env DASHSCOPE_API_KEY",
+            "DASHSCOPE_API_KEY precedes BAILIAN_API_KEY"
+        );
+
+        let (v, src) = qwen_standard_key(None, &no_env, &settings, QWEN_SETTINGS_SRC).unwrap();
+        assert_eq!(v, "set-dash");
+        assert_eq!(
+            src, "settings /tmp/llmu-qwen/settings.json",
+            "settings env block is the last fallback"
+        );
+    }
+
+    #[test]
+    fn qwen_standard_key_accepts_bailian_as_second_env_fallback() {
+        let envs = envmap(&[("BAILIAN_API_KEY", "env-bailian")]);
+        let env = |k: &str| envs.get(k).map(|v| v.to_string());
+        let (v, src) =
+            qwen_standard_key(None, &env, &qwen_settings(&[]), QWEN_SETTINGS_SRC).unwrap();
+        assert_eq!(v, "env-bailian");
+        assert_eq!(src, "env BAILIAN_API_KEY");
+
+        let settings = qwen_settings(&[("BAILIAN_API_KEY", "set-bailian")]);
+        let (v, src) = qwen_standard_key(None, &no_env, &settings, QWEN_SETTINGS_SRC).unwrap();
+        assert_eq!(v, "set-bailian");
+        assert_eq!(src, "settings /tmp/llmu-qwen/settings.json");
+    }
+
+    #[test]
+    fn qwen_standard_key_skips_empty_settings_values() {
+        let settings = qwen_settings(&[
+            ("DASHSCOPE_API_KEY", ""),
+            ("BAILIAN_API_KEY", "set-bailian"),
+        ]);
+        let (v, src) = qwen_standard_key(None, &no_env, &settings, QWEN_SETTINGS_SRC).unwrap();
+        assert_eq!(v, "set-bailian");
+        assert_eq!(src, "settings /tmp/llmu-qwen/settings.json");
+    }
+
+    #[test]
+    fn qwen_ac1_given_only_coding_plan_env_token_plan_stays_unset() {
+        let envs = envmap(&[("BAILIAN_CODING_PLAN_API_KEY", "sk-sp-X")]);
+        let env = |k: &str| envs.get(k).map(|v| v.to_string());
+        let settings = qwen_settings(&[]);
+        assert_eq!(
+            qwen_coding_plan_key(None, &env, &settings, QWEN_SETTINGS_SRC)
+                .unwrap()
+                .0,
+            "sk-sp-X"
+        );
+        assert!(
+            qwen_token_plan_key(None, &env, &settings, QWEN_SETTINGS_SRC).is_none(),
+            "Token Plan must not read BAILIAN_CODING_PLAN_API_KEY (AC-1)"
+        );
+        assert!(
+            qwen_standard_key(None, &env, &settings, QWEN_SETTINGS_SRC).is_none(),
+            "standard must not read the Coding Plan variable (AC-1)"
+        );
+    }
+
+    #[test]
+    fn qwen_ac1_given_only_token_plan_env_coding_plan_stays_unset() {
+        let envs = envmap(&[("BAILIAN_TOKEN_PLAN_API_KEY", "sk-sp-Y")]);
+        let env = |k: &str| envs.get(k).map(|v| v.to_string());
+        let settings = qwen_settings(&[]);
+        assert_eq!(
+            qwen_token_plan_key(None, &env, &settings, QWEN_SETTINGS_SRC)
+                .unwrap()
+                .0,
+            "sk-sp-Y"
+        );
+        assert!(
+            qwen_coding_plan_key(None, &env, &settings, QWEN_SETTINGS_SRC).is_none(),
+            "Coding Plan must not read BAILIAN_TOKEN_PLAN_API_KEY (AC-1)"
+        );
+        assert!(
+            qwen_standard_key(None, &env, &settings, QWEN_SETTINGS_SRC).is_none(),
+            "standard must not read the Token Plan variable (AC-1)"
+        );
+    }
+
+    #[test]
+    fn qwen_ac1_bare_sk_sp_under_dashscope_populates_standard_only() {
+        let envs = envmap(&[("DASHSCOPE_API_KEY", "sk-sp-bare")]);
+        let env = |k: &str| envs.get(k).map(|v| v.to_string());
+        let settings = qwen_settings(&[]);
+        let (v, src) = qwen_standard_key(None, &env, &settings, QWEN_SETTINGS_SRC).unwrap();
+        assert_eq!(
+            v, "sk-sp-bare",
+            "a bare sk-sp-* value stays standard (AC-1)"
+        );
+        assert_eq!(src, "env DASHSCOPE_API_KEY");
+        assert!(
+            qwen_coding_plan_key(None, &env, &settings, QWEN_SETTINGS_SRC).is_none(),
+            "never promote an sk-sp-* standard value to Coding Plan (AC-1)"
+        );
+        assert!(
+            qwen_token_plan_key(None, &env, &settings, QWEN_SETTINGS_SRC).is_none(),
+            "never promote an sk-sp-* standard value to Token Plan (AC-1)"
+        );
+    }
+
+    #[test]
+    fn qwen_plan_keys_never_fall_back_to_standard_sources() {
+        let envs = envmap(&[("DASHSCOPE_API_KEY", "sk-dash")]);
+        let env = |k: &str| envs.get(k).map(|v| v.to_string());
+        let settings = qwen_settings(&[("DASHSCOPE_API_KEY", "set-dash")]);
+        assert!(
+            qwen_coding_plan_key(None, &env, &settings, QWEN_SETTINGS_SRC).is_none(),
+            "Coding Plan recognizes only its dedicated env/settings name (FR-1)"
+        );
+        assert!(
+            qwen_token_plan_key(None, &env, &settings, QWEN_SETTINGS_SRC).is_none(),
+            "Token Plan recognizes only its dedicated env/settings name (FR-1)"
+        );
+    }
+
+    #[test]
+    fn qwen_home_prefers_config_then_env_then_default() {
+        let default = Path::new("/tmp/llmu-default/.qwen");
+        let envs = envmap(&[("QWEN_HOME", "/tmp/llmu-env-home")]);
+        let env = |k: &str| envs.get(k).map(|v| v.to_string());
+
+        let (p, src) =
+            qwen_home(Some(Path::new("/tmp/llmu-cfg-home")), &env, Some(default)).unwrap();
+        assert_eq!(p, PathBuf::from("/tmp/llmu-cfg-home"));
+        assert_eq!(src, "config", "explicit home precedes QWEN_HOME (FR-1)");
+
+        let (p, src) = qwen_home(None, &env, Some(default)).unwrap();
+        assert_eq!(p, PathBuf::from("/tmp/llmu-env-home"));
+        assert_eq!(src, "env QWEN_HOME", "QWEN_HOME precedes ~/.qwen (FR-1)");
+
+        let (p, src) = qwen_home(None, &no_env, Some(default)).unwrap();
+        assert_eq!(p, PathBuf::from("/tmp/llmu-default/.qwen"));
+        assert_eq!(src, "default ~/.qwen");
+
+        assert!(
+            qwen_home(None, &no_env, None).is_none(),
+            "no home, no env, no default -> no Qwen home"
+        );
+    }
+
+    #[test]
+    fn qwen_runtime_prefers_config_then_env_then_settings_then_home() {
+        let home = Path::new("/tmp/llmu-qwen-home");
+        let envs = envmap(&[("QWEN_RUNTIME_DIR", "/tmp/llmu-env-runtime")]);
+        let env = |k: &str| envs.get(k).map(|v| v.to_string());
+
+        let (p, src) = qwen_runtime(
+            Some(Path::new("/tmp/llmu-cfg-runtime")),
+            &env,
+            runtime_settings(Some("rel/runtime"))
+                .advanced
+                .runtime_output_dir
+                .as_deref(),
+            QWEN_SETTINGS_SRC,
+            home,
+        )
+        .unwrap();
+        assert_eq!(p, PathBuf::from("/tmp/llmu-cfg-runtime"));
+        assert_eq!(src, "config", "explicit runtime precedes env (FR-1)");
+
+        let (p, src) = qwen_runtime(None, &env, None, QWEN_SETTINGS_SRC, home).unwrap();
+        assert_eq!(p, PathBuf::from("/tmp/llmu-env-runtime"));
+        assert_eq!(
+            src, "env QWEN_RUNTIME_DIR",
+            "QWEN_RUNTIME_DIR precedes settings (FR-1)"
+        );
+
+        let (p, src) = qwen_runtime(
+            None,
+            &no_env,
+            runtime_settings(Some("/abs/runtime"))
+                .advanced
+                .runtime_output_dir
+                .as_deref(),
+            QWEN_SETTINGS_SRC,
+            home,
+        )
+        .unwrap();
+        assert_eq!(p, PathBuf::from("/abs/runtime"));
+        assert_eq!(
+            src, "settings /tmp/llmu-qwen/settings.json advanced.runtimeOutputDir",
+            "settings runtimeOutputDir precedes the home fallback (FR-1)"
+        );
+
+        let (p, src) = qwen_runtime(None, &no_env, None, QWEN_SETTINGS_SRC, home).unwrap();
+        assert_eq!(p, PathBuf::from("/tmp/llmu-qwen-home"));
+        assert_eq!(
+            src, "qwen home",
+            "effective Qwen home is the last runtime fallback (FR-1)"
+        );
+    }
+
+    #[test]
+    fn qwen_runtime_relative_output_anchors_under_effective_home() {
+        let home = Path::new("/tmp/llmu-qwen-home");
+        let (p, _) = qwen_runtime(
+            None,
+            &no_env,
+            runtime_settings(Some("runtime/out"))
+                .advanced
+                .runtime_output_dir
+                .as_deref(),
+            QWEN_SETTINGS_SRC,
+            home,
+        )
+        .unwrap();
+        assert_eq!(
+            p,
+            home.join("runtime/out"),
+            "relative runtimeOutputDir resolves under the effective Qwen home, never CWD (FR-2)"
+        );
+        let (p, _) = qwen_runtime(
+            None,
+            &no_env,
+            runtime_settings(Some("usage"))
+                .advanced
+                .runtime_output_dir
+                .as_deref(),
+            QWEN_SETTINGS_SRC,
+            home,
+        )
+        .unwrap();
+        assert_eq!(p, home.join("usage"));
+        let (p, _) = qwen_runtime(
+            None,
+            &no_env,
+            runtime_settings(Some("/abs/out"))
+                .advanced
+                .runtime_output_dir
+                .as_deref(),
+            QWEN_SETTINGS_SRC,
+            home,
+        )
+        .unwrap();
+        assert_eq!(
+            p,
+            PathBuf::from("/abs/out"),
+            "absolute runtimeOutputDir is used as-is"
+        );
+        assert!(
+            qwen_runtime(
+                None,
+                &no_env,
+                runtime_settings(Some("  "))
+                    .advanced
+                    .runtime_output_dir
+                    .as_deref(),
+                QWEN_SETTINGS_SRC,
+                home,
+            )
+            .is_some(),
+            "whitespace-only runtime falls through to the home fallback"
+        );
+        let (p, _) = qwen_runtime(
+            None,
+            &no_env,
+            runtime_settings(Some("  "))
+                .advanced
+                .runtime_output_dir
+                .as_deref(),
+            QWEN_SETTINGS_SRC,
+            home,
+        )
+        .unwrap();
+        assert_eq!(p, PathBuf::from("/tmp/llmu-qwen-home"));
+    }
+
+    #[test]
+    fn qwen_settings_parse_exact_env_and_runtime_output_dir() {
+        let s: QwenSettings = serde_json::from_str(
+            r#"{"env":{"DASHSCOPE_API_KEY":"sk-a","BAILIAN_CODING_PLAN_API_KEY":"sk-b"},"advanced":{"runtimeOutputDir":"runtime"},"other":{"x":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            s.env.get("DASHSCOPE_API_KEY").map(String::as_str),
+            Some("sk-a")
+        );
+        assert_eq!(
+            s.env.get("BAILIAN_CODING_PLAN_API_KEY").map(String::as_str),
+            Some("sk-b")
+        );
+        assert_eq!(s.advanced.runtime_output_dir.as_deref(), Some("runtime"));
+    }
+
+    #[test]
+    fn qwen_settings_missing_blocks_default_cleanly() {
+        let s: QwenSettings = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(s.env.is_empty());
+        assert!(s.advanced.runtime_output_dir.is_none());
+        let s: QwenSettings = serde_json::from_str(r#"{"env":{}}"#).unwrap();
+        assert!(s.env.is_empty());
+    }
+
+    #[test]
+    fn qwen_settings_wrong_typed_values_fail_parse() {
+        assert!(serde_json::from_str::<QwenSettings>(r#"{"env":"oops"}"#).is_err());
+        assert!(
+            serde_json::from_str::<QwenSettings>(r#"{"env":{"DASHSCOPE_API_KEY":42}}"#).is_err()
+        );
+        assert!(
+            serde_json::from_str::<QwenSettings>(r#"{"advanced":{"runtimeOutputDir":3}}"#).is_err()
+        );
     }
 }

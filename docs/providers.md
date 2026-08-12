@@ -66,6 +66,77 @@
   `[gemini] usage_log`. llmu parses flat or nested shapes.
 - Docs: https://ai.google.dev/gemini-api/docs/billing
 
+## Qwen / QwenCloud — Alibaba Cloud Model Studio (implemented, local)
+
+Usage comes from **local Qwen Code records**, never from a Qwen network
+call: llmu performs no network request to Qwen or QwenCloud, writes
+nothing, and makes no built-in Qwen price guesses (per-model `[pricing]`
+entries estimate cost when they match). Wired as provider `qwen`.
+
+**Three non-interchangeable key classes.** Each class has its own llmu
+config field, env/settings names, and base URL family; keys and base URLs
+are **not interchangeable** between classes, and an `sk-sp-*` prefix
+never identifies which plan class a key belongs to. A bare `sk-sp-*` value
+under a standard variable stays standard; it is never promoted to either
+plan.
+- **Standard / pay-as-you-go** — `[qwen].standard_key`;
+  `DASHSCOPE_API_KEY`, then `BAILIAN_API_KEY` (env and Qwen Code settings
+  `env` block, same order). OpenAI-compatible hosts:
+  - `https://dashscope.aliyuncs.com/compatible-mode/v1` (China Beijing)
+  - `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` (Singapore)
+  - `https://dashscope-us.aliyuncs.com/compatible-mode/v1` (US Virginia)
+  - `https://cn-hongkong.dashscope.aliyuncs.com/compatible-mode/v1` (Hong Kong)
+- **Coding Plan** — `[qwen].coding_plan_key`;
+  `BAILIAN_CODING_PLAN_API_KEY` only. OpenAI-compatible hosts:
+  - `https://coding.dashscope.aliyuncs.com/v1` (China)
+  - `https://coding-intl.dashscope.aliyuncs.com/v1` (international)
+  - Official Alibaba Cloud docs also expose an Anthropic-compatible
+    international endpoint:
+    `https://coding-intl.dashscope.aliyuncs.com/apps/anthropic`.
+- **Token Plan** — `[qwen].token_plan_key`;
+  `BAILIAN_TOKEN_PLAN_API_KEY` only. OpenAI-compatible hosts:
+  - `https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1`
+  - `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`
+
+**Paths and precedence.** Qwen Code settings live at
+`${QWEN_HOME:-~/.qwen}/settings.json`; llmu reads the `env` block and
+`advanced.runtimeOutputDir` from it read-only and records provenance in
+`llmu providers`.
+
+- Home: `[qwen].home` > `QWEN_HOME` > `~/.qwen`.
+- Runtime: `[qwen].runtime_dir` > `QWEN_RUNTIME_DIR` >
+  settings `advanced.runtimeOutputDir` > effective Qwen home. A relative
+  `runtimeOutputDir` anchors under the effective Qwen home, never the
+  process working directory.
+
+**Local usage sources** (Qwen-family `qwen*` models only; GLM/Kimi/DeepSeek
+rows recorded by Qwen Code are never relabeled):
+
+- Request ledger: every `usage/token-usage-*.jsonl` under the effective
+  runtime directory. Filenames use the writer's local month
+  (`token-usage-YYYY-MM.jsonl`), so llmu reads all matching files and
+  filters records by their RFC3339 UTC timestamp, deduplicating on the
+  record id. `inputTokens` already includes cached tokens (uncached input =
+  input − cached); `thoughtsTokens` folds into output.
+- Legacy fallback: `${home}/usage_record.jsonl` session summaries, last
+  valid record wins per session; a session covered by the request ledger
+  suppresses its legacy summary entirely — no double counting. Sessions
+  without request records emit one event per Qwen model.
+- Routed Claude Code rows with `qwen*` models (served through an
+  Anthropic-compatible route) are attributed to `qwen` too. The two
+  clients' records represent disjoint requests and are additive — llmu
+  performs no cross-client deduplication, and `--provider qwen` includes
+  both.
+
+**Trust boundary.** QwenCloud account analytics, free-tier/subscription
+quota, and billing are console-only: there is no documented
+account-reporting API authenticated by an inference or plan key. Browser
+cookies and the console `sec_token` are intentionally never discovered,
+stored, or used, and llmu never scrapes the console `/data/api.json`
+endpoints. A key-only configuration shows as configured but claims no live
+account usage; malformed or unreadable local records are skipped with one
+aggregate secret-free note each.
+
 ---
 
 ## Endpoints recovered from CLIs & open-source trackers (2026-08)

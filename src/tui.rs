@@ -75,6 +75,7 @@ fn provider_color(id: &str) -> Color {
         "kimi" => Color::Cyan,
         "glm" => Color::Yellow,
         "gemini" => Color::LightBlue,
+        "qwen" => Color::LightRed,
         _ => Color::White,
     }
 }
@@ -719,5 +720,11 @@ mod tests {
                 "every TUI gather must pass the context, got: {line}"
             );
         }
+    }
+
+    /// FR-6: the TUI renders the qwen provider in light red.
+    #[test]
+    fn provider_color_maps_qwen_to_light_red() {
+        assert_eq!(provider_color("qwen"), Color::LightRed);
     }
 }

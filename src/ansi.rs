@@ -59,6 +59,7 @@ pub fn provider_color(id: &str) -> &'static str {
         "kimi" => CYAN,
         "glm" => YELLOW,
         "gemini" => BLUE,
+        "qwen" => RED,
         _ => "",
     }
 }
@@ -98,5 +99,11 @@ mod tests {
     fn paint_when_on_wraps_exactly_like_paint() {
         let enabled = paint_when("abc", GREEN, true);
         assert_eq!(enabled, format!("{GREEN}abc{RESET}"));
+    }
+
+    /// FR-6: the plain CLI renders the qwen provider in RED.
+    #[test]
+    fn provider_color_maps_qwen_to_red() {
+        assert_eq!(provider_color("qwen"), RED);
     }
 }

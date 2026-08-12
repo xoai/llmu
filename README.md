@@ -2,8 +2,9 @@
 
 One tiny, fast, cross-platform binary that answers: *how much am I using, what
 is it costing, and how close am I to my limits* — across Anthropic, OpenAI,
-DeepSeek, Kimi (Moonshot), GLM (Z.ai/Zhipu) and Gemini, covering both
-pay-as-you-go APIs and subscription plans.
+DeepSeek, Kimi (Moonshot), GLM (Z.ai/Zhipu), Gemini and Qwen (Alibaba Cloud
+Model Studio / QwenCloud), covering both pay-as-you-go APIs and subscription
+plans.
 
 ```
 llmu usage --since 30d --by week --group-by provider,model
@@ -96,7 +97,8 @@ tokens are never touched. Detected sources:
 | OpenCode `auth.json` (`~/.local/share/opencode`, override: `OPENCODE_DATA_DIR`) | DeepSeek / Z.ai / Moonshot keys, Claude OAuth fallback |
 | kimi-cli `~/.kimi/credentials/*.json` (override: `KIMI_SHARE_DIR`) | Kimi For Coding quota |
 | `~/.gemini/oauth_creds.json` (override: `[gemini] credentials` / `GEMINI_CLI_HOME`) | Gemini Code Assist quotas (plaintext OAuth, auto-refreshed; encrypted/keychain stores unsupported) |
-| env vars | `ANTHROPIC_ADMIN_KEY`, `OPENAI_ADMIN_KEY`, `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`/`KIMI_API_KEY`, `KIMI_CODE_API_KEY`, `ZAI_API_KEY`/`ZHIPU_API_KEY`, `ANTHROPIC_AUTH_TOKEN`+`ANTHROPIC_BASE_URL`; plain `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` are used only when admin-grade (`sk-ant-admin…`/`sk-admin…`) |
+| `~/.qwen/settings.json` `env` block + `usage/` ledgers (override: `[qwen]` home/runtime, `QWEN_HOME`, `QWEN_RUNTIME_DIR`) | Qwen (Alibaba Cloud Model Studio) local request/legacy usage records — read-only, no Qwen network call; QwenCloud account quota/billing stays console-only |
+| env vars | `ANTHROPIC_ADMIN_KEY`, `OPENAI_ADMIN_KEY`, `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`/`KIMI_API_KEY`, `KIMI_CODE_API_KEY`, `ZAI_API_KEY`/`ZHIPU_API_KEY`, `ANTHROPIC_AUTH_TOKEN`+`ANTHROPIC_BASE_URL`, `DASHSCOPE_API_KEY`/`BAILIAN_API_KEY`, `BAILIAN_CODING_PLAN_API_KEY`, `BAILIAN_TOKEN_PLAN_API_KEY`, `QWEN_HOME`, `QWEN_RUNTIME_DIR`; plain `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` are used only when admin-grade (`sk-ant-admin…`/`sk-admin…`) |
 
 Precedence: explicit `config.toml` > env vars > discovered files.
 `llmu providers` shows exactly where every credential came from, labeled
@@ -119,6 +121,7 @@ normalizes three record types instead of pretending everything is uniform:
 | Kimi / Moonshot | ❌ | ❌ | ✅ `/v1/users/me/balance` (cash/voucher/available) | ✅ Kimi For Coding weekly + windowed limits via `api.kimi.com/coding/v1/usages` |
 | GLM (Z.ai / bigmodel.cn) | ⚠️ model-usage endpoint (best effort) | ❌ | – | ✅ Coding-Plan session/weekly % + tool quota via `/api/monitor/usage/quota/limit` |
 | Gemini API | ⚠️ client-side: log `usageMetadata` per response | via Google Cloud Billing only | – | ✅ Code Assist quotas via Gemini CLI OAuth (auto-refreshed) |
+| Qwen (Alibaba Cloud Model Studio / QwenCloud) | ✅ local Qwen Code records (request ledger + legacy session summaries; routed Claude Code `qwen*` rows included) | est. only — no built-in Qwen price guesses | – | – (QwenCloud analytics/quota/billing is console-only; no inference-key account API) |
 
 Legend: ✅ official API · ⚠️ workaround (local logs / undocumented endpoint) · ❌ not exposed.
 
@@ -155,6 +158,20 @@ see "Optional HTTP response cache"). `[gemini]` accepts optional
 `docs/providers.md`). Credential discovery stays read-only except validated
 plaintext Gemini/Claude OAuth refresh.
 
+`[qwen]` configures Qwen (Alibaba Cloud Model Studio / QwenCloud) usage,
+read from local Qwen Code records — llmu makes no Qwen network call and adds
+no built-in Qwen price guesses. The three key classes are
+**not interchangeable** — standard (`DASHSCOPE_API_KEY`, then
+`BAILIAN_API_KEY`), Coding Plan (`BAILIAN_CODING_PLAN_API_KEY` only), and
+Token Plan (`BAILIAN_TOKEN_PLAN_API_KEY` only); an `sk-sp-*` prefix never
+identifies a plan class, and the base URL families differ per class (see
+`docs/providers.md`). Qwen home precedence: `[qwen].home` > `QWEN_HOME` >
+`~/.qwen`. Runtime precedence: `[qwen].runtime_dir` > `QWEN_RUNTIME_DIR` >
+settings `advanced.runtimeOutputDir` (relative values anchor under the
+effective Qwen home) > effective Qwen home. QwenCloud account analytics,
+quota, and billing are console-only — llmu never uses browser cookies or a
+console `sec_token`, and a key-only setup reports local records only.
+
 ## CLI reference
 
 ```
@@ -163,7 +180,7 @@ llmu usage
   --until YYYY-MM-DD                    window end (default now)
   --by day|week|month                   time bucket
   --group-by provider,model,source      extra grouping dimensions
-  --provider anthropic,openai,...       provider filter
+  --provider anthropic,openai,...,qwen  provider filter
   --model sonnet                        substring model filter
   --source api|local                    billing API vs local logs
   --json                                aggregated rows as JSON
@@ -264,6 +281,7 @@ Adding a provider = one file implementing `Provider` with whichever of
 - [x] Codex CLI local session logs + ChatGPT-plan limits (`wham/usage`)
 - [x] Gemini CLI / Code Assist quota (`loadCodeAssist` + `v1internal:retrieveUserQuota`; Gemini CLI plaintext OAuth credentials, auto-refreshed — see docs/providers.md)
 - [x] Anthropic OAuth token auto-refresh (proactive five-minute refresh + one reactive 401 retry for Claude Code file-backed credentials)
+- [x] Qwen (Alibaba Cloud Model Studio / QwenCloud): local Qwen Code request/legacy usage via `[qwen]` config + Qwen Code settings discovery; no console API (see docs/providers.md)
 - [x] `llmu balance --history` (spend deltas from snapshots)
 - [x] `--csv` output; optional local response cache with TTL (`[http_cache] ttl_seconds`)
 
@@ -298,6 +316,19 @@ itself with a `note:` on stderr instead of staying silent. The common ones:
   `GOOGLE_CLOUD_PROJECT` (a project returned by `loadCodeAssist` wins).
 - `codex: wham/usage failed… no rate_limits in session logs` — run
   `codex` once to refresh its token / produce a session.
+- `qwen: skipped N malformed local usage record(s)` — a Qwen Code ledger
+  line has an unsupported schema version or invalid fields; llmu skips it
+  with one aggregate note and never prints record bodies, paths, or keys.
+  If Qwen Code upgraded its schema, this usually resolves itself after new
+  records arrive.
+- `qwen: skipped N unreadable local usage file(s)` — a
+  `usage/token-usage-*.jsonl` file cannot be read (permissions or a
+  directory at the path); other files still count.
+- `qwen` shows as configured but no usage appears — a key was found (env,
+  config, or `~/.qwen/settings.json`) but there are no local Qwen Code
+  records yet. llmu never calls a QwenCloud account API: analytics,
+  quota, and billing are console-only, and no built-in Qwen price guesses
+  exist (add `[pricing]` entries to estimate).
 - `…responded but no meters were parsed (payload drift?)` — the
   undocumented endpoint changed shape. Rerun with `LLMU_DEBUG=1` to dump
   every request URL + response body, and compare against
@@ -310,21 +341,27 @@ entry (longest-prefix match). Add one to `~/.config/llmu/config.toml`.
 
 The header totals, activity sparkline, bar chart, and by-model table sum
 **only sources that produce usage events**: local Claude Code transcripts,
-local Codex session logs, the Anthropic/OpenAI org usage APIs (admin keys),
-GLM's model-usage endpoint (best effort), and the Gemini usage log. Both
-UIs print exactly which feeds are being counted, and which configured
+local Codex session logs, Qwen Code's local request/legacy ledgers (plus
+routed Claude Code `qwen*` rows), the Anthropic/OpenAI org usage APIs (admin
+keys), GLM's model-usage endpoint (best effort), and the Gemini usage log.
+Both UIs print exactly which feeds are being counted, and which configured
 providers can't contribute:
 
 - **DeepSeek** exposes no usage/history API at all — only a wallet
   balance — so it can never appear in usage panels from its own API.
 - **Kimi**, **Claude Pro/Max**, and **Gemini Code Assist** expose quota
   meters (percentages or token units), not per-model token histories.
+- **Qwen** is counted from local Qwen Code records; a key-only Qwen setup
+  with no records yet appears as configured but contributes no rows, and
+  QwenCloud quota/billing is never fetched (console-only).
 
 **Routed coding plans are the exception that works.** If Claude Code is
-pointed at GLM / Kimi / DeepSeek via `ANTHROPIC_BASE_URL`, those requests
-land in your local transcripts with the real model ids — llmu attributes
-them to the actual provider (a `glm-4.7` event shows under `glm`, not
-`anthropic`), prices them with the per-model `[pricing]` table as
-"API-equivalent cost", and keeps them out of the Claude 5h burn meter.
-That makes local transcripts the single best usage feed for subscription
-plans that publish no usage API.
+pointed at GLM / Kimi / DeepSeek / Qwen via `ANTHROPIC_BASE_URL`, those
+requests land in your local transcripts with the real model ids — llmu
+attributes them to the actual provider (a `glm-4.7` event shows under `glm`,
+a `qwen-plus` event under `qwen`), prices them with the per-model `[pricing]`
+table as "API-equivalent cost", and keeps them out of the Claude 5h burn
+meter. Qwen Code's own ledgers and these routed transcript rows represent
+disjoint client requests and stay additive — llmu never deduplicates across
+clients. That makes local transcripts the single best usage feed for
+subscription plans that publish no usage API.

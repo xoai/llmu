@@ -6,6 +6,7 @@ pub mod gemini;
 pub mod glm;
 pub mod kimi;
 pub mod openai;
+pub mod qwen;
 
 use crate::{config::Config, http, types::*};
 use anyhow::Result;
@@ -104,6 +105,7 @@ pub fn all() -> Vec<Box<dyn Provider>> {
         Box::new(kimi::Kimi),
         Box::new(glm::Glm),
         Box::new(gemini::Gemini),
+        Box::new(qwen::Qwen),
     ]
 }
 

@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Qwen (Alibaba Cloud Model Studio / QwenCloud) provider: read-only local
+  usage from Qwen Code's request token ledger
+  (`usage/token-usage-YYYY-MM.jsonl`, writer-local months, RFC3339
+  timestamps, id-deduplicated) and legacy session summaries
+  (`usage_record.jsonl`, last-wins per session, request-ledger sessions
+  suppress the legacy summary). Routed Claude Code `qwen*` transcript rows
+  are attributed to `qwen` and stay additive — no cross-client
+  deduplication; `--provider qwen` includes both.
+- `[qwen]` configuration and discovery: three non-interchangeable key
+  classes — standard (`DASHSCOPE_API_KEY`, then `BAILIAN_API_KEY`), Coding
+  Plan (`BAILIAN_CODING_PLAN_API_KEY`), and Token Plan
+  (`BAILIAN_TOKEN_PLAN_API_KEY`) — plus Qwen Code settings/home discovery
+  (`[qwen].home` > `QWEN_HOME` > `~/.qwen`) and runtime precedence
+  (`[qwen].runtime_dir` > `QWEN_RUNTIME_DIR` > settings
+  `advanced.runtimeOutputDir` > effective Qwen home). An `sk-sp-*` prefix
+  never identifies a plan class.
+- Honest Qwen availability boundary: llmu adds no built-in Qwen price
+  guesses, performs no Qwen network call, and never uses browser cookies
+  or a console `sec_token`; QwenCloud account analytics, quota, and
+  billing remain console-only, so a key-only setup is reported as
+  configured without claiming live account usage.
+
 ## [0.1.2] - 2026-08-11
 
 ### Fixed

@@ -23,7 +23,7 @@ impl SourceKind {
 /// One normalized usage bucket (typically 1 hour or 1 day, per model).
 #[derive(Debug, Clone, Serialize)]
 pub struct UsageEvent {
-    pub provider: String, // "anthropic" | "openai" | "deepseek" | "kimi" | "glm" | "gemini"
+    pub provider: String, // "anthropic" | "openai" | "deepseek" | "kimi" | "glm" | "gemini" | "qwen"
     pub source: SourceKind,
     pub model: String,
     pub start: DateTime<Utc>,
