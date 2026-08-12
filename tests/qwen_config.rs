@@ -290,7 +290,14 @@ fn malformed_qwen_settings_do_not_break_other_providers() {
         "the providers table must still render (AC-10):\n{stdout}"
     );
     assert!(
-        !stdout.contains("qwen"),
+        !stdout.contains("qwen."),
         "no Qwen field may be populated from malformed settings (AC-10):\n{stdout}"
+    );
+    // AC-7: the provider table lists `qwen` unconditionally, so the
+    // malformed-settings isolation is proven by the absence of any
+    // populated `qwen.*` field/provenance line, not by the row itself.
+    assert!(
+        stdout.contains("qwen "),
+        "the registered qwen provider row must still render (AC-7):\n{stdout}"
     );
 }
