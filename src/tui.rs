@@ -2,8 +2,8 @@
 //!
 //! Two refresh cadences run on a background worker thread so the UI
 //! never blocks:
-//!   - LOCAL tick (default 3s): re-parses Claude Code / Codex session
-//!     logs only — mtime-filtered, milliseconds of work, safe to poll.
+//!   - LOCAL tick (default 3s): re-parses Claude Code, Codex, Gemini,
+//!     and Qwen local usage records — no network requests.
 //!   - NETWORK tick (default 60s): full fetch including provider usage
 //!     APIs, quotas, and balances. Kept slow deliberately — the Claude
 //!     oauth/usage endpoint rate-limits aggressively.
@@ -11,6 +11,7 @@
 //! Keys: q quit • d/w/m period • r force network refresh • p pause.
 
 use crate::config::Config;
+use crate::providers::Provider;
 use crate::report::{self, Group, Period};
 use crate::types::*;
 use anyhow::{Context as _, Result};
@@ -67,6 +68,20 @@ impl FreshState {
     }
 }
 
+fn apply_local_refresh(
+    api_events: &[UsageEvent],
+    local_events: &mut Vec<UsageEvent>,
+    refreshed: Vec<UsageEvent>,
+    complete: bool,
+) -> Vec<UsageEvent> {
+    if complete {
+        *local_events = refreshed;
+    }
+    let mut events = api_events.to_vec();
+    events.extend(local_events.iter().cloned());
+    events
+}
+
 fn provider_color(id: &str) -> Color {
     match id {
         "anthropic" | "claude" => Color::Magenta,
@@ -118,6 +133,7 @@ pub fn run(
             let mut fresh_state = FreshState::new(fresh_initial);
             // Non-local state kept from the last network tick.
             let mut api_events: Vec<UsageEvent> = vec![];
+            let mut local_events: Vec<UsageEvent> = vec![];
             let mut billed: Vec<BilledCost> = vec![];
             let mut quotas: Vec<QuotaSnapshot> = vec![];
             let mut balances: Vec<BalanceSnapshot> = vec![];
@@ -144,6 +160,12 @@ pub fn run(
                         .filter(|e| e.source == SourceKind::Api)
                         .cloned()
                         .collect();
+                    local_events = g
+                        .events
+                        .iter()
+                        .filter(|e| e.source == SourceKind::LocalLogs)
+                        .cloned()
+                        .collect();
                     billed = g.billed.clone();
                     quotas = g.quotas.clone();
                     balances = g.balances.clone();
@@ -164,19 +186,33 @@ pub fn run(
                         return;
                     }
                 } else if !is_paused && last_local.elapsed() >= locald {
-                    // Local-only: codex provider (file-based); the Claude
-                    // Code transcript collector always runs inside gather.
+                    // Local-only: call each file-backed usage source directly.
+                    // `gather`'s provider filter is report semantics and also
+                    // filters Claude transcript attribution, so it cannot model
+                    // which independent local streams this partial tick owns.
                     // No network happens here, so the freshness bypass is
                     // neither consumed nor required (FR-3.2).
-                    let filt = ["codex".to_string()];
                     let ctx = crate::providers::FetchContext::from_config(&cfg, false);
-                    let l = crate::gather(&cfg, &ctx, since, now, Some(&filt), true, false, false);
-                    let mut events = api_events.clone();
-                    events.extend(
-                        l.events
-                            .into_iter()
-                            .filter(|e| e.source == SourceKind::LocalLogs),
-                    );
+                    let mut refreshed = vec![];
+                    let mut complete = true;
+                    match crate::local::claude_code::collect(&cfg, since, now) {
+                        Ok(c) => refreshed.extend(c.events),
+                        Err(_) => complete = false,
+                    }
+                    for provider in [
+                        &crate::providers::codex::Codex as &dyn Provider,
+                        &crate::providers::gemini::Gemini,
+                        &crate::providers::qwen::Qwen,
+                    ] {
+                        if provider.configured(&cfg) {
+                            match provider.usage(&cfg, &ctx, since, now) {
+                                Ok(f) => refreshed.extend(f.events),
+                                Err(_) => complete = false,
+                            }
+                        }
+                    }
+                    let events =
+                        apply_local_refresh(&api_events, &mut local_events, refreshed, complete);
                     last_local = Instant::now();
                     let snap = Snap {
                         d: Dashboard {
@@ -618,6 +654,66 @@ mod tests {
         }
     }
 
+    fn usage(provider: &str, source: SourceKind) -> UsageEvent {
+        UsageEvent {
+            provider: provider.into(),
+            source,
+            model: format!("{provider}-model"),
+            start: Utc::now(),
+            requests: 1,
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            tool_calls: 0,
+            cost_usd: None,
+            cost_is_estimate: false,
+        }
+    }
+
+    #[test]
+    fn incomplete_local_refresh_preserves_the_previous_local_snapshot() {
+        let api = vec![usage("openai", SourceKind::Api)];
+        let mut local = vec![
+            usage("anthropic", SourceKind::LocalLogs),
+            usage("qwen", SourceKind::LocalLogs),
+        ];
+
+        let next = apply_local_refresh(
+            &api,
+            &mut local,
+            vec![usage("codex", SourceKind::LocalLogs)],
+            false,
+        );
+        let providers: Vec<&str> = next.iter().map(|e| e.provider.as_str()).collect();
+
+        assert_eq!(providers, vec!["openai", "anthropic", "qwen"]);
+    }
+
+    #[test]
+    fn complete_local_refresh_replaces_local_rows_and_preserves_api_rows() {
+        let api = vec![usage("openai", SourceKind::Api)];
+        let mut local = vec![usage("anthropic", SourceKind::LocalLogs)];
+
+        let next = apply_local_refresh(
+            &api,
+            &mut local,
+            vec![
+                usage("anthropic", SourceKind::LocalLogs),
+                usage("codex", SourceKind::LocalLogs),
+                usage("gemini", SourceKind::LocalLogs),
+                usage("qwen", SourceKind::LocalLogs),
+            ],
+            true,
+        );
+        let providers: Vec<&str> = next.iter().map(|e| e.provider.as_str()).collect();
+
+        assert_eq!(
+            providers,
+            vec!["openai", "anthropic", "codex", "gemini", "qwen"]
+        );
+    }
+
     #[test]
     fn quota_panel_renders_rows_beyond_the_first_six() {
         let d = Dashboard {
@@ -704,22 +800,24 @@ mod tests {
         assert!(!s.take(false));
     }
 
-    /// Task 7 (RED): both TUI gather paths thread the typed fetch
-    /// context; the network tick derives it from config plus the
-    /// per-tick freshness decision, the local-only tick from config
-    /// alone.
+    /// The full TUI gather and direct local-provider usage path both
+    /// receive the typed fetch context; no hidden freshness state exists.
     #[test]
     fn tui_gather_sites_pass_the_fetch_context() {
         let needle = ["crate::", "gat", "her("].concat();
         let src = include_str!("tui.rs");
         let sites: Vec<&str> = src.lines().filter(|l| l.contains(&needle)).collect();
-        assert_eq!(sites.len(), 2, "network tick + local-only tick");
+        assert_eq!(sites.len(), 1, "only the network tick uses gather");
         for line in &sites {
             assert!(
                 line.contains("&ctx"),
                 "every TUI gather must pass the context, got: {line}"
             );
         }
+        assert!(
+            src.contains("provider.usage(&cfg, &ctx, since, now)"),
+            "direct local-provider usage must receive the context"
+        );
     }
 
     /// FR-6: the TUI renders the qwen provider in light red.
