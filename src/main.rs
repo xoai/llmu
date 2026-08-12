@@ -655,6 +655,7 @@ fn usage_scope_line(g: &Gathered, cfg: &Config) -> String {
                     }
                 }
                 "claude" => no_feed.push("claude (quota only)"),
+                "qwen" => no_feed.push("qwen (no local usage records yet)"),
                 _ => {}
             }
         }

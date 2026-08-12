@@ -27,6 +27,12 @@
 //!   "access":…}.
 //! - kimi-cli: ~/.kimi/credentials/*.json (OAuth access_token for the
 //!   Kimi For Coding platform).
+//! - Qwen: `${QWEN_HOME:-~/.qwen}/settings.json` `env` block (standard
+//!   `DASHSCOPE_API_KEY` then `BAILIAN_API_KEY`, Coding Plan
+//!   `BAILIAN_CODING_PLAN_API_KEY`, Token Plan
+//!   `BAILIAN_TOKEN_PLAN_API_KEY`) plus `advanced.runtimeOutputDir`,
+//!   with `QWEN_HOME` / `QWEN_RUNTIME_DIR` precedence overrides; strictly
+//!   read-only and network-free (FR-2).
 
 use crate::config::{
     qwen_coding_plan_key, qwen_home, qwen_runtime, qwen_standard_key, qwen_token_plan_key, Config,

@@ -589,6 +589,22 @@ enabled = true
 enabled = true
 # home = "~/.codex"
 
+[qwen]
+# Qwen (Alibaba Cloud Model Studio / QwenCloud): usage from local Qwen Code
+# records only — no Qwen network call, no built-in price guesses, and no
+# console API. Three NON-interchangeable key classes; an sk-sp-* prefix
+# never identifies the plan class.
+# env: standard DASHSCOPE_API_KEY then BAILIAN_API_KEY; Coding Plan
+#      BAILIAN_CODING_PLAN_API_KEY only; Token Plan BAILIAN_TOKEN_PLAN_API_KEY only.
+# standard_key = ""
+# coding_plan_key = ""
+# token_plan_key = ""
+# Qwen home precedence: [qwen].home > QWEN_HOME > ~/.qwen
+# home = "~/.qwen"
+# Runtime precedence: [qwen].runtime_dir > QWEN_RUNTIME_DIR > settings
+# advanced.runtimeOutputDir (relative -> under the Qwen home) > Qwen home.
+# runtime_dir = ""
+
 [http_cache]
 # Optional TTL (seconds) for caching successful JSON responses of eligible
 # side-effect-free GET requests only — never OAuth exchanges, POSTs, or
