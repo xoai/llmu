@@ -9,7 +9,7 @@
 //! in `docs/providers.md` with the exact three key classes, env names,
 //! host families, paths and precedence; the generated `Config::sample`
 //! `[qwen]` section; `src/discover.rs` module-doc source list; the clap
-//! `--provider` enumeration; the Unreleased changelog coverage; and the
+//! `--provider` enumeration; the changelog release-section coverage; and the
 //! no-realistic-secrets rule. The contracts fail when any of those
 //! surfaces is missing, stale, or disagrees with the approved spec
 //! (FR-1 through FR-7).
@@ -459,19 +459,19 @@ fn key_only_qwen_is_labeled_in_the_usage_scope_line() {
 }
 
 // ---------------------------------------------------------------------------
-// CHANGELOG: Unreleased coverage (FR-7).
+// CHANGELOG: release-section coverage (FR-7).
 // ---------------------------------------------------------------------------
 
 #[test]
-fn changelog_unreleased_covers_qwen() {
+fn changelog_release_section_covers_qwen() {
     let c = read("CHANGELOG.md");
-    let unreleased = c
-        .split("## [Unreleased]")
-        .nth(1)
-        .expect("Unreleased section")
+    // Before release, these notes live under Unreleased. The release finalizer
+    // moves that same body into a dated version section, so locate the section
+    // by a Qwen-specific key rather than pinning mutable lifecycle state.
+    let notes = c
         .split("\n## [")
-        .next()
-        .unwrap();
+        .find(|section| section.contains("BAILIAN_CODING_PLAN_API_KEY"))
+        .expect("one changelog section must contain the Qwen release notes");
     for needle in [
         "Qwen",
         "DASHSCOPE_API_KEY",
@@ -483,8 +483,8 @@ fn changelog_unreleased_covers_qwen() {
         "additive",
     ] {
         assert!(
-            unreleased.contains(needle),
-            "the Unreleased changelog must cover {needle} (FR-7)"
+            notes.contains(needle),
+            "one CHANGELOG release section must cover {needle} (FR-7)"
         );
     }
 }
