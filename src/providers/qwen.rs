@@ -115,7 +115,11 @@ fn parse_legacy_entry(model: &str, m: &serde_json::Value) -> Option<LegacyEntry>
     })
 }
 
-fn parse_legacy(v: &serde_json::Value) -> Option<LegacyRecord> {
+/// One accepted legacy session-summary record plus the number of malformed
+/// Qwen model entries skipped inside it. Non-Qwen models are filtered
+/// silently and never counted as malformed (FR-4); an invalid Qwen model
+/// entry counts toward the aggregate skipped-record note (FR-5).
+fn parse_legacy(v: &serde_json::Value) -> Option<(LegacyRecord, usize)> {
     if v["version"].as_u64() != Some(1) {
         return None;
     }
@@ -126,19 +130,25 @@ fn parse_legacy(v: &serde_json::Value) -> Option<LegacyRecord> {
     let ms = i64::try_from(u64_field(v, "timestamp")?).ok()?;
     let ts = Utc.timestamp_millis_opt(ms).single()?;
     let mut accepted = vec![];
+    let mut malformed = 0usize;
     for (model, m) in v["models"].as_object()? {
         if !is_qwen_model(model) {
             continue;
         }
         if let Some(e) = parse_legacy_entry(model, m) {
             accepted.push(e);
+        } else {
+            malformed += 1;
         }
     }
-    Some(LegacyRecord {
-        session,
-        ts,
-        models: accepted,
-    })
+    Some((
+        LegacyRecord {
+            session,
+            ts,
+            models: accepted,
+        },
+        malformed,
+    ))
 }
 
 /// Every `usage/token-usage-*.jsonl` entry under the runtime directory in
@@ -174,15 +184,13 @@ fn has_request_file(runtime: &Path) -> bool {
     })
 }
 
-/// (effective Qwen home, effective runtime dir). After discovery both are
-/// installed (FR-1); when one is missing it falls back to the other, and
-/// with neither configured no files exist.
+/// (Qwen home, effective runtime dir). The legacy ledger lives only under
+/// `cfg.qwen.home` (FR-4); an absent home never falls back to the runtime
+/// directory. The runtime directory may fall back to home when no runtime
+/// override is set (FR-1). After discovery both are installed; this only
+/// distinguishes explicit config, where the two may diverge.
 fn effective_paths(cfg: &Config) -> (Option<PathBuf>, Option<PathBuf>) {
-    let home = cfg
-        .qwen
-        .home
-        .clone()
-        .or(cfg.qwen.runtime_dir.clone());
+    let home = cfg.qwen.home.clone();
     let runtime = cfg.qwen.runtime_dir.clone().or(home.clone());
     (home, runtime)
 }
@@ -330,16 +338,23 @@ impl Provider for Qwen {
                         skipped += 1;
                         continue;
                     };
-                    let Some(rec) = parse_legacy(&v) else {
+                    let Some((rec, malformed)) = parse_legacy(&v) else {
                         skipped += 1;
                         continue;
                     };
+                    skipped += malformed;
                     last.insert(rec.session.clone(), rec);
                 }
             }
         }
         for rec in last.into_values() {
             if covered_sessions.contains(&rec.session) {
+                continue;
+            }
+            // The same [since, until) window as request records, applied
+            // after last-wins/session suppression and before emission
+            // (FR-3/FR-4).
+            if rec.ts < since || rec.ts >= until {
                 continue;
             }
             for e in rec.models {
@@ -712,7 +727,11 @@ mod tests {
         );
     }
 
-    /// FR-3: output order is timestamp, model id, then stable record id.
+    /// FR-3: output order is timestamp, model id, then stable request id.
+    /// Same-timestamp, same-model records carry distinguishable input
+    /// counts so the id tiebreak is actually proven — the record written
+    /// first (a2) must sort after a1 purely by stable request id, not
+    /// merely produce two equal-shaped rows.
     #[test]
     fn stable_event_order_by_timestamp_then_model_then_id() {
         let dir = temp_dir("order");
@@ -721,31 +740,192 @@ mod tests {
             &dir.join("runtime/usage"),
             "token-usage-2026-08.jsonl",
             &[
-                &req("z1", "s1", "2026-08-10T00:00:00Z", "qwen-z", 1, 1, 0, 0, 2),
-                &req("a2", "s2", "2026-08-05T00:00:00Z", "qwen-a", 1, 1, 0, 0, 2),
+                &req("z1", "s1", "2026-08-10T00:00:00Z", "qwen-z", 10, 1, 0, 0, 11),
+                &req("a2", "s2", "2026-08-05T00:00:00Z", "qwen-a", 2, 1, 0, 0, 3),
                 &req("a1", "s3", "2026-08-05T00:00:00Z", "qwen-a", 1, 1, 0, 0, 2),
-                &req("b1", "s4", "2026-08-05T00:00:00Z", "qwen-b", 1, 1, 0, 0, 2),
-                &req("z2", "s5", "2026-08-10T00:00:00Z", "qwen-z", 1, 1, 0, 0, 2),
+                &req("b1", "s4", "2026-08-05T00:00:00Z", "qwen-b", 3, 1, 0, 0, 4),
+                &req("z2", "s5", "2026-08-10T00:00:00Z", "qwen-z", 20, 1, 0, 0, 21),
             ],
         );
         let f = usage(&cfg);
-        let keys: Vec<_> = f
-            .events
-            .iter()
-            .map(|e| (e.start, e.model.clone()))
-            .collect();
-        let ids: Vec<_> = f.events.iter().map(|e| e.requests).collect();
-        assert_eq!(ids.len(), 5);
+        let rows: Vec<_> = f.events.iter().map(row).collect();
         assert_eq!(
-            keys,
+            rows,
             vec![
-                (dt("2026-08-05T00:00:00Z"), "qwen-a".into()),
-                (dt("2026-08-05T00:00:00Z"), "qwen-a".into()),
-                (dt("2026-08-05T00:00:00Z"), "qwen-b".into()),
-                (dt("2026-08-10T00:00:00Z"), "qwen-z".into()),
-                (dt("2026-08-10T00:00:00Z"), "qwen-z".into()),
-            ]
+                // Same ts + model: a1 (input 1) precedes a2 (input 2) by
+                // stable request id despite a2 appearing first in the file.
+                ("2026-08-05T00:00:00+00:00".into(), "qwen-a".into(), 1, 1, 1, 0, 0),
+                ("2026-08-05T00:00:00+00:00".into(), "qwen-a".into(), 1, 2, 1, 0, 0),
+                ("2026-08-05T00:00:00+00:00".into(), "qwen-b".into(), 1, 3, 1, 0, 0),
+                ("2026-08-10T00:00:00+00:00".into(), "qwen-z".into(), 1, 10, 1, 0, 0),
+                ("2026-08-10T00:00:00+00:00".into(), "qwen-z".into(), 1, 20, 1, 0, 0),
+            ],
+            "id tiebreak (a1 < a2) must order same-ts same-model records over file order"
         );
+    }
+
+    /// FR-4: legacy summaries respect the same [since, until) window as
+    /// request records — below since and at exactly until are excluded,
+    /// exactly since and just below until are included — applied after
+    /// last-wins/session suppression and before event emission.
+    #[test]
+    fn legacy_range_filter_bounds() {
+        let dir = temp_dir("legacy-range");
+        let cfg = cfg_with(&dir.join("home"), &dir.join("runtime"));
+        write(
+            &dir.join("home/usage_record.jsonl"),
+            &format!(
+                "{}\n{}\n{}\n{}\n",
+                legacy(
+                    "s-below",
+                    dt("2026-07-31T23:59:59.999Z").timestamp_millis(),
+                    &[("qwen-max", 1, 10, 10, 0, 0, 20)],
+                ),
+                legacy(
+                    "s-since",
+                    dt("2026-08-01T00:00:00.000Z").timestamp_millis(),
+                    &[("qwen-max", 1, 20, 20, 0, 0, 40)],
+                ),
+                legacy(
+                    "s-below-until",
+                    dt("2026-08-31T23:59:59.999Z").timestamp_millis(),
+                    &[("qwen-max", 1, 30, 30, 0, 0, 60)],
+                ),
+                legacy(
+                    "s-until",
+                    dt("2026-09-01T00:00:00.000Z").timestamp_millis(),
+                    &[("qwen-max", 1, 40, 40, 0, 0, 80)],
+                ),
+            ),
+        );
+        let f = usage(&cfg);
+        let input: Vec<_> = f.events.iter().map(|e| e.input_tokens).collect();
+        assert_eq!(
+            f.events.len(),
+            2,
+            "only in-window legacy summaries emit (below since and at until excluded)"
+        );
+        assert_eq!(input, vec![20, 30], "exactly since and just below until included");
+        assert!(f.notes.is_empty());
+    }
+
+    /// FR-4/AC-5: a legacy session mixing one valid Qwen model, one
+    /// invalid-token Qwen model, and a non-Qwen model keeps the valid
+    /// event, counts exactly the invalid Qwen entry as malformed (one
+    /// aggregate note, no payload/path leakage), and never treats
+    /// non-Qwen models as malformed.
+    #[test]
+    fn legacy_mixed_session_counts_invalid_qwen_entries_only() {
+        let dir = temp_dir("legacy-mixed");
+        let cfg = cfg_with(&dir.join("home"), &dir.join("runtime"));
+        let ts = dt("2026-08-10T00:00:00Z").timestamp_millis();
+        let mut m = serde_json::Map::new();
+        m.insert(
+            "qwen-max".into(),
+            json!({
+                "requests": 1, "inputTokens": 100, "outputTokens": 50,
+                "cachedTokens": 0, "thoughtsTokens": 0, "totalTokens": 150
+            }),
+        );
+        m.insert(
+            "qwen-turbo".into(),
+            json!({
+                "requests": 1, "inputTokens": "abc", "outputTokens": 1,
+                "cachedTokens": 0, "thoughtsTokens": 0, "totalTokens": 2
+            }),
+        );
+        m.insert(
+            "glm-4.6".into(),
+            json!({
+                "requests": 9, "inputTokens": 900, "outputTokens": 900,
+                "cachedTokens": 0, "thoughtsTokens": 0, "totalTokens": 1800
+            }),
+        );
+        write(
+            &dir.join("home/usage_record.jsonl"),
+            &format!(
+                "{}\n",
+                json!({
+                    "version": 1,
+                    "sessionId": "s-mixed",
+                    "timestamp": ts,
+                    "startTime": ts,
+                    "durationMs": 1,
+                    "models": m
+                })
+            ),
+        );
+        let f = usage(&cfg);
+        let rows: Vec<_> = f.events.iter().map(row).collect();
+        assert_eq!(
+            rows,
+            vec![("2026-08-10T00:00:00+00:00".into(), "qwen-max".into(), 1, 100, 50, 0, 0)],
+            "valid Qwen entry survives; invalid Qwen entry and non-Qwen model emit nothing"
+        );
+        assert_eq!(
+            f.notes,
+            vec!["qwen: skipped 1 malformed local usage record(s)".to_string()],
+            "exactly one aggregate note for the invalid Qwen entry"
+        );
+        let note = &f.notes[0];
+        for leaked in [
+            "abc", "qwen-turbo", "glm", "usage_record", "home", "runtime", "settings",
+        ] {
+            assert!(!note.contains(leaked), "note must not leak `{leaked}`: {note}");
+        }
+    }
+
+    /// FR-4: the legacy ledger is read only from `cfg.qwen.home` — an
+    /// absent home never falls back to the runtime directory — while the
+    /// runtime directory may fall back to home (FR-1).
+    #[test]
+    fn legacy_reads_only_from_configured_home() {
+        let dir = temp_dir("legacy-home-only");
+        let runtime = dir.join("runtime");
+        let home = dir.join("home");
+        // Only runtime_dir configured: legacy content under the runtime
+        // directory must NOT be read (legacy requires cfg.qwen.home).
+        let mut cfg = Config::default();
+        cfg.qwen.runtime_dir = Some(runtime.clone());
+        write(
+            &runtime.join("usage_record.jsonl"),
+            &format!(
+                "{}\n",
+                legacy("s-rt", dt("2026-08-10T00:00:00Z").timestamp_millis(), &[("qwen-max", 1, 10, 10, 0, 0, 20)])
+            ),
+        );
+        let f = usage(&cfg);
+        assert!(f.events.is_empty(), "legacy must not fall back to the runtime directory");
+        assert!(f.notes.is_empty());
+
+        // Runtime ledger still works with only runtime_dir configured.
+        write_lines(
+            &runtime.join("usage"),
+            "token-usage-2026-08.jsonl",
+            &[&req("r1", "s1", "2026-08-10T00:00:00Z", "qwen-max", 1, 1, 0, 0, 2)],
+        );
+        let f = usage(&cfg);
+        assert_eq!(f.events.len(), 1, "runtime ledger unaffected by home-only legacy rule");
+
+        // Only home configured: runtime may fall back to home, and home
+        // serves the legacy ledger.
+        let mut cfg2 = Config::default();
+        cfg2.qwen.home = Some(home.clone());
+        write_lines(
+            &home.join("usage"),
+            "token-usage-2026-08.jsonl",
+            &[&req("r2", "s2", "2026-08-11T00:00:00Z", "qwen-max", 2, 2, 0, 0, 4)],
+        );
+        write(
+            &home.join("usage_record.jsonl"),
+            &format!(
+                "{}\n",
+                legacy("s-h", dt("2026-08-12T00:00:00Z").timestamp_millis(), &[("qwen-max", 3, 30, 30, 0, 0, 60)])
+            ),
+        );
+        let f = usage(&cfg2);
+        let inputs: Vec<_> = f.events.iter().map(|e| e.input_tokens).collect();
+        assert_eq!(inputs, vec![2, 30], "home serves runtime fallback and legacy ledger");
     }
 
     /// FR-4: legacy epoch-ms + nested per-model events with the same
