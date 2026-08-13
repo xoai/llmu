@@ -151,53 +151,121 @@ const MESSAGE_QUERY: &str = "SELECT time_created, data FROM message \
      WHERE time_created >= ?1 AND time_created < ?2 \
      ORDER BY time_created, id";
 
+/// Exact Rust `str::trim` whitespace set (Unicode White_Space), passed
+/// as the SQLite `TRIM` character-set argument so provider/model
+/// normalization in the probe matches `parse_record`'s `.trim()`
+/// exactly (Task 4 review: SQLite's default TRIM strips only spaces).
+const TRIM_WHITESPACE: &str = "\t\n\x0b\x0c\r \u{85}\u{a0}\u{1680}\
+    \u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\
+    \u{2008}\u{2009}\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}";
+
+/// Maximum `data.time.created` epoch milliseconds the locked Chrono
+/// (0.4.38) accepts through `DateTime::from_timestamp_millis`. The
+/// probe bounds `$.time.created` with this same value so status and
+/// parser agree; tests prove it at this value, at +1, and at i64::MAX.
+const CREATED_MS_MAX: i64 = 8_210_266_876_799_999;
+
 /// Task 4 bounded eligibility probe: a constant-1 single-row read over
 /// `message` with every FR-13 parser invariant enforced in SQL, so the
-/// status answer matches the collector exactly. SQLite JSON integers
-/// are signed 64-bit, but `json_type` reports 'integer' even for
-/// literals that overflow i64 — those surface as REAL at storage
-/// level — so each integer field also guards
-/// `typeof(json_extract(...)) = 'integer'` to bound extracted values
-/// inside i64 (and therefore u64) parser limits. Positivity of the
+/// status answer matches the collector exactly. `?1` is
+/// `TRIM_WHITESPACE` and `?2` is `CREATED_MS_MAX`, so SQL and parser
+/// agree on trimming and on `time.created` acceptance. SQLite stores
+/// JSON integer literals that overflow i64 as REAL, so token fields
+/// keep `json_type='integer'` (lexical integer, excluding real and
+/// exponent forms), drop the `typeof='integer'` storage guard, and
+/// instead bound the value with `json_extract(...) < 18446744073709551616`
+/// (2^64). SQLite rounds both `18446744073709551615` (u64::MAX) and
+/// `18446744073709551616` (2^64) to the same double, so the single
+/// boundary value 2^64 is decided lexically: the raw literal is
+/// compared against u64::MAX textually. Lexical `-0` is likewise
+/// rejected per required numeric field, because serde_json `as_u64()`
+/// rejects it while SQLite admits it numerically. Positivity of the
 /// normalized saturated total is expressed as an OR over the
 /// nonnegative token fields, avoiding SQLite signed-addition overflow.
 const AVAILABLE_QUERY: &str = "SELECT 1 FROM message WHERE \
      json_valid(data) = 1 AND json_type(data) = 'object' \
      AND json_extract(data, '$.role') = 'assistant' \
-     AND TRIM(json_extract(data, '$.providerID')) <> '' \
-     AND TRIM(json_extract(data, '$.providerID')) IN ( \
+     AND TRIM(json_extract(data, '$.providerID'), ?1) <> '' \
+     AND TRIM(json_extract(data, '$.providerID'), ?1) IN ( \
          'alibaba', 'alibaba-cn', 'alibaba-coding-plan', 'alibaba-coding-plan-cn', \
          'alibaba-token-plan', 'alibaba-token-plan-cn', 'bailian-token-plan-personal', \
          'zai', 'zai-coding-plan', 'zhipuai', 'zhipuai-coding-plan', \
          'deepseek', 'kimi-for-coding', 'moonshot', 'moonshotai', 'kimi', 'openai') \
      AND json_type(data, '$.modelID') = 'text' \
-     AND TRIM(json_extract(data, '$.modelID')) <> '' \
+     AND TRIM(json_extract(data, '$.modelID'), ?1) <> '' \
      AND json_type(data, '$.time.created') = 'integer' \
      AND typeof(json_extract(data, '$.time.created')) = 'integer' \
      AND json_extract(data, '$.time.created') >= 0 \
+     AND json_extract(data, '$.time.created') <= ?2 \
+     AND NOT (json_extract(data, '$.time.created') = 0 \
+              AND instr(data, '\"created\":') > 0 \
+              AND substr(data, instr(data, '\"created\":'), 18) LIKE '%-0%') \
      AND json_type(data, '$.time.completed') = 'integer' \
      AND typeof(json_extract(data, '$.time.completed')) = 'integer' \
      AND json_extract(data, '$.time.completed') >= 0 \
+     AND NOT (json_extract(data, '$.time.completed') = 0 \
+              AND instr(data, '\"completed\":') > 0 \
+              AND substr(data, instr(data, '\"completed\":'), 20) LIKE '%-0%') \
      AND json_extract(data, '$.time.created') = time_created \
      AND (json_type(data, '$.error') IS NULL OR json_type(data, '$.error') = 'null') \
      AND json_extract(data, '$.finish') IN ('tool-calls', 'stop', 'length') \
      AND json_type(data, '$.tokens') = 'object' \
      AND json_type(data, '$.tokens.input') = 'integer' \
-     AND typeof(json_extract(data, '$.tokens.input')) = 'integer' \
      AND json_extract(data, '$.tokens.input') >= 0 \
+     AND (typeof(json_extract(data, '$.tokens.input')) = 'integer' \
+          OR json_extract(data, '$.tokens.input') < 18446744073709551616 \
+          OR (json_extract(data, '$.tokens.input') = 18446744073709551616 \
+              AND substr(ltrim(substr(data, instr(data, '\"input\":') + 8), \
+                               ' ' || char(9) || char(10) || char(13)), 1, 20) \
+                  <= '18446744073709551615')) \
+     AND NOT (json_extract(data, '$.tokens.input') = 0 \
+              AND instr(data, '\"input\":') > 0 \
+              AND substr(data, instr(data, '\"input\":'), 16) LIKE '%-0%') \
      AND json_type(data, '$.tokens.output') = 'integer' \
-     AND typeof(json_extract(data, '$.tokens.output')) = 'integer' \
      AND json_extract(data, '$.tokens.output') >= 0 \
+     AND (typeof(json_extract(data, '$.tokens.output')) = 'integer' \
+          OR json_extract(data, '$.tokens.output') < 18446744073709551616 \
+          OR (json_extract(data, '$.tokens.output') = 18446744073709551616 \
+              AND substr(ltrim(substr(data, instr(data, '\"output\":') + 9), \
+                               ' ' || char(9) || char(10) || char(13)), 1, 20) \
+                  <= '18446744073709551615')) \
+     AND NOT (json_extract(data, '$.tokens.output') = 0 \
+              AND instr(data, '\"output\":') > 0 \
+              AND substr(data, instr(data, '\"output\":'), 17) LIKE '%-0%') \
      AND json_type(data, '$.tokens.reasoning') = 'integer' \
-     AND typeof(json_extract(data, '$.tokens.reasoning')) = 'integer' \
      AND json_extract(data, '$.tokens.reasoning') >= 0 \
+     AND (typeof(json_extract(data, '$.tokens.reasoning')) = 'integer' \
+          OR json_extract(data, '$.tokens.reasoning') < 18446744073709551616 \
+          OR (json_extract(data, '$.tokens.reasoning') = 18446744073709551616 \
+              AND substr(ltrim(substr(data, instr(data, '\"reasoning\":') + 12), \
+                               ' ' || char(9) || char(10) || char(13)), 1, 20) \
+                  <= '18446744073709551615')) \
+     AND NOT (json_extract(data, '$.tokens.reasoning') = 0 \
+              AND instr(data, '\"reasoning\":') > 0 \
+              AND substr(data, instr(data, '\"reasoning\":'), 20) LIKE '%-0%') \
      AND json_type(data, '$.tokens.cache') = 'object' \
      AND json_type(data, '$.tokens.cache.read') = 'integer' \
-     AND typeof(json_extract(data, '$.tokens.cache.read')) = 'integer' \
      AND json_extract(data, '$.tokens.cache.read') >= 0 \
+     AND (typeof(json_extract(data, '$.tokens.cache.read')) = 'integer' \
+          OR json_extract(data, '$.tokens.cache.read') < 18446744073709551616 \
+          OR (json_extract(data, '$.tokens.cache.read') = 18446744073709551616 \
+              AND substr(ltrim(substr(data, instr(data, '\"read\":') + 7), \
+                               ' ' || char(9) || char(10) || char(13)), 1, 20) \
+                  <= '18446744073709551615')) \
+     AND NOT (json_extract(data, '$.tokens.cache.read') = 0 \
+              AND instr(data, '\"read\":') > 0 \
+              AND substr(data, instr(data, '\"read\":'), 15) LIKE '%-0%') \
      AND json_type(data, '$.tokens.cache.write') = 'integer' \
-     AND typeof(json_extract(data, '$.tokens.cache.write')) = 'integer' \
      AND json_extract(data, '$.tokens.cache.write') >= 0 \
+     AND (typeof(json_extract(data, '$.tokens.cache.write')) = 'integer' \
+          OR json_extract(data, '$.tokens.cache.write') < 18446744073709551616 \
+          OR (json_extract(data, '$.tokens.cache.write') = 18446744073709551616 \
+              AND substr(ltrim(substr(data, instr(data, '\"write\":') + 8), \
+                               ' ' || char(9) || char(10) || char(13)), 1, 20) \
+                  <= '18446744073709551615')) \
+     AND NOT (json_extract(data, '$.tokens.cache.write') = 0 \
+              AND instr(data, '\"write\":') > 0 \
+              AND substr(data, instr(data, '\"write\":'), 16) LIKE '%-0%') \
      AND (json_extract(data, '$.tokens.input') > 0 \
           OR json_extract(data, '$.tokens.output') > 0 \
           OR json_extract(data, '$.tokens.reasoning') > 0 \
@@ -221,8 +289,12 @@ pub fn available_from(path: &Path) -> bool {
         Err(_) => return false,
     };
     matches!(
-        conn.query_row(AVAILABLE_QUERY, [], |row| row.get::<_, i64>(0))
-            .optional(),
+        conn.query_row(
+            AVAILABLE_QUERY,
+            rusqlite::params![TRIM_WHITESPACE, CREATED_MS_MAX],
+            |row| row.get::<_, i64>(0)
+        )
+        .optional(),
         Ok(Some(1))
     )
 }
@@ -1435,6 +1507,278 @@ mod tests {
         );
         let out = collect_from(&Config::default(), &path, ms(0), ms(10_000));
         assert_eq!(out.events.len(), 0);
+    }
+
+    #[test]
+    fn parser_accepts_token_buckets_at_2p63_and_u64max() {
+        for bucket in [9_223_372_036_854_775_808u64, u64::MAX] {
+            for field in ["input", "output", "reasoning"] {
+                let mut data = valid_data("openai", "model-a", 1_000);
+                data["tokens"][field] = serde_json::json!(bucket);
+                let parsed = parse_record(1_000, &data.to_string())
+                    .unwrap_or_else(|| panic!("{field} at {bucket} must parse"));
+                assert!(
+                    parsed.input_tokens > 0 || parsed.output_tokens > 0,
+                    "{field} at {bucket} must produce a positive total"
+                );
+            }
+            for field in ["read", "write"] {
+                let mut data = valid_data("openai", "model-a", 1_000);
+                data["tokens"]["cache"][field] = serde_json::json!(bucket);
+                let parsed = parse_record(1_000, &data.to_string())
+                    .unwrap_or_else(|| panic!("cache.{field} at {bucket} must parse"));
+                assert!(
+                    parsed.cache_read_tokens > 0 || parsed.cache_write_tokens > 0,
+                    "cache.{field} at {bucket} must produce a positive total"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn available_parity_token_buckets_u64_range_yes_and_2p64_no() {
+        for (field, cache) in [
+            ("input", false),
+            ("output", false),
+            ("reasoning", false),
+            ("read", true),
+            ("write", true),
+        ] {
+            for bucket in [9_223_372_036_854_775_808u64, u64::MAX] {
+                let mut data = valid_data("openai", "model-a", 1_000);
+                if cache {
+                    data["tokens"]["cache"][field] = serde_json::json!(bucket);
+                } else {
+                    data["tokens"][field] = serde_json::json!(bucket);
+                }
+                let path = write_values(
+                    &temp_dir(&format!("avail-tok-{field}-{bucket}")),
+                    &[(1_000, "m", data)],
+                );
+                assert!(
+                    available_from(&path),
+                    "tokens.{field} at {bucket} must answer yes"
+                );
+                let out = collect_from(&Config::default(), &path, ms(0), ms(10_000));
+                assert_eq!(
+                    out.events.len(),
+                    1,
+                    "tokens.{field} at {bucket} must collect an event"
+                );
+            }
+        }
+        let base = r#"{"role":"assistant","providerID":"openai","modelID":"m","time":{"created":1000,"completed":1001},"finish":"stop","tokens":{"input":10,"output":20,"reasoning":5,"cache":{"read":3,"write":2}}}"#;
+        for (field, literal) in [
+            ("input", r#""input":10"#),
+            ("output", r#""output":20"#),
+            ("reasoning", r#""reasoning":5"#),
+            ("read", r#""read":3"#),
+            ("write", r#""write":2"#),
+        ] {
+            let row = base.replace(literal, &format!("\"{field}\":18446744073709551616"));
+            let path = write_db(
+                &temp_dir(&format!("avail-2p64-{field}")),
+                &[(1_000, "m", &row)],
+            );
+            assert!(
+                !available_from(&path),
+                "tokens.{field} literal 18446744073709551616 must answer no"
+            );
+            let out = collect_from(&Config::default(), &path, ms(0), ms(10_000));
+            assert_eq!(
+                out.events.len(),
+                0,
+                "tokens.{field} literal 18446744073709551616 must collect nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn available_parity_created_upper_bound_matches_locked_chrono() {
+        let created_max = CREATED_MS_MAX;
+        assert!(
+            DateTime::<Utc>::from_timestamp_millis(created_max).is_some(),
+            "the locked Chrono must accept created_max"
+        );
+        assert!(
+            DateTime::<Utc>::from_timestamp_millis(created_max + 1).is_none(),
+            "the locked Chrono must reject created_max + 1"
+        );
+        assert!(
+            DateTime::<Utc>::from_timestamp_millis(i64::MAX).is_none(),
+            "the locked Chrono must reject i64::MAX milliseconds"
+        );
+        for (created, expect) in [
+            (created_max, true),
+            (created_max + 1, false),
+            (i64::MAX, false),
+        ] {
+            let mut data = valid_data("openai", "model-a", 1_000);
+            data["time"]["created"] = serde_json::json!(created);
+            data["time"]["completed"] = serde_json::json!(created);
+            let row = data.to_string();
+            assert_eq!(
+                parse_record(created, &row).is_some(),
+                expect,
+                "parser must agree on created {created}"
+            );
+            let path = write_db(
+                &temp_dir(&format!("avail-created-{created}")),
+                &[(created, "m", &row)],
+            );
+            assert_eq!(
+                available_from(&path),
+                expect,
+                "probe must agree on created {created}"
+            );
+            let conn = open_readonly(&path).unwrap();
+            let mut rows = vec![];
+            stream_message_rows(&conn, 0, created.saturating_add(1), |r| rows.push(r)).unwrap();
+            assert_eq!(
+                rows.iter()
+                    .filter(|r| parse_record(r.time_created_ms, &r.data).is_some())
+                    .count(),
+                usize::from(expect),
+                "the collector must agree on created {created}"
+            );
+        }
+        let mut near = valid_data("openai", "model-a", created_max - 60_000);
+        near["time"]["created"] = serde_json::json!(created_max - 60_000);
+        near["time"]["completed"] = serde_json::json!(created_max - 60_000);
+        let path = write_values(
+            &temp_dir("avail-created-near-max"),
+            &[(created_max - 60_000, "m", near)],
+        );
+        let out = collect_from(&Config::default(), &path, ms(0), ms(created_max));
+        assert_eq!(
+            out.events.len(),
+            1,
+            "collect must accept large created values"
+        );
+    }
+
+    #[test]
+    fn available_parity_whitespace_trim_matches_rust_trim() {
+        for provider in [
+            "\nopenai\t",
+            " \topenai\r\n",
+            "\u{3000}openai\u{85}",
+            "\u{2003}openai\u{2028}",
+        ] {
+            let mut data = valid_data(provider, "model-a", 1_000);
+            data["cost"] = serde_json::Value::Null;
+            let path = write_values(
+                &temp_dir(&format!("avail-ws-p-{}", provider.escape_default())),
+                &[(1_000, "m", data)],
+            );
+            assert!(
+                available_from(&path),
+                "provider {provider:?} must trim to an allowlisted id"
+            );
+            let out = collect_from(&Config::default(), &path, ms(0), ms(10_000));
+            assert_eq!(out.events.len(), 1, "provider {provider:?}");
+            assert_eq!(out.events[0].provider, "openai");
+        }
+        for provider in ["\t \n", " \u{3000}\u{2003} ", "\r\n\t"] {
+            let data = valid_data(provider, "model-a", 1_000);
+            let path = write_values(
+                &temp_dir(&format!("avail-ws-pempty-{}", provider.escape_default())),
+                &[(1_000, "m", data)],
+            );
+            assert!(
+                !available_from(&path),
+                "whitespace-only provider {provider:?} must answer no"
+            );
+            let out = collect_from(&Config::default(), &path, ms(0), ms(10_000));
+            assert_eq!(out.events.len(), 0, "whitespace-only provider {provider:?}");
+        }
+        for model in ["\nmodel-a\t", "\u{2003}model-a\u{2028}"] {
+            let mut data = valid_data("openai", model, 1_000);
+            data["cost"] = serde_json::Value::Null;
+            let path = write_values(
+                &temp_dir(&format!("avail-ws-m-{}", model.escape_default())),
+                &[(1_000, "m", data)],
+            );
+            assert!(
+                available_from(&path),
+                "model {model:?} must trim to a nonempty id"
+            );
+            let out = collect_from(&Config::default(), &path, ms(0), ms(10_000));
+            assert_eq!(out.events.len(), 1, "model {model:?}");
+            assert_eq!(out.events[0].model, "model-a");
+        }
+        for model in ["\t\n", "\u{3000} "] {
+            let data = valid_data("openai", model, 1_000);
+            let path = write_values(
+                &temp_dir(&format!("avail-ws-mempty-{}", model.escape_default())),
+                &[(1_000, "m", data)],
+            );
+            assert!(
+                !available_from(&path),
+                "whitespace-only model {model:?} must answer no"
+            );
+            let out = collect_from(&Config::default(), &path, ms(0), ms(10_000));
+            assert_eq!(out.events.len(), 0, "whitespace-only model {model:?}");
+        }
+    }
+
+    #[test]
+    fn available_parity_lexical_negative_zero_rejected() {
+        let base = r#"{"role":"assistant","providerID":"openai","modelID":"m","time":{"created":1000,"completed":1001},"finish":"stop","tokens":{"input":10,"output":20,"reasoning":5,"cache":{"read":3,"write":2}}}"#;
+        for (needle, replacement, time_created) in [
+            (r#""created":1000"#, r#""created":-0"#, 0),
+            (r#""completed":1001"#, r#""completed":-0"#, 1_000),
+            (r#""input":10"#, r#""input":-0"#, 1_000),
+            (r#""output":20"#, r#""output":-0"#, 1_000),
+            (r#""reasoning":5"#, r#""reasoning":-0"#, 1_000),
+            (r#""read":3"#, r#""read":-0"#, 1_000),
+            (r#""write":2"#, r#""write":-0"#, 1_000),
+        ] {
+            let row = base.replace(needle, replacement);
+            assert!(
+                parse_record(time_created, &row).is_none(),
+                "the parser must reject {needle} as {replacement}"
+            );
+            let path = write_db(
+                &temp_dir(&format!("avail-negzero-{needle}")),
+                &[(time_created, "m", &row)],
+            );
+            assert!(
+                !available_from(&path),
+                "the probe must reject {needle} as {replacement}"
+            );
+            let out = collect_from(&Config::default(), &path, ms(0), ms(10_000));
+            assert_eq!(
+                out.events.len(),
+                0,
+                "{needle} as {replacement} must collect nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn trim_whitespace_set_matches_rust_trim_semantics() {
+        for ch in TRIM_WHITESPACE.chars() {
+            assert!(
+                ch.is_whitespace(),
+                "U+{:04X} must be Rust str::trim whitespace",
+                ch as u32
+            );
+            let wrapped = format!("{ch}x{ch}");
+            assert_eq!(
+                wrapped.trim(),
+                "x",
+                "U+{:04X} must be trimmed by Rust str::trim",
+                ch as u32
+            );
+        }
+        for ch in ['\u{200B}', '\u{00AD}', 'x', '-'] {
+            assert!(
+                !ch.is_whitespace(),
+                "U+{:04X} must NOT be Rust whitespace",
+                ch as u32
+            );
+        }
     }
 
     #[test]
