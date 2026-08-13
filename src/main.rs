@@ -376,7 +376,7 @@ fn main() -> Result<()> {
                 if cfg.claude_code.enabled { "yes" } else { "no" },
             );
             println!(
-                "{:<10} {:<11} read-only local usage from OpenCode SQLite message records across supported providers",
+                "{:<10} {:<11} read-only local usage from OpenCode's SQLite message records across supported providers",
                 "opencode",
                 if local::opencode::available() { "yes" } else { "no" },
             );

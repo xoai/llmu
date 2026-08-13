@@ -1112,7 +1112,7 @@ fn providers_prints_opencode_yes_for_eligible_db() {
     );
     assert!(
         row.contains(
-            "read-only local usage from OpenCode SQLite message records across supported providers"
+            "read-only local usage from OpenCode's SQLite message records across supported providers"
         ),
         "the capabilities wording must be exact:\n{row}"
     );
