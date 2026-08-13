@@ -16,7 +16,8 @@ dirs = "=5.0.1"
 ratatui = "=0.26.3"
 # pin: bundled SQLite for read-only OpenCode usage (FR-4, NFR-12) — exact
 # 0.31.0 compiles on rust-version 1.75; no system sqlite dependency.
-rusqlite = { version = "=0.31.0", features = ["bundled"] }
+# `functions` adds no transitive dependency (status scalar, FR-30).
+rusqlite = { version = "=0.31.0", features = ["bundled", "functions"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "=0.10.9"

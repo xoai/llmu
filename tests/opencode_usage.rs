@@ -30,8 +30,8 @@ fn read(rel: &str) -> String {
 fn cargo_toml_pins_exact_bundled_rusqlite() {
     let cargo = read("Cargo.toml");
     assert!(
-        cargo.contains("rusqlite = { version = \"=0.31.0\", features = [\"bundled\"] }"),
-        "Cargo.toml must declare `rusqlite = {{ version = \"=0.31.0\", features = [\"bundled\"] }}` (FR-4)"
+        cargo.contains("rusqlite = { version = \"=0.31.0\", features = [\"bundled\", \"functions\"] }"),
+        "Cargo.toml must declare `rusqlite = {{ version = \"=0.31.0\", features = [\"bundled\", \"functions\"] }}` (FR-4)"
     );
 }
 
@@ -1012,97 +1012,43 @@ fn opencode_availability_probe_never_calls_the_collector() {
 }
 
 #[test]
-fn opencode_availability_sql_enforces_parser_parity_before_limit_1() {
+fn opencode_availability_probe_is_scalar_filtered_limit_1_without_lexical_scraping() {
     let probe = probe_region(&opencode_prod());
-    for alias in [
-        "alibaba",
-        "alibaba-cn",
-        "alibaba-coding-plan",
-        "alibaba-coding-plan-cn",
-        "alibaba-token-plan",
-        "alibaba-token-plan-cn",
-        "bailian-token-plan-personal",
-        "zai",
-        "zai-coding-plan",
-        "zhipuai",
-        "zhipuai-coding-plan",
-        "deepseek",
-        "kimi-for-coding",
-        "moonshot",
-        "moonshotai",
-        "kimi",
-        "openai",
-    ] {
-        assert!(
-            probe.contains(&format!("'{alias}'")),
-            "the probe allowlist must include {alias} (Task 4)"
-        );
-    }
-    for needle in [
-        "json_valid(data)",
-        "json_type(data) = 'object'",
-        "json_extract(data, '$.role') = 'assistant'",
-        "TRIM(json_extract(data, '$.providerID'), ?1) <> ''",
-        "json_type(data, '$.modelID') = 'text'",
-        "TRIM(json_extract(data, '$.modelID'), ?1) <> ''",
-        "json_type(data, '$.time.created') = 'integer'",
-        "typeof(json_extract(data, '$.time.created')) = 'integer'",
-        "json_extract(data, '$.time.created') >= 0",
-        "json_extract(data, '$.time.created') <= ?2",
-        "json_type(data, '$.time.completed') = 'integer'",
-        "typeof(json_extract(data, '$.time.completed')) = 'integer'",
-        "json_extract(data, '$.time.completed') >= 0",
-        "json_extract(data, '$.time.created') = time_created",
-        "json_type(data, '$.error') IS NULL OR json_type(data, '$.error') = 'null'",
-        "json_extract(data, '$.finish') IN ('tool-calls', 'stop', 'length')",
-        "json_type(data, '$.tokens') = 'object'",
-        "json_type(data, '$.tokens.input') = 'integer'",
-        "typeof(json_extract(data, '$.tokens.input')) = 'integer'",
-        "json_extract(data, '$.tokens.input') >= 0",
-        "json_extract(data, '$.tokens.input') < 18446744073709551616",
-        "json_type(data, '$.tokens.output') = 'integer'",
-        "typeof(json_extract(data, '$.tokens.output')) = 'integer'",
-        "json_extract(data, '$.tokens.output') >= 0",
-        "json_extract(data, '$.tokens.output') < 18446744073709551616",
-        "json_type(data, '$.tokens.reasoning') = 'integer'",
-        "typeof(json_extract(data, '$.tokens.reasoning')) = 'integer'",
-        "json_extract(data, '$.tokens.reasoning') >= 0",
-        "json_extract(data, '$.tokens.reasoning') < 18446744073709551616",
-        "json_type(data, '$.tokens.cache') = 'object'",
-        "json_type(data, '$.tokens.cache.read') = 'integer'",
-        "typeof(json_extract(data, '$.tokens.cache.read')) = 'integer'",
-        "json_extract(data, '$.tokens.cache.read') >= 0",
-        "json_extract(data, '$.tokens.cache.read') < 18446744073709551616",
-        "json_type(data, '$.tokens.cache.write') = 'integer'",
-        "typeof(json_extract(data, '$.tokens.cache.write')) = 'integer'",
-        "json_extract(data, '$.tokens.cache.write') >= 0",
-        "json_extract(data, '$.tokens.cache.write') < 18446744073709551616",
-        "substr(ltrim(substr(data, instr(data, '\\\"input\\\":')",
-        "<= '18446744073709551615'",
-        "LIKE '%-0%'",
-        "instr(data, '\\\"created\\\":')",
-    ] {
-        assert!(
-            probe.contains(needle),
-            "the probe SQL must enforce `{needle}` (FR-13 parity, Task 4)"
-        );
-    }
-    for field in ["input", "output", "reasoning"] {
-        assert!(
-            probe.contains(&format!("$.tokens.{field}') > 0")),
-            "positivity must OR tokens.{field} (Task 4)"
-        );
-    }
-    for field in ["read", "write"] {
-        assert!(
-            probe.contains(&format!("$.tokens.cache.{field}') > 0")),
-            "positivity must OR cache.{field} (Task 4)"
-        );
-    }
     assert!(
-        probe.contains("> 0"),
-        "positivity is an OR over token fields, never a summing aggregation (Task 4)"
+        probe.contains(
+            "SELECT 1 FROM message WHERE strict_eligible(time_created, data) = 1 LIMIT 1"
+        ),
+        "the probe is one scalar-filtered constant-1 LIMIT 1 read (FR-30)"
     );
+    assert!(
+        probe.contains("create_scalar_function"),
+        "the probe registers a connection-local scalar (FR-30)"
+    );
+    let compact: String = probe.split_whitespace().collect();
+    assert!(
+        compact.contains("FunctionFlags::SQLITE_UTF8|FunctionFlags::SQLITE_DETERMINISTIC|FunctionFlags::SQLITE_DIRECTONLY"),
+        "the scalar is UTF8, deterministic, and direct-only (FR-30)"
+    );
+    assert!(
+        probe.contains("get_raw"),
+        "the scalar reads raw typed arguments (FR-30)"
+    );
+    for absent in [
+        "json_extract",
+        "json_type",
+        "TRIM(",
+        "instr(",
+        "substr(",
+        "LIKE ",
+        "typeof(",
+        "18446744073709551615",
+        "18446744073709551616",
+    ] {
+        assert!(
+            !probe.contains(absent),
+            "no lexical JSON scraping may remain in the probe: `{absent}` (FR-30)"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
