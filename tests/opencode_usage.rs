@@ -30,8 +30,8 @@ fn read(rel: &str) -> String {
 fn cargo_toml_pins_exact_bundled_rusqlite() {
     let cargo = read("Cargo.toml");
     assert!(
-        cargo.contains("rusqlite = { version = \"=0.31.0\", features = [\"bundled\"] }"),
-        "Cargo.toml must declare `rusqlite = {{ version = \"=0.31.0\", features = [\"bundled\"] }}` (FR-4)"
+        cargo.contains("rusqlite = { version = \"=0.31.0\", features = [\"bundled\", \"functions\"] }"),
+        "Cargo.toml must declare `rusqlite = {{ version = \"=0.31.0\", features = [\"bundled\", \"functions\"] }}` (FR-4)"
     );
 }
 
@@ -699,29 +699,41 @@ fn opencode_query_only_enabled_and_verified() {
     );
 }
 
+/// The collector's own query region (Task 4): the Task 2 query-shape
+/// contracts live there alone, because the availability probe
+/// legitimately adds a second bounded `message` read with `LIMIT 1`.
+fn collector_region(o: &str) -> String {
+    let start = o
+        .find("const MESSAGE_QUERY")
+        .expect("collector query const");
+    let end = o.find("const AVAILABLE_QUERY").unwrap_or(o.len());
+    o[start..end].to_string()
+}
+
 #[test]
 fn opencode_query_is_single_streamed_message_read_with_exact_bounds() {
     let o = opencode_prod();
+    let region = collector_region(&o);
     assert!(
         o.contains("SELECT time_created, data FROM message"),
         "selects only time_created and data from message (FR-9)"
     );
     assert!(
-        o.contains("time_created >= ?1"),
+        region.contains("time_created >= ?1"),
         "the lower bound is inclusive `>=` (FR-10)"
     );
     assert!(
-        o.contains("time_created < ?2"),
+        region.contains("time_created < ?2"),
         "the upper bound is exclusive `<` (FR-10)"
     );
     assert!(
-        o.contains("ORDER BY time_created, id"),
+        region.contains("ORDER BY time_created, id"),
         "deterministic order by time then id (FR-9/FR-10)"
     );
     assert_eq!(
-        o.matches("FROM ").count(),
+        region.matches("FROM ").count(),
         1,
-        "exactly one table read — message only (FR-9, NFR-1)"
+        "exactly one table read in the collector query — message only (FR-9, NFR-1)"
     );
     for absent in [
         "FROM event",
@@ -733,8 +745,8 @@ fn opencode_query_is_single_streamed_message_read_with_exact_bounds() {
         "LIMIT",
     ] {
         assert!(
-            !o.contains(absent),
-            "forbidden query shape `{absent}` (FR-9, NFR-1)"
+            !region.contains(absent),
+            "forbidden query shape `{absent}` in the collector query (FR-9, NFR-1)"
         );
     }
 }
@@ -893,4 +905,317 @@ fn opencode_task3_ignores_client_cost_and_preserves_fresh_input() {
         !o.contains("saturating_sub"),
         "cache is never subtracted from fresh input"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Task 4: bounded availability probe contracts (FR-13 parity, no collector
+// invocation, constant-select LIMIT 1, `opencode yes/no` row).
+// ---------------------------------------------------------------------------
+
+/// The availability probe region of production `src/local/opencode.rs`:
+/// the probe's SQL constant, the testable path-injected probe, and the
+/// production std probe — ending where the failure classifier begins.
+/// The bounded constant-select and no-collector contracts are pinned
+/// here — never on the whole file, which legitimately contains the
+/// collector query.
+fn probe_region(o: &str) -> String {
+    let start = o
+        .find("const AVAILABLE_QUERY")
+        .expect("availability probe query const");
+    let end = o.find("fn classify(").expect("failure classifier fn");
+    o[start..end].to_string()
+}
+
+#[test]
+fn opencode_availability_exposes_testable_and_production_probes() {
+    let o = opencode_prod();
+    assert!(
+        o.contains("pub fn available_from(path: &Path) -> bool"),
+        "a testable path-injected probe must exist (Task 4)"
+    );
+    assert!(
+        o.contains("pub fn available() -> bool"),
+        "a production std probe must exist (Task 4)"
+    );
+    let probe = probe_region(&o);
+    assert!(
+        probe.contains("metadata_class"),
+        "the probe reuses the metadata safety check (Task 4)"
+    );
+    assert!(
+        probe.contains("open_readonly"),
+        "the probe reuses the shared READONLY|NOMUTEX + 250 ms + query_only connection (Task 4)"
+    );
+    assert!(
+        o.contains("std_db_path"),
+        "the production probe resolves through the shared std path (Task 4)"
+    );
+}
+
+#[test]
+fn opencode_availability_probe_is_constant_select_with_limit_1() {
+    let probe = probe_region(&opencode_prod());
+    assert_eq!(
+        probe.matches("SELECT").count(),
+        1,
+        "the probe runs exactly one SELECT (Task 4)"
+    );
+    assert!(
+        probe.contains("SELECT 1") && probe.contains("LIMIT 1"),
+        "the probe is `SELECT 1 ... LIMIT 1` returning a constant (Task 4)"
+    );
+    assert_eq!(
+        probe.matches("FROM message").count(),
+        1,
+        "the probe reads the message table once and nothing else (Task 4)"
+    );
+    for absent in [
+        "SELECT *",
+        "JOIN",
+        "GROUP BY",
+        "ORDER BY",
+        "time_created >= ",
+        "time_created < ",
+        "collect::<Vec<",
+    ] {
+        assert!(
+            !probe.contains(absent),
+            "the probe must not contain `{absent}` (Task 4)"
+        );
+    }
+}
+
+#[test]
+fn opencode_availability_probe_never_calls_the_collector() {
+    let probe = probe_region(&opencode_prod());
+    for forbidden in [
+        "collect_from",
+        "collect(",
+        "stream_message_rows",
+        "parse_record",
+        "canonical_provider",
+        "MESSAGE_QUERY",
+    ] {
+        assert!(
+            !probe.contains(forbidden),
+            "the availability probe must not invoke `{forbidden}` (Task 4)"
+        );
+    }
+    assert!(
+        !probe.contains("fn collect") && !probe.contains("fn stream_message_rows"),
+        "no collector code may live inside the probe (Task 4)"
+    );
+    assert!(
+        probe.contains("query_row"),
+        "the probe reads at most one row through rusqlite (Task 4)"
+    );
+}
+
+#[test]
+fn opencode_availability_probe_is_scalar_filtered_limit_1_without_lexical_scraping() {
+    let probe = probe_region(&opencode_prod());
+    assert!(
+        probe.contains(
+            "SELECT 1 FROM message WHERE strict_eligible(time_created, data) = 1 LIMIT 1"
+        ),
+        "the probe is one scalar-filtered constant-1 LIMIT 1 read (FR-30)"
+    );
+    assert!(
+        probe.contains("create_scalar_function"),
+        "the probe registers a connection-local scalar (FR-30)"
+    );
+    let compact: String = probe.split_whitespace().collect();
+    assert!(
+        compact.contains("FunctionFlags::SQLITE_UTF8|FunctionFlags::SQLITE_DETERMINISTIC|FunctionFlags::SQLITE_DIRECTONLY"),
+        "the scalar is UTF8, deterministic, and direct-only (FR-30)"
+    );
+    assert!(
+        probe.contains("get_raw"),
+        "the scalar reads raw typed arguments (FR-30)"
+    );
+    for absent in [
+        "json_extract",
+        "json_type",
+        "TRIM(",
+        "instr(",
+        "substr(",
+        "LIKE ",
+        "typeof(",
+        "18446744073709551615",
+        "18446744073709551616",
+    ] {
+        assert!(
+            !probe.contains(absent),
+            "no lexical JSON scraping may remain in the probe: `{absent}` (FR-30)"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Task 4 black-box: `llmu providers` status row over isolated synthetic
+// databases (NFR-8). Integration crates may use package dependencies, so
+// rusqlite writes the synthetic `message` table directly; llmu stays
+// binary-only and is never imported.
+// ---------------------------------------------------------------------------
+
+fn write_opencode_db(dir: &Path, rows: &[(i64, &str, &str)]) -> PathBuf {
+    fs::create_dir_all(dir).unwrap();
+    let path = dir.join("opencode.db");
+    let w = rusqlite::Connection::open(&path).unwrap();
+    w.execute_batch(
+        "CREATE TABLE message (id TEXT PRIMARY KEY, sessionID TEXT, time_created INTEGER, \
+         time_updated INTEGER, role TEXT, providerID TEXT, modelID TEXT, data TEXT)",
+    )
+    .unwrap();
+    for (t, id, data) in rows {
+        w.execute(
+            "INSERT INTO message (id, time_created, data) VALUES (?1, ?2, ?3)",
+            rusqlite::params![id, t, data],
+        )
+        .unwrap();
+    }
+    drop(w);
+    path
+}
+
+fn eligible_message(provider: &str) -> String {
+    format!(
+        r#"{{"role":"assistant","providerID":"{provider}","modelID":"model-a","time":{{"created":1000,"completed":1001}},"finish":"stop","tokens":{{"input":10,"output":20,"reasoning":5,"cache":{{"read":3,"write":2}}}}}}"#
+    )
+}
+
+/// An eligible OpenCode SQLite record prints `opencode yes` with the
+/// honest capability wording; no path, key, or diagnostic leaks.
+#[test]
+fn providers_prints_opencode_yes_for_eligible_db() {
+    let sb = Sandbox::new("avail-yes");
+    let dir = sb.dir.join("eligible-data");
+    write_opencode_db(&dir, &[(1000, "m1", &eligible_message("openai"))]);
+    let out = sb
+        .cmd(Some(&dir), Some(&sb.data()))
+        .args(["--config", sb.config_path().to_str().unwrap(), "providers"])
+        .output()
+        .expect("spawning llmu binary");
+    assert!(
+        out.status.success(),
+        "providers must succeed: {}",
+        sb.stderr(&out)
+    );
+    let stdout = sb.stdout(&out);
+    let row = stdout
+        .lines()
+        .find(|l| l.trim_start().starts_with("opencode"))
+        .expect("providers must list an opencode row");
+    assert!(
+        row.contains("yes"),
+        "an eligible OpenCode DB must report configured yes:\n{row}"
+    );
+    assert!(
+        row.contains(
+            "read-only local usage from OpenCode's SQLite message records across supported providers"
+        ),
+        "the capabilities wording must be exact:\n{row}"
+    );
+    assert!(
+        !stdout.contains("opencode.db") && !stdout.contains(dir.display().to_string().as_str()),
+        "no path diagnostics may reach output (Task 4):\n{stdout}"
+    );
+    assert!(
+        !sb.stderr(&out).contains("opencode"),
+        "no opencode diagnostics on stderr (Task 4): {}",
+        sb.stderr(&out)
+    );
+}
+
+/// Rejected-only and missing databases print `opencode no` with no
+/// diagnostics of any kind.
+#[test]
+fn providers_prints_opencode_no_for_rejected_and_missing_db() {
+    let sb = Sandbox::new("avail-no");
+    let rejected_dir = sb.dir.join("rejected-data");
+    let user_row = r#"{"role":"user","providerID":"openai","modelID":"model-a","time":{"created":1000,"completed":1001},"finish":"stop","tokens":{"input":10,"output":20,"reasoning":5,"cache":{"read":3,"write":2}}}"#;
+    write_opencode_db(&rejected_dir, &[(1000, "m1", user_row)]);
+    let out = sb
+        .cmd(Some(&rejected_dir), Some(&sb.data()))
+        .args(["--config", sb.config_path().to_str().unwrap(), "providers"])
+        .output()
+        .expect("spawning llmu binary");
+    assert!(
+        out.status.success(),
+        "providers must succeed: {}",
+        sb.stderr(&out)
+    );
+    let stdout = sb.stdout(&out);
+    let row = stdout
+        .lines()
+        .find(|l| l.trim_start().starts_with("opencode"))
+        .expect("providers must list an opencode row");
+    assert!(row.contains("no"), "a rejected-only DB answers no:\n{row}");
+    assert!(
+        !sb.stderr(&out).contains("note:"),
+        "status never surfaces diagnostics: {}",
+        sb.stderr(&out)
+    );
+
+    let missing_dir = sb.dir.join("missing-data");
+    let out = sb
+        .cmd(Some(&missing_dir), Some(&sb.data()))
+        .args(["--config", sb.config_path().to_str().unwrap(), "providers"])
+        .output()
+        .expect("spawning llmu binary");
+    assert!(
+        out.status.success(),
+        "providers must succeed: {}",
+        sb.stderr(&out)
+    );
+    let stdout = sb.stdout(&out);
+    let row = stdout
+        .lines()
+        .find(|l| l.trim_start().starts_with("opencode"))
+        .expect("providers must list an opencode row");
+    assert!(row.contains("no"), "a missing DB answers no:\n{row}");
+    assert!(
+        !sb.stderr(&out).contains("note:"),
+        "status never surfaces diagnostics: {}",
+        sb.stderr(&out)
+    );
+}
+
+/// A corrupt database still prints `opencode no`; raw sqlite error text
+/// and paths never leak into stdout or stderr.
+#[test]
+fn providers_opencode_status_never_leaks_db_diagnostics() {
+    let sb = Sandbox::new("avail-corrupt");
+    let dir = sb.dir.join("corrupt-data");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("opencode.db"), "this is not a sqlite database").unwrap();
+    let out = sb
+        .cmd(Some(&dir), Some(&sb.data()))
+        .args(["--config", sb.config_path().to_str().unwrap(), "providers"])
+        .output()
+        .expect("spawning llmu binary");
+    assert!(
+        out.status.success(),
+        "providers must succeed: {}",
+        sb.stderr(&out)
+    );
+    let stdout = sb.stdout(&out);
+    let row = stdout
+        .lines()
+        .find(|l| l.trim_start().starts_with("opencode"))
+        .expect("providers must list an opencode row");
+    assert!(row.contains("no"), "a corrupt DB answers no:\n{row}");
+    let combined = format!("{stdout}\n{}", sb.stderr(&out));
+    for leak in [
+        "not a sqlite",
+        "malformed",
+        "no such table",
+        "disk image",
+        "opencode.db",
+    ] {
+        assert!(
+            !combined.contains(leak),
+            "status must never surface DB diagnostics: `{leak}` in:\n{combined}"
+        );
+    }
 }

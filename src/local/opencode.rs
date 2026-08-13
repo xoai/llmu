@@ -9,6 +9,10 @@
 //! the rusqlite row iterator (FR-9/10/11/12). Completed assistant
 //! records are strictly validated, mapped through an explicit provider
 //! allowlist, normalized, and aggregated into hourly buckets (FR-13-22).
+//! Task 4 adds a bounded availability probe (`available_from` /
+//! `available`) that answers `llmu providers` status through one
+//! connection-local scalar reusing the exact shared strict decoder and
+//! record predicate; it never runs the collector.
 //! Nothing here creates, writes, copies, or snapshots the database
 //! (FR-6/7, NFR-5). Database notes are fixed literals and record notes
 //! interpolate counts only: no raw rusqlite error, path, SQL, JSON, id,
@@ -18,8 +22,12 @@ use crate::config::{Config, EnvLookup};
 use crate::local::Collected;
 use crate::types::{SourceKind, UsageEvent};
 use chrono::{DateTime, Timelike, Utc};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::functions::FunctionFlags;
+use rusqlite::types::ValueRef;
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -45,8 +53,11 @@ pub enum DbError {
 pub struct MessageRow {
     /// UTC epoch milliseconds (FR-10).
     pub time_created_ms: i64,
-    /// Raw `message.data` JSON text; parsing is Task 3.
-    pub data: String,
+    /// Raw `message.data` JSON text, present only when the SQLite
+    /// storage class is TEXT with valid UTF-8; BLOB/INTEGER/REAL/NULL
+    /// and invalid-UTF-8 TEXT surface as `None` and are counted
+    /// malformed, never a database failure (FR-14/FR-34).
+    pub data: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,12 +71,124 @@ struct ParsedRecord {
     cache_write_tokens: u64,
 }
 
+/// Strict serde `Deserialize` wrapper: builds the same
+/// `serde_json::Value` the collector reads, but rejects duplicate
+/// decoded object member names at ANY nesting depth before overwrite
+/// (FR-14). `serde_json::Value` alone silently keeps the last member.
+/// Equality is exact decoded Rust `String` equality — no Unicode
+/// normalization or case folding — so escaped/literal equivalents and
+/// embedded-NUL-equal names duplicate, while the same name in
+/// different object instances stays valid. Number, Unicode, recursion,
+/// and validity semantics are serde_json's own (u64 through
+/// `u64::MAX`, `-0` and 2^64 rejected, lone surrogates rejected,
+/// recursion limit preserved).
+#[derive(Debug, Clone, PartialEq)]
+struct StrictValue(serde_json::Value);
+
+impl<'de> Deserialize<'de> for StrictValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct StrictVisitor;
+
+        impl<'de> Visitor<'de> for StrictVisitor {
+            type Value = StrictValue;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a JSON value")
+            }
+
+            fn visit_bool<E>(self, v: bool) -> Result<StrictValue, E> {
+                Ok(StrictValue(serde_json::Value::Bool(v)))
+            }
+
+            fn visit_i64<E>(self, v: i64) -> Result<StrictValue, E> {
+                Ok(StrictValue(serde_json::Value::Number(v.into())))
+            }
+
+            fn visit_u64<E>(self, v: u64) -> Result<StrictValue, E> {
+                Ok(StrictValue(serde_json::Value::Number(v.into())))
+            }
+
+            fn visit_f64<E>(self, v: f64) -> Result<StrictValue, E>
+            where
+                E: de::Error,
+            {
+                serde_json::Number::from_f64(v)
+                    .map(|n| StrictValue(serde_json::Value::Number(n)))
+                    .ok_or_else(|| de::Error::custom("invalid JSON number"))
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<StrictValue, E> {
+                Ok(StrictValue(serde_json::Value::String(v.to_string())))
+            }
+
+            fn visit_string<E>(self, v: String) -> Result<StrictValue, E> {
+                Ok(StrictValue(serde_json::Value::String(v)))
+            }
+
+            fn visit_unit<E>(self) -> Result<StrictValue, E> {
+                Ok(StrictValue(serde_json::Value::Null))
+            }
+
+            fn visit_none<E>(self) -> Result<StrictValue, E> {
+                Ok(StrictValue(serde_json::Value::Null))
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> Result<StrictValue, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                deserializer.deserialize_any(StrictVisitor)
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<StrictValue, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut values = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(1024));
+                while let Some(value) = seq.next_element::<StrictValue>()? {
+                    values.push(value.0);
+                }
+                Ok(StrictValue(serde_json::Value::Array(values)))
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<StrictValue, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut object =
+                    serde_json::Map::with_capacity(map.size_hint().unwrap_or(0).min(1024));
+                while let Some((key, value)) = map.next_entry::<String, StrictValue>()? {
+                    if object.contains_key(&key) {
+                        return Err(de::Error::custom("duplicate object key"));
+                    }
+                    object.insert(key, value.0);
+                }
+                Ok(StrictValue(serde_json::Value::Object(object)))
+            }
+        }
+
+        deserializer.deserialize_any(StrictVisitor)
+    }
+}
+
+/// The one strict JSON decoder shared by collection and status (FR-14,
+/// FR-30): serde_json parsing through `StrictValue` so duplicate decoded
+/// object member names are rejected at any depth.
+fn decode_strict(raw: &str) -> Option<serde_json::Value> {
+    serde_json::from_str::<StrictValue>(raw)
+        .ok()
+        .map(|StrictValue(value)| value)
+}
+
 /// Strictly validate one completed assistant record before provider
 /// attribution (FR-13-FR-18). Required numeric fields are never
 /// defaulted; `as_u64` rejects null, negative, fractional, nonnumeric,
 /// and values outside u64. OpenCode's client-local `cost` is ignored.
 fn parse_record(db_time_created: i64, raw: &str) -> Option<ParsedRecord> {
-    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let value = decode_strict(raw)?;
     let object = value.as_object()?;
     if object.get("role")?.as_str()? != "assistant" {
         return None;
@@ -140,6 +263,17 @@ fn canonical_provider(provider_id: &str) -> Option<&'static str> {
     }
 }
 
+/// Status eligibility: the exact shared record predicate plus the
+/// provider allowlist (FR-30). The status scalar calls this; collection
+/// uses `parse_record` and classifies a strictly valid unknown provider
+/// as unsupported rather than malformed.
+fn status_eligible(db_time_created: i64, raw: &str) -> bool {
+    match parse_record(db_time_created, raw) {
+        Some(record) => canonical_provider(&record.provider_id).is_some(),
+        None => false,
+    }
+}
+
 /// The collector's single query (FR-9/FR-10/FR-11/FR-12): only the
 /// `message` table, only `time_created` and `data`, exact `[since,
 /// until)` bounds in UTC epoch milliseconds, deterministic order by
@@ -147,6 +281,84 @@ fn canonical_provider(provider_id: &str) -> Option<&'static str> {
 const MESSAGE_QUERY: &str = "SELECT time_created, data FROM message \
      WHERE time_created >= ?1 AND time_created < ?2 \
      ORDER BY time_created, id";
+
+/// Task 4 bounded eligibility probe: one constant-1 single-row read over
+/// `message` filtered by the connection-local `strict_eligible` scalar,
+/// which is the final eligibility authority (FR-30). SQLite does not
+/// independently coerce, path-read, duplicate-check, Unicode-decode, or
+/// range-check record JSON; every FR-13 invariant runs in the shared
+/// Rust decoder, so status and collection cannot diverge. The query may
+/// examine every row when no match exists; no candidate cap or window is
+/// applied, because either would create false `no` answers (NFR-2).
+const AVAILABLE_QUERY: &str =
+    "SELECT 1 FROM message WHERE strict_eligible(time_created, data) = 1 LIMIT 1";
+
+/// Register the probe's one private connection-local scalar (FR-30):
+/// UTF8, deterministic, and direct-only. It accepts exactly two
+/// arguments — database `time_created` and raw `data` — reads them
+/// type-tolerantly through `ValueRef`, and returns the boolean
+/// eligibility result. Non-text data, invalid UTF-8, malformed JSON,
+/// duplicate keys, strict record rejection, or an unsupported provider
+/// all answer `false`; record content never becomes a callback `Err`.
+fn register_status_scalar(conn: &Connection) -> rusqlite::Result<()> {
+    conn.create_scalar_function(
+        "strict_eligible",
+        2,
+        FunctionFlags::SQLITE_UTF8
+            | FunctionFlags::SQLITE_DETERMINISTIC
+            | FunctionFlags::SQLITE_DIRECTONLY,
+        move |ctx| {
+            let time_created = match ctx.get_raw(0) {
+                ValueRef::Integer(ms) => ms,
+                _ => return Ok(false),
+            };
+            let data = match ctx.get_raw(1) {
+                ValueRef::Text(bytes) => match std::str::from_utf8(bytes) {
+                    Ok(text) => text,
+                    Err(_) => return Ok(false),
+                },
+                _ => return Ok(false),
+            };
+            Ok(status_eligible(time_created, data))
+        },
+    )
+}
+
+/// Task 4 eligibility probe over a concrete database path: `yes` iff
+/// the metadata safety check passes, the shared READONLY|NOMUTEX +
+/// 250 ms + query_only connection succeeds, the private scalar
+/// registers, and the bounded SQL finds at least one eligible
+/// supported-provider assistant message. Every failure — missing,
+/// unreadable, busy, incompatible schema, corrupt, rejected-only —
+/// answers `false`; the status never prints DB diagnostics (FR-8).
+pub fn available_from(path: &Path) -> bool {
+    if metadata_class(path).is_err() {
+        return false;
+    }
+    let conn = match open_readonly(path) {
+        Ok(conn) => conn,
+        Err(_) => return false,
+    };
+    if register_status_scalar(&conn).is_err() {
+        return false;
+    }
+    matches!(
+        conn.query_row(AVAILABLE_QUERY, [], |row| row.get::<_, i64>(0))
+            .optional(),
+        Ok(Some(1))
+    )
+}
+
+/// Task 4 production eligibility probe: resolves the live database
+/// through the shared resolver and defers to `available_from`. The
+/// answer is a plain boolean — no note, path, or raw error ever
+/// reaches `llmu providers` output.
+pub fn available() -> bool {
+    match std_db_path() {
+        Some(path) => available_from(&path),
+        None => false,
+    }
+}
 
 /// Map a rusqlite failure to a bounded category (FR-8). Internal only:
 /// the raw error is never emitted. Covers both the open/query variants
@@ -186,7 +398,6 @@ fn std_env(k: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-#[allow(dead_code)] // std entry chain; wired by gather/CLI in Task 5
 fn std_db_path() -> Option<PathBuf> {
     db_path(&std_env, dirs::home_dir().as_deref())
 }
@@ -243,9 +454,16 @@ pub fn stream_message_rows(
         .query(rusqlite::params![since_ms, until_ms])
         .map_err(|e| classify(&e))?;
     while let Some(row) = rows.next().map_err(|e| classify(&e))? {
+        let data = match row.get_ref(1).map_err(|e| classify(&e))? {
+            ValueRef::Text(bytes) => match std::str::from_utf8(bytes) {
+                Ok(text) => Some(text.to_string()),
+                Err(_) => None,
+            },
+            _ => None,
+        };
         on_row(MessageRow {
             time_created_ms: row.get::<_, i64>(0).map_err(|e| classify(&e))?,
-            data: row.get::<_, String>(1).map_err(|e| classify(&e))?,
+            data,
         });
     }
     Ok(())
@@ -257,7 +475,7 @@ const NOTE_INCOMPATIBLE: &str = "opencode: local usage database schema is unsupp
 /// Collect from a concrete database path (FR-3/FR-25). Hermetic core:
 /// the path is injected so tests run against synthetic databases only
 /// (NFR-8); the std entry point resolves the live path. Events stay
-/// are staged until the row iterator completes, so a database-level
+/// staged until the row iterator completes, so a database-level
 /// failure cannot leak partial events or partial row counts (FR-34).
 pub fn collect_from(
     cfg: &Config,
@@ -289,7 +507,11 @@ pub fn collect_from(
     let mut malformed = 0u64;
     let mut unsupported = 0u64;
     let streamed = stream_message_rows(&conn, since_ms, until_ms, |row| {
-        let Some(record) = parse_record(row.time_created_ms, &row.data) else {
+        let Some(data) = row.data else {
+            malformed = malformed.saturating_add(1);
+            return;
+        };
+        let Some(record) = parse_record(row.time_created_ms, &data) else {
             malformed = malformed.saturating_add(1);
             return;
         };
@@ -609,9 +831,9 @@ mod tests {
             "exact [since, until) window excludes 100 and 400 (FR-10)"
         );
         assert_eq!(got[0].time_created_ms, 200);
-        assert_eq!(got[0].data, r#"{"text":"two"}"#);
+        assert_eq!(got[0].data.as_deref(), Some(r#"{"text":"two"}"#));
         assert_eq!(got[1].time_created_ms, 300);
-        assert_eq!(got[1].data, r#"{"text":"three"}"#);
+        assert_eq!(got[1].data.as_deref(), Some(r#"{"text":"three"}"#));
         let mut none = vec![];
         stream_message_rows(&conn, 400, 400, |r| none.push(r)).unwrap();
         assert!(
@@ -636,10 +858,11 @@ mod tests {
         assert_eq!(got.len(), 3);
         assert_eq!(got[0].time_created_ms, 100);
         assert_eq!(
-            got[1].data, r#"{"x":3}"#,
+            got[1].data.as_deref(),
+            Some(r#"{"x":3}"#),
             "same-time rows order by id (row-a before row-b) (FR-10)"
         );
-        assert_eq!(got[2].data, r#"{"x":1}"#);
+        assert_eq!(got[2].data.as_deref(), Some(r#"{"x":1}"#));
     }
 
     #[test]
@@ -1041,22 +1264,117 @@ mod tests {
     }
 
     #[test]
-    fn database_row_failure_discards_previously_staged_events_atomically() {
-        let dir = temp_dir("atomic");
-        let path = write_values(
-            &dir,
-            &[(100, "a-valid", valid_data("openai", "model-a", 100))],
+    fn non_text_and_invalid_utf8_data_is_malformed_not_database_failure() {
+        let dir = temp_dir("nontext");
+        let path = dir.join("opencode.db");
+        let w = Connection::open(&path).unwrap();
+        w.execute_batch(
+            "CREATE TABLE message (id TEXT PRIMARY KEY, sessionID TEXT, time_created INTEGER, \
+             time_updated INTEGER, role TEXT, providerID TEXT, modelID TEXT, data TEXT)",
+        )
+        .unwrap();
+        w.execute(
+            "INSERT INTO message (id, time_created, data) VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                "a-valid",
+                100_i64,
+                valid_data("openai", "model-a", 100).to_string()
+            ],
+        )
+        .unwrap();
+        w.execute(
+            "INSERT INTO message (id, time_created, data) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["z-blob", 200_i64, vec![0xff_u8]],
+        )
+        .unwrap();
+        w.execute(
+            "INSERT INTO message (id, time_created, data) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["z-int", 300_i64, 42_i64],
+        )
+        .unwrap();
+        w.execute(
+            "INSERT INTO message (id, time_created, data) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["z-real", 400_i64, 4.2_f64],
+        )
+        .unwrap();
+        w.execute(
+            "INSERT INTO message (id, time_created, data) VALUES (?1, ?2, CAST(?3 AS TEXT))",
+            rusqlite::params!["z-utf8", 500_i64, vec![0xff_u8]],
+        )
+        .unwrap();
+        w.execute(
+            "INSERT INTO message (id, time_created) VALUES (?1, ?2)",
+            rusqlite::params!["z-null", 600_i64],
+        )
+        .unwrap();
+        drop(w);
+        let out = collect_from(&Config::default(), &path, ms(0), ms(10_000));
+        assert_eq!(
+            out.events.len(),
+            1,
+            "the valid sibling row must still collect (FR-34)"
         );
-        let writer = Connection::open(&path).unwrap();
-        writer
-            .execute(
-                "INSERT INTO message (id, time_created, data) VALUES (?1, ?2, ?3)",
-                rusqlite::params!["z-invalid-type", 200_i64, vec![0xff_u8]],
-            )
-            .unwrap();
-        drop(writer);
-        let out = collect_from(&Config::default(), &path, ms(0), ms(1_000));
-        assert!(out.events.is_empty(), "partial events must be discarded");
+        assert_eq!(
+            out.notes,
+            vec!["opencode: skipped 5 malformed local usage record(s)"],
+            "non-text and invalid-UTF-8 data is malformed, never a database failure (FR-14)"
+        );
+        assert!(
+            available_from(&path),
+            "the eligible sibling still answers yes"
+        );
+        let before = snapshot(&path);
+        assert!(available_from(&path));
+        let after = snapshot(&path);
+        assert_eq!(
+            before, after,
+            "the probe never writes: length, hash, and mtime stay untouched (NFR-5)"
+        );
+    }
+
+    #[test]
+    fn genuine_row_failure_discards_staged_events_atomically() {
+        let dir = temp_dir("genuine-atomic");
+        let path = dir.join("opencode.db");
+        let w = Connection::open(&path).unwrap();
+        w.execute_batch(
+            "CREATE TABLE message (id TEXT PRIMARY KEY, sessionID TEXT, time_created INTEGER, \
+             time_updated INTEGER, role TEXT, providerID TEXT, modelID TEXT, data TEXT)",
+        )
+        .unwrap();
+        w.execute(
+            "INSERT INTO message (id, time_created, data) VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                "a-valid",
+                100_i64,
+                valid_data("openai", "model-a", 100).to_string()
+            ],
+        )
+        .unwrap();
+        w.execute(
+            "INSERT INTO message (id, time_created, data) VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                "z-real-time",
+                9_999.5_f64,
+                valid_data("openai", "model-b", 200).to_string()
+            ],
+        )
+        .unwrap();
+        w.execute(
+            "INSERT INTO message (id, time_created, data) VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                "b-valid",
+                300_i64,
+                valid_data("openai", "model-c", 300).to_string()
+            ],
+        )
+        .unwrap();
+        drop(w);
+        let out = collect_from(&Config::default(), &path, ms(0), ms(10_000));
+        assert!(
+            out.events.is_empty(),
+            "a genuine row failure after staged rows must discard everything (FR-34)"
+        );
         assert_eq!(
             out.notes,
             vec!["opencode: local usage database is busy or unreadable"]
@@ -1076,6 +1394,778 @@ mod tests {
         assert_eq!(
             out.notes,
             vec!["opencode: local usage database is busy or unreadable"]
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Task 4: bounded availability probe.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn available_missing_unreadable_and_incompatible_all_false() {
+        let dir = temp_dir("avail-missing");
+        assert!(
+            !available_from(&dir.join("opencode.db")),
+            "a missing database answers no (FR-3)"
+        );
+        let garbage = dir.join("garbage.db");
+        std::fs::write(&garbage, "definitely not a sqlite database").unwrap();
+        assert!(!available_from(&garbage), "a corrupt file answers no");
+        let empty = dir.join("empty.db");
+        Connection::open(&empty).unwrap();
+        assert!(
+            !available_from(&empty),
+            "a database without the message table answers no"
+        );
+    }
+
+    #[test]
+    fn available_eligible_db_yes_and_rejected_only_db_no() {
+        let eligible = write_values(
+            &temp_dir("avail-elig"),
+            &[(1_000, "m1", valid_data("openai", "model-a", 1_000))],
+        );
+        assert!(
+            available_from(&eligible),
+            "at least one eligible record answers yes"
+        );
+        let before = snapshot(&eligible);
+        assert!(available_from(&eligible));
+        let after = snapshot(&eligible);
+        assert_eq!(
+            before, after,
+            "the probe never writes: length, hash, and mtime stay untouched (NFR-5)"
+        );
+
+        let unknown = write_values(
+            &temp_dir("avail-rejected"),
+            &[(1_000, "m1", valid_data("private-unknown", "model-a", 1_000))],
+        );
+        assert!(
+            !available_from(&unknown),
+            "records from unsupported providers answer no"
+        );
+        let generic = write_values(
+            &temp_dir("avail-generic"),
+            &[(1_000, "m1", valid_data("opencode", "model-a", 1_000))],
+        );
+        assert!(
+            !available_from(&generic),
+            "the generic `opencode` provider id answers no"
+        );
+    }
+
+    #[test]
+    fn available_finds_any_eligible_record_without_window_bound() {
+        let path = write_values(
+            &temp_dir("avail-window"),
+            &[(0, "ancient", valid_data("deepseek", "model-a", 0))],
+        );
+        assert!(
+            available_from(&path),
+            "eligibility is window-free: an ancient eligible record still answers yes"
+        );
+    }
+
+    #[test]
+    fn available_parity_accepted_finishes_and_aliases_also_collect() {
+        let aliases = [
+            "alibaba",
+            "alibaba-cn",
+            "alibaba-coding-plan",
+            "alibaba-coding-plan-cn",
+            "alibaba-token-plan",
+            "alibaba-token-plan-cn",
+            "bailian-token-plan-personal",
+            "zai",
+            "zai-coding-plan",
+            "zhipuai",
+            "zhipuai-coding-plan",
+            "deepseek",
+            "kimi-for-coding",
+            "moonshot",
+            "moonshotai",
+            "kimi",
+            "openai",
+        ];
+        let mut case = 0;
+        for alias in aliases {
+            for finish in ["tool-calls", "stop", "length"] {
+                let mut data = valid_data(alias, "model-a", 1_000);
+                data["finish"] = serde_json::json!(finish);
+                data["error"] = serde_json::Value::Null;
+                let path = write_values(
+                    &temp_dir(&format!("avail-accept-{case}")),
+                    &[(1_000, &format!("m-{case}"), data)],
+                );
+                assert!(
+                    available_from(&path),
+                    "alias {alias} with finish {finish} must answer yes"
+                );
+                let out = collect_from(&Config::default(), &path, ms(0), ms(10_000));
+                assert_eq!(
+                    out.events.len(),
+                    1,
+                    "alias {alias} with finish {finish} must collect an event"
+                );
+                assert!(out.notes.is_empty(), "notes: {:?}", out.notes);
+                case += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn available_parity_rejected_dimensions_collect_nothing() {
+        let base = valid_data("openai", "model-a", 1_000);
+        let mut invalid = Vec::new();
+        invalid.push(serde_json::json!([{ "role": "assistant" }]));
+        for role in ["user", "system"] {
+            let mut v = base.clone();
+            v["role"] = serde_json::json!(role);
+            invalid.push(v);
+        }
+        let mut v = base.clone();
+        v["error"] = serde_json::json!({"name": "safe-test-error"});
+        invalid.push(v);
+        let mut v = base.clone();
+        v["finish"] = serde_json::json!("cancelled");
+        invalid.push(v);
+        for provider in ["  ", "OpenAI", "opencode", "private-unknown"] {
+            let mut v = base.clone();
+            v["providerID"] = serde_json::json!(provider);
+            invalid.push(v);
+        }
+        let mut v = base.clone();
+        v["providerID"] = serde_json::json!(42);
+        invalid.push(v);
+        for model in [
+            serde_json::Value::Null,
+            serde_json::json!("  "),
+            serde_json::json!(7),
+        ] {
+            let mut v = base.clone();
+            v["modelID"] = model;
+            invalid.push(v);
+        }
+        for created in [serde_json::json!(-1), serde_json::json!(1.5)] {
+            let mut v = base.clone();
+            v["time"]["created"] = created;
+            invalid.push(v);
+        }
+        for completed in [serde_json::json!(-1), serde_json::json!(1.5)] {
+            let mut v = base.clone();
+            v["time"]["completed"] = completed;
+            invalid.push(v);
+        }
+        let mut v = base.clone();
+        v["time"].as_object_mut().unwrap().remove("completed");
+        invalid.push(v);
+        let mut v = base.clone();
+        v["time"].as_object_mut().unwrap().remove("created");
+        invalid.push(v);
+        let mut v = base.clone();
+        v["time"]["created"] = serde_json::json!(999);
+        invalid.push(v); // the DB row time_created stays 1000 -> mismatch
+        for input in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::Value::Null,
+        ] {
+            let mut v = base.clone();
+            v["tokens"]["input"] = input;
+            invalid.push(v);
+        }
+        for output in [serde_json::json!(-1), serde_json::json!(1.5)] {
+            let mut v = base.clone();
+            v["tokens"]["output"] = output;
+            invalid.push(v);
+        }
+        let mut v = base.clone();
+        v["tokens"]["reasoning"] = serde_json::Value::Null;
+        invalid.push(v);
+        let mut v = base.clone();
+        v["tokens"]["cache"]["read"] = serde_json::json!({});
+        invalid.push(v);
+        let mut v = base.clone();
+        v["tokens"]["cache"]["write"] = serde_json::json!(-1);
+        invalid.push(v);
+        let mut v = base.clone();
+        v["tokens"]["cache"] = serde_json::Value::Null;
+        invalid.push(v);
+        let mut v = base.clone();
+        v["tokens"]["cache"].as_object_mut().unwrap().remove("read");
+        invalid.push(v);
+        let mut v = base.clone();
+        v["tokens"] = serde_json::json!([]);
+        invalid.push(v);
+        let mut v = base.clone();
+        v["tokens"]["input"] = serde_json::json!(0);
+        v["tokens"]["output"] = serde_json::json!(0);
+        v["tokens"]["reasoning"] = serde_json::json!(0);
+        v["tokens"]["cache"]["read"] = serde_json::json!(0);
+        v["tokens"]["cache"]["write"] = serde_json::json!(0);
+        invalid.push(v);
+
+        for (index, data) in invalid.into_iter().enumerate() {
+            let path = write_values(
+                &temp_dir(&format!("avail-reject-{index}")),
+                &[(1_000, "m", data)],
+            );
+            assert!(
+                !available_from(&path),
+                "rejected case {index} must answer no"
+            );
+            let out = collect_from(&Config::default(), &path, ms(0), ms(10_000));
+            assert_eq!(
+                out.events.len(),
+                0,
+                "rejected case {index} must collect no events"
+            );
+        }
+
+        let malformed = write_db(
+            &temp_dir("avail-reject-malformed"),
+            &[(1_000, "m", "{not json")],
+        );
+        assert!(!available_from(&malformed), "malformed JSON answers no");
+        let out = collect_from(&Config::default(), &malformed, ms(0), ms(10_000));
+        assert_eq!(out.events.len(), 0);
+    }
+
+    #[test]
+    fn available_parity_overflowing_json_integer_literals_answer_no() {
+        for (index, literal) in ["9223372036854775808", "18446744073709551616"]
+            .iter()
+            .enumerate()
+        {
+            let row = format!(
+                r#"{{"role":"assistant","providerID":"openai","modelID":"m","time":{{"created":{literal},"completed":1}},"finish":"stop","tokens":{{"input":1,"output":0,"reasoning":0,"cache":{{"read":0,"write":0}}}}}}"#
+            );
+            let path = write_db(
+                &temp_dir(&format!("avail-overflow-time-{index}")),
+                &[(1, "m", &row)],
+            );
+            assert!(
+                !available_from(&path),
+                "created literal {literal} must answer no"
+            );
+            let out = collect_from(&Config::default(), &path, ms(0), ms(10_000));
+            assert_eq!(
+                out.events.len(),
+                0,
+                "created literal {literal} must collect no events"
+            );
+        }
+        let row = r#"{"role":"assistant","providerID":"openai","modelID":"m","time":{"created":1,"completed":2},"finish":"stop","tokens":{"input":18446744073709551616,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}"#;
+        let path = write_db(&temp_dir("avail-overflow-token"), &[(1, "m", row)]);
+        assert!(
+            !available_from(&path),
+            "an input token literal past u64 must answer no"
+        );
+        let out = collect_from(&Config::default(), &path, ms(0), ms(10_000));
+        assert_eq!(out.events.len(), 0);
+    }
+
+    #[test]
+    fn parser_accepts_token_buckets_at_2p63_and_u64max() {
+        for bucket in [9_223_372_036_854_775_808u64, u64::MAX] {
+            for field in ["input", "output", "reasoning"] {
+                let mut data = valid_data("openai", "model-a", 1_000);
+                data["tokens"][field] = serde_json::json!(bucket);
+                let parsed = parse_record(1_000, &data.to_string())
+                    .unwrap_or_else(|| panic!("{field} at {bucket} must parse"));
+                assert!(
+                    parsed.input_tokens > 0 || parsed.output_tokens > 0,
+                    "{field} at {bucket} must produce a positive total"
+                );
+            }
+            for field in ["read", "write"] {
+                let mut data = valid_data("openai", "model-a", 1_000);
+                data["tokens"]["cache"][field] = serde_json::json!(bucket);
+                let parsed = parse_record(1_000, &data.to_string())
+                    .unwrap_or_else(|| panic!("cache.{field} at {bucket} must parse"));
+                assert!(
+                    parsed.cache_read_tokens > 0 || parsed.cache_write_tokens > 0,
+                    "cache.{field} at {bucket} must produce a positive total"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn available_parity_token_buckets_u64_range_yes_and_2p64_no() {
+        for (field, cache) in [
+            ("input", false),
+            ("output", false),
+            ("reasoning", false),
+            ("read", true),
+            ("write", true),
+        ] {
+            for bucket in [9_223_372_036_854_775_808u64, u64::MAX] {
+                let mut data = valid_data("openai", "model-a", 1_000);
+                if cache {
+                    data["tokens"]["cache"][field] = serde_json::json!(bucket);
+                } else {
+                    data["tokens"][field] = serde_json::json!(bucket);
+                }
+                let path = write_values(
+                    &temp_dir(&format!("avail-tok-{field}-{bucket}")),
+                    &[(1_000, "m", data)],
+                );
+                assert!(
+                    available_from(&path),
+                    "tokens.{field} at {bucket} must answer yes"
+                );
+                let out = collect_from(&Config::default(), &path, ms(0), ms(10_000));
+                assert_eq!(
+                    out.events.len(),
+                    1,
+                    "tokens.{field} at {bucket} must collect an event"
+                );
+            }
+        }
+        let base = r#"{"role":"assistant","providerID":"openai","modelID":"m","time":{"created":1000,"completed":1001},"finish":"stop","tokens":{"input":10,"output":20,"reasoning":5,"cache":{"read":3,"write":2}}}"#;
+        for (field, literal) in [
+            ("input", r#""input":10"#),
+            ("output", r#""output":20"#),
+            ("reasoning", r#""reasoning":5"#),
+            ("read", r#""read":3"#),
+            ("write", r#""write":2"#),
+        ] {
+            let row = base.replace(literal, &format!("\"{field}\":18446744073709551616"));
+            let path = write_db(
+                &temp_dir(&format!("avail-2p64-{field}")),
+                &[(1_000, "m", &row)],
+            );
+            assert!(
+                !available_from(&path),
+                "tokens.{field} literal 18446744073709551616 must answer no"
+            );
+            let out = collect_from(&Config::default(), &path, ms(0), ms(10_000));
+            assert_eq!(
+                out.events.len(),
+                0,
+                "tokens.{field} literal 18446744073709551616 must collect nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn available_parity_created_upper_bound_matches_locked_chrono() {
+        let created_max = 8_210_266_876_799_999i64;
+        assert!(
+            DateTime::<Utc>::from_timestamp_millis(created_max).is_some(),
+            "the locked Chrono must accept created_max"
+        );
+        assert!(
+            DateTime::<Utc>::from_timestamp_millis(created_max + 1).is_none(),
+            "the locked Chrono must reject created_max + 1"
+        );
+        assert!(
+            DateTime::<Utc>::from_timestamp_millis(i64::MAX).is_none(),
+            "the locked Chrono must reject i64::MAX milliseconds"
+        );
+        for (created, expect) in [
+            (created_max, true),
+            (created_max + 1, false),
+            (i64::MAX, false),
+        ] {
+            let mut data = valid_data("openai", "model-a", 1_000);
+            data["time"]["created"] = serde_json::json!(created);
+            data["time"]["completed"] = serde_json::json!(created);
+            let row = data.to_string();
+            assert_eq!(
+                parse_record(created, &row).is_some(),
+                expect,
+                "parser must agree on created {created}"
+            );
+            let path = write_db(
+                &temp_dir(&format!("avail-created-{created}")),
+                &[(created, "m", &row)],
+            );
+            assert_eq!(
+                available_from(&path),
+                expect,
+                "probe must agree on created {created}"
+            );
+            let conn = open_readonly(&path).unwrap();
+            let mut rows = vec![];
+            stream_message_rows(&conn, 0, created.saturating_add(1), |r| rows.push(r)).unwrap();
+            assert_eq!(
+                rows.iter()
+                    .filter(|r| r.data.as_deref().is_some_and(|d| parse_record(
+                        r.time_created_ms,
+                        d
+                    )
+                    .is_some()))
+                    .count(),
+                usize::from(expect),
+                "the collector must agree on created {created}"
+            );
+        }
+        let mut near = valid_data("openai", "model-a", created_max - 60_000);
+        near["time"]["created"] = serde_json::json!(created_max - 60_000);
+        near["time"]["completed"] = serde_json::json!(created_max - 60_000);
+        let path = write_values(
+            &temp_dir("avail-created-near-max"),
+            &[(created_max - 60_000, "m", near)],
+        );
+        let out = collect_from(&Config::default(), &path, ms(0), ms(created_max));
+        assert_eq!(
+            out.events.len(),
+            1,
+            "collect must accept large created values"
+        );
+    }
+
+    #[test]
+    fn available_parity_whitespace_trim_matches_rust_trim() {
+        for provider in [
+            "\nopenai\t",
+            " \topenai\r\n",
+            "\u{3000}openai\u{85}",
+            "\u{2003}openai\u{2028}",
+        ] {
+            let mut data = valid_data(provider, "model-a", 1_000);
+            data["cost"] = serde_json::Value::Null;
+            let path = write_values(
+                &temp_dir(&format!("avail-ws-p-{}", provider.escape_default())),
+                &[(1_000, "m", data)],
+            );
+            assert!(
+                available_from(&path),
+                "provider {provider:?} must trim to an allowlisted id"
+            );
+            let out = collect_from(&Config::default(), &path, ms(0), ms(10_000));
+            assert_eq!(out.events.len(), 1, "provider {provider:?}");
+            assert_eq!(out.events[0].provider, "openai");
+        }
+        for provider in ["\t \n", " \u{3000}\u{2003} ", "\r\n\t"] {
+            let data = valid_data(provider, "model-a", 1_000);
+            let path = write_values(
+                &temp_dir(&format!("avail-ws-pempty-{}", provider.escape_default())),
+                &[(1_000, "m", data)],
+            );
+            assert!(
+                !available_from(&path),
+                "whitespace-only provider {provider:?} must answer no"
+            );
+            let out = collect_from(&Config::default(), &path, ms(0), ms(10_000));
+            assert_eq!(out.events.len(), 0, "whitespace-only provider {provider:?}");
+        }
+        for model in ["\nmodel-a\t", "\u{2003}model-a\u{2028}"] {
+            let mut data = valid_data("openai", model, 1_000);
+            data["cost"] = serde_json::Value::Null;
+            let path = write_values(
+                &temp_dir(&format!("avail-ws-m-{}", model.escape_default())),
+                &[(1_000, "m", data)],
+            );
+            assert!(
+                available_from(&path),
+                "model {model:?} must trim to a nonempty id"
+            );
+            let out = collect_from(&Config::default(), &path, ms(0), ms(10_000));
+            assert_eq!(out.events.len(), 1, "model {model:?}");
+            assert_eq!(out.events[0].model, "model-a");
+        }
+        for model in ["\t\n", "\u{3000} "] {
+            let data = valid_data("openai", model, 1_000);
+            let path = write_values(
+                &temp_dir(&format!("avail-ws-mempty-{}", model.escape_default())),
+                &[(1_000, "m", data)],
+            );
+            assert!(
+                !available_from(&path),
+                "whitespace-only model {model:?} must answer no"
+            );
+            let out = collect_from(&Config::default(), &path, ms(0), ms(10_000));
+            assert_eq!(out.events.len(), 0, "whitespace-only model {model:?}");
+        }
+    }
+
+    #[test]
+    fn available_parity_lexical_negative_zero_rejected() {
+        let base = r#"{"role":"assistant","providerID":"openai","modelID":"m","time":{"created":1000,"completed":1001},"finish":"stop","tokens":{"input":10,"output":20,"reasoning":5,"cache":{"read":3,"write":2}}}"#;
+        for (needle, replacement, time_created) in [
+            (r#""created":1000"#, r#""created":-0"#, 0),
+            (r#""completed":1001"#, r#""completed":-0"#, 1_000),
+            (r#""input":10"#, r#""input":-0"#, 1_000),
+            (r#""output":20"#, r#""output":-0"#, 1_000),
+            (r#""reasoning":5"#, r#""reasoning":-0"#, 1_000),
+            (r#""read":3"#, r#""read":-0"#, 1_000),
+            (r#""write":2"#, r#""write":-0"#, 1_000),
+        ] {
+            let row = base.replace(needle, replacement);
+            assert!(
+                parse_record(time_created, &row).is_none(),
+                "the parser must reject {needle} as {replacement}"
+            );
+            let path = write_db(
+                &temp_dir(&format!("avail-negzero-{needle}")),
+                &[(time_created, "m", &row)],
+            );
+            assert!(
+                !available_from(&path),
+                "the probe must reject {needle} as {replacement}"
+            );
+            let out = collect_from(&Config::default(), &path, ms(0), ms(10_000));
+            assert_eq!(
+                out.events.len(),
+                0,
+                "{needle} as {replacement} must collect nothing"
+            );
+        }
+    }
+
+    /// Bidirectional status/collector parity for one raw JSON record:
+    /// the strict decoder, the probe, and the collector over a covering
+    /// window must all agree on eligibility (FR-13/14, FR-30).
+    fn assert_record_parity(index: usize, time_created: i64, raw: &str, expect: bool) {
+        assert_eq!(
+            parse_record(time_created, raw).is_some(),
+            expect,
+            "case {index}: parser parity for {raw}"
+        );
+        let path = write_db(
+            &temp_dir(&format!("parity-{index}")),
+            &[(time_created, "m", raw)],
+        );
+        assert_eq!(
+            available_from(&path),
+            expect,
+            "case {index}: probe parity for {raw}"
+        );
+        let out = collect_from(&Config::default(), &path, ms(0), ms(time_created + 60_000));
+        assert_eq!(
+            out.events.len(),
+            usize::from(expect),
+            "case {index}: collector parity for {raw}"
+        );
+    }
+
+    #[test]
+    fn strict_records_reject_duplicate_decoded_keys_at_any_depth() {
+        let rejected: Vec<String> = vec![
+            // Top-level literal duplicate.
+            r#"{"role":"assistant","role":"assistant","providerID":"openai","modelID":"m","time":{"created":1000,"completed":1001},"finish":"stop","tokens":{"input":10,"output":20,"reasoning":5,"cache":{"read":3,"write":2}}}"#.into(),
+            // Literal plus escaped equivalent duplicate.
+            r#"{"role":"assistant","\u0072ole":"assistant","providerID":"openai","modelID":"m","time":{"created":1000,"completed":1001},"finish":"stop","tokens":{"input":10,"output":20,"reasoning":5,"cache":{"read":3,"write":2}}}"#.into(),
+            // Duplicate inside a nested object.
+            r#"{"role":"assistant","providerID":"openai","modelID":"m","time":{"created":1000,"created":1000,"completed":1001},"finish":"stop","tokens":{"input":10,"output":20,"reasoning":5,"cache":{"read":3,"write":2}}}"#.into(),
+            // Duplicate inside an object nested in an array.
+            r#"{"role":"assistant","providerID":"openai","modelID":"m","time":{"created":1000,"completed":1001},"finish":"stop","tokens":{"input":10,"output":20,"reasoning":5,"cache":{"read":3,"write":2}},"extra":[{"x":1,"x":2}]}"#.into(),
+            // Embedded-NUL-equal keys duplicate.
+            r#"{"role":"assistant","providerID":"openai","modelID":"m","time":{"created":1000,"completed":1001},"finish":"stop","tokens":{"input":10,"output":20,"reasoning":5,"cache":{"read":3,"write":2}},"a\u0000b":1,"a\u0000b":2}"#.into(),
+        ];
+        for (index, raw) in rejected.iter().enumerate() {
+            assert_record_parity(index, 1_000, raw, false);
+        }
+        let accepted: Vec<String> = vec![
+            // The same key in different object instances stays valid.
+            r#"{"role":"assistant","providerID":"openai","modelID":"m","time":{"created":1000,"completed":1001},"finish":"stop","tokens":{"input":10,"output":20,"reasoning":5,"cache":{"read":3,"write":2}},"x":{"created":1},"y":{"created":2}}"#.into(),
+            // Case-distinct keys stay valid.
+            r#"{"role":"assistant","providerID":"openai","modelID":"m","time":{"created":1000,"completed":1001},"finish":"stop","tokens":{"input":10,"output":20,"reasoning":5,"cache":{"read":3,"write":2}},"Role":"user"}"#.into(),
+            // Normalization-distinct keys stay valid (U+00E9 vs U+0065 U+0301).
+            r#"{"role":"assistant","providerID":"openai","modelID":"m","time":{"created":1000,"completed":1001},"finish":"stop","tokens":{"input":10,"output":20,"reasoning":5,"cache":{"read":3,"write":2}},"caf\u00e9":1,"cafe\u0301":2}"#.into(),
+            // Embedded-NUL-distinct keys stay valid.
+            r#"{"role":"assistant","providerID":"openai","modelID":"m","time":{"created":1000,"completed":1001},"finish":"stop","tokens":{"input":10,"output":20,"reasoning":5,"cache":{"read":3,"write":2}},"a\u0000b":1,"a\u0000c":2}"#.into(),
+        ];
+        for (index, raw) in accepted.iter().enumerate() {
+            assert_record_parity(index + 100, 1_000, raw, true);
+        }
+    }
+
+    #[test]
+    fn available_parity_escaped_keys_formatting_and_decoy_keys() {
+        let cases: &[(&str, bool)] = &[
+            // Escaped key decodes to the exact required name.
+            (r#"{"role":"assistant","providerID":"openai","model\u0049D":"m","time":{"created":1000,"completed":1001},"finish":"stop","tokens":{"input":10,"output":20,"reasoning":5,"cache":{"read":3,"write":2}}}"#, true),
+            // Pretty-printed formatting between tokens is irrelevant.
+            ("{\n  \"role\": \"assistant\",\n  \"providerID\": \"openai\",\n  \"modelID\": \"m\",\n  \"time\": { \"created\": 1000, \"completed\": 1001 },\n  \"finish\": \"stop\",\n  \"tokens\": { \"input\": 10, \"output\": 20, \"reasoning\": 5, \"cache\": { \"read\": 3, \"write\": 2 } }\n}", true),
+            // Shuffled key order plus decoy extra keys stay valid.
+            (r#"{"role":"assistant","finish":"stop","providerID":"openai","modelID":"m","time":{"completed":1001,"created":1000},"tokens":{"cache":{"write":2,"read":3},"reasoning":5,"input":10,"output":20},"extra":"decoy"}"#, true),
+            // A decoy key does not satisfy a required field.
+            (r#"{"role":"assistant","providerID":"openai","modelID":"m","time":{"created":1000,"completed":1001},"finish":"stop","tokens":{"inputx":10,"output":20,"reasoning":5,"cache":{"read":3,"write":2}}}"#, false),
+        ];
+        for (index, (raw, expect)) in cases.iter().enumerate() {
+            assert_record_parity(index + 200, 1_000, raw, *expect);
+        }
+    }
+
+    #[test]
+    fn available_parity_surrogates_nul_and_excessive_nesting() {
+        let mut cases: Vec<(String, bool)> = vec![
+            // Lone high surrogate in a string field is invalid JSON.
+            (r#"{"role":"assistant","providerID":"openai","modelID":"\ud800","time":{"created":1000,"completed":1001},"finish":"stop","tokens":{"input":10,"output":20,"reasoning":5,"cache":{"read":3,"write":2}}}"#.into(), false),
+            // Lone low surrogate in a string field is invalid JSON.
+            (r#"{"role":"assistant","providerID":"\ude00","modelID":"m","time":{"created":1000,"completed":1001},"finish":"stop","tokens":{"input":10,"output":20,"reasoning":5,"cache":{"read":3,"write":2}}}"#.into(), false),
+            // Lone surrogate in a key is invalid JSON.
+            (r#"{"role":"assistant","providerID":"openai","modelID":"m","time":{"created":1000,"completed":1001},"finish":"stop","tokens":{"input":10,"output":20,"reasoning":5,"cache":{"read":3,"write":2}},"\ud800":1}"#.into(), false),
+            // A valid surrogate pair decodes to one scalar.
+            (r#"{"role":"assistant","providerID":"openai","modelID":"\ud83d\ude00","time":{"created":1000,"completed":1001},"finish":"stop","tokens":{"input":10,"output":20,"reasoning":5,"cache":{"read":3,"write":2}}}"#.into(), true),
+        ];
+        let base = r#"{"role":"assistant","providerID":"openai","modelID":"m","time":{"created":1000,"completed":1001},"finish":"stop","tokens":{"input":10,"output":20,"reasoning":5,"cache":{"read":3,"write":2}}}"#;
+        cases.push((
+            format!(
+                "{}{}{}{}",
+                &base[..base.len() - 3],
+                "}},\"extra\":",
+                "[".repeat(200),
+                format!("1{}", "]".repeat(200)).as_str(),
+            ) + "}",
+            false,
+        ));
+        cases.push((
+            format!(
+                "{}{}{}{}",
+                &base[..base.len() - 3],
+                "}},\"extra\":",
+                "[".repeat(50),
+                format!("1{}", "]".repeat(50)).as_str(),
+            ) + "}",
+            true,
+        ));
+        for (index, (raw, expect)) in cases.iter().enumerate() {
+            assert_record_parity(index + 300, 1_000, raw, *expect);
+        }
+
+        // An embedded NUL keeps the record strictly valid but the
+        // provider unsupported — classified as unsupported, not malformed.
+        let nul_provider = r#"{"role":"assistant","providerID":"openai\u0000","modelID":"m","time":{"created":1000,"completed":1001},"finish":"stop","tokens":{"input":10,"output":20,"reasoning":5,"cache":{"read":3,"write":2}}}"#;
+        assert!(
+            parse_record(1_000, nul_provider).is_some(),
+            "a NUL-suffixed provider id is still a strictly valid record"
+        );
+        let path = write_db(&temp_dir("nul-provider"), &[(1_000, "m", nul_provider)]);
+        assert!(!available_from(&path), "a NUL-suffixed provider answers no");
+        let out = collect_from(&Config::default(), &path, ms(0), ms(10_000));
+        assert_eq!(out.events.len(), 0);
+        assert_eq!(
+            out.notes,
+            vec!["opencode: skipped 1 local usage record(s) from unsupported provider(s)"]
+        );
+        // NUL in the model id stays eligible end to end.
+        let nul_model = r#"{"role":"assistant","providerID":"openai","modelID":"model-a\u0000","time":{"created":1000,"completed":1001},"finish":"stop","tokens":{"input":10,"output":20,"reasoning":5,"cache":{"read":3,"write":2}}}"#;
+        assert_record_parity(399, 1_000, nul_model, true);
+    }
+
+    #[test]
+    fn strict_decoder_rejects_duplicate_keys_at_any_depth() {
+        for raw in [
+            r#"{"a":1,"a":2}"#,
+            r#"{"a":1,"\u0061":2}"#,
+            r#"{"a":{"b":1,"b":2}}"#,
+            r#"{"a":[{"b":1,"b":2}]}"#,
+            r#"{"a\u0000b":1,"a\u0000b":2}"#,
+            r#"{"a":1,"b":{"c":2,"c":3}}"#,
+        ] {
+            assert!(
+                decode_strict(raw).is_none(),
+                "duplicate decoded keys must be rejected: {raw}"
+            );
+        }
+        for raw in [
+            r#"{"a":1,"b":2}"#,
+            r#"{"a":{"a":1},"b":{"a":2}}"#,
+            r#"{"A":1,"a":2}"#,
+            r#"{"caf\u00e9":1,"cafe\u0301":2}"#,
+            r#"{"a\u0000b":1,"a\u0000c":2}"#,
+            r#"{ "a" : 1 , "b" : 2 }"#,
+            r#"{"\u0061":1,"b":2}"#,
+        ] {
+            assert!(
+                decode_strict(raw).is_some(),
+                "distinct decoded keys must be accepted: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_decoder_rejects_excessive_nesting_and_out_of_range_numbers() {
+        let deep = format!("{}1{}", "[".repeat(200), "]".repeat(200));
+        assert!(
+            decode_strict(&deep).is_none(),
+            "200 array levels must exceed the serde recursion limit"
+        );
+        let ok = format!("{}1{}", "[".repeat(50), "]".repeat(50));
+        assert!(decode_strict(&ok).is_some(), "50 levels stay valid");
+        let deep_object = format!("{}0{}", r#"{"a":"#.repeat(200), "}".repeat(200));
+        assert!(
+            decode_strict(&deep_object).is_none(),
+            "200 object levels must exceed the serde recursion limit"
+        );
+        assert!(
+            decode_strict(r#"{"a":1e400}"#).is_none(),
+            "an out-of-range exponent is invalid JSON"
+        );
+        assert!(
+            decode_strict(r#"{"a":1e308}"#).is_some(),
+            "an in-range exponent is valid"
+        );
+        assert!(
+            decode_strict(r#"{"a":18446744073709551615}"#).is_some(),
+            "u64::MAX decodes"
+        );
+        // 2^64 and lexical -0 decode exactly like serde_json (f64
+        // numbers) and are rejected by the record predicate's as_u64.
+        let p64 = decode_strict(r#"{"a":18446744073709551616}"#).expect("2^64 decodes as f64");
+        assert!(p64["a"].as_u64().is_none(), "2^64 is not a u64");
+        let neg_zero = decode_strict(r#"{"a":-0}"#).expect("-0 decodes as f64");
+        assert!(neg_zero["a"].as_u64().is_none(), "lexical -0 is not a u64");
+        assert!(
+            decode_strict(r#"{"a":"\ud800"}"#).is_none(),
+            "a lone high surrogate is rejected"
+        );
+        assert!(
+            decode_strict(r#"{"a":"\ud83d\ude00"}"#).is_some(),
+            "a valid surrogate pair decodes"
+        );
+    }
+
+    #[test]
+    fn status_eligible_uses_shared_predicate_plus_provider_allowlist() {
+        let known = valid_data("openai", "model-a", 1_000);
+        assert!(status_eligible(1_000, &known.to_string()));
+        let unknown = valid_data("private-unknown", "model-a", 1_000);
+        assert!(!status_eligible(1_000, &unknown.to_string()));
+        assert!(
+            parse_record(1_000, &unknown.to_string()).is_some(),
+            "a strictly valid unknown provider stays a valid record — unsupported, not malformed"
+        );
+        let generic = valid_data("opencode", "model-a", 1_000);
+        assert!(!status_eligible(1_000, &generic.to_string()));
+        let mismatch = valid_data("openai", "model-a", 999);
+        assert!(!status_eligible(1_000, &mismatch.to_string()));
+        let duplicate = known.to_string().replacen(
+            r#""providerID":"openai""#,
+            r#""providerID":"openai","providerID":"openai""#,
+            1,
+        );
+        assert!(
+            !status_eligible(1_000, &duplicate),
+            "duplicate keys answer false"
+        );
+    }
+
+    #[test]
+    fn available_busy_db_waits_250ms_then_answers_no() {
+        let path = write_values(
+            &temp_dir("avail-busy"),
+            &[(1_000, "m1", valid_data("openai", "model-a", 1_000))],
+        );
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let start = Instant::now();
+        let answer = available_from(&path);
+        let elapsed = start.elapsed();
+        assert!(!answer, "a busy database answers no");
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "the busy bound is honored (NFR-3): {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "still bounded: {elapsed:?}"
         );
     }
 }

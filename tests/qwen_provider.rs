@@ -143,7 +143,8 @@ fn cargo_toml_dependencies_unchanged() {
                     ratatui = \"=0.26.3\"\n\
                     # pin: bundled SQLite for read-only OpenCode usage (FR-4, NFR-12) — exact\n\
                     # 0.31.0 compiles on rust-version 1.75; no system sqlite dependency.\n\
-                    rusqlite = { version = \"=0.31.0\", features = [\"bundled\"] }\n\
+                    # `functions` adds no transitive dependency (status scalar, FR-30).\n\
+                    rusqlite = { version = \"=0.31.0\", features = [\"bundled\", \"functions\"] }\n\
                     serde = { version = \"1.0\", features = [\"derive\"] }\n\
                     serde_json = \"1.0\"\n\
                     sha2 = \"=0.10.9\"\n\
