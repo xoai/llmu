@@ -212,7 +212,8 @@ impl Sandbox {
     /// provider env var removed. Tests then add args/env and `.output()`.
     fn cmd(&self, opencode_dir: Option<&Path>, xdg_data_home: Option<&Path>) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_llmu"));
-        c.env("HOME", self.home()).env("XDG_CONFIG_HOME", self.config());
+        c.env("HOME", self.home())
+            .env("XDG_CONFIG_HOME", self.config());
         match opencode_dir {
             Some(d) => {
                 c.env("OPENCODE_DATA_DIR", d);
@@ -279,7 +280,11 @@ impl Sandbox {
 fn opencode_auth_missing_everywhere_yields_no_credentials() {
     let sb = Sandbox::new("missing");
     let out = sb.run(&["--config", sb.config_path().to_str().unwrap(), "providers"]);
-    assert!(out.status.success(), "providers must succeed: {}", sb.stderr(&out));
+    assert!(
+        out.status.success(),
+        "providers must succeed: {}",
+        sb.stderr(&out)
+    );
     let stdout = sb.stdout(&out);
     assert!(
         !stdout.contains("auth.json"),
@@ -328,7 +333,11 @@ fn opencode_override_env_wins_and_all_provider_aliases_map() {
         .args(["--config", sb.config_path().to_str().unwrap(), "providers"])
         .output()
         .expect("spawning llmu binary");
-    assert!(out.status.success(), "providers must succeed: {}", sb.stderr(&out));
+    assert!(
+        out.status.success(),
+        "providers must succeed: {}",
+        sb.stderr(&out)
+    );
     let stdout = sb.stdout(&out);
     let path_str = path.display().to_string();
     assert!(
@@ -369,7 +378,11 @@ fn opencode_xdg_data_home_fallback_finds_auth() {
         r#"{"alibaba-token-plan": {"type": "api", "key": "sk-test-alibaba-token-plan"}}"#,
     );
     let out = sb.run(&["--config", sb.config_path().to_str().unwrap(), "providers"]);
-    assert!(out.status.success(), "providers must succeed: {}", sb.stderr(&out));
+    assert!(
+        out.status.success(),
+        "providers must succeed: {}",
+        sb.stderr(&out)
+    );
     let stdout = sb.stdout(&out);
     let path_str = path.display().to_string();
     assert!(
@@ -397,7 +410,11 @@ fn opencode_default_home_fallback_finds_auth() {
         .args(["--config", sb.config_path().to_str().unwrap(), "providers"])
         .output()
         .expect("spawning llmu binary");
-    assert!(out.status.success(), "providers must succeed: {}", sb.stderr(&out));
+    assert!(
+        out.status.success(),
+        "providers must succeed: {}",
+        sb.stderr(&out)
+    );
     let stdout = sb.stdout(&out);
     let path_str = path.display().to_string();
     assert!(
@@ -425,7 +442,11 @@ fn opencode_token_plan_aliases_fill_only_token_plan_key() {
         }"#,
     );
     let out = sb.run(&["--config", sb.config_path().to_str().unwrap(), "providers"]);
-    assert!(out.status.success(), "providers must succeed: {}", sb.stderr(&out));
+    assert!(
+        out.status.success(),
+        "providers must succeed: {}",
+        sb.stderr(&out)
+    );
     let stdout = sb.stdout(&out);
     let path_str = path.display().to_string();
     assert_eq!(
@@ -468,7 +489,11 @@ fn opencode_token_plan_fallback_loses_to_explicit_config() {
     )
     .unwrap();
     let out = sb.run(&["--config", sb.config_path().to_str().unwrap(), "providers"]);
-    assert!(out.status.success(), "providers must succeed: {}", sb.stderr(&out));
+    assert!(
+        out.status.success(),
+        "providers must succeed: {}",
+        sb.stderr(&out)
+    );
     let stdout = sb.stdout(&out);
     assert!(
         !stdout.contains("qwen.token_plan_key") && !stdout.contains("opencode auth"),
@@ -495,7 +520,11 @@ fn opencode_token_plan_fallback_loses_to_env() {
         .args(["--config", sb.config_path().to_str().unwrap(), "providers"])
         .output()
         .expect("spawning llmu binary");
-    assert!(out.status.success(), "providers must succeed: {}", sb.stderr(&out));
+    assert!(
+        out.status.success(),
+        "providers must succeed: {}",
+        sb.stderr(&out)
+    );
     let stdout = sb.stdout(&out);
     assert!(
         stdout.contains("env BAILIAN_TOKEN_PLAN_API_KEY"),
@@ -532,7 +561,11 @@ fn opencode_token_plan_fallback_loses_to_qwen_settings() {
     )
     .unwrap();
     let out = sb.run(&["--config", sb.config_path().to_str().unwrap(), "providers"]);
-    assert!(out.status.success(), "providers must succeed: {}", sb.stderr(&out));
+    assert!(
+        out.status.success(),
+        "providers must succeed: {}",
+        sb.stderr(&out)
+    );
     let stdout = sb.stdout(&out);
     let settings_path = sb.qwen_home().join("settings.json").display().to_string();
     assert!(
@@ -601,7 +634,10 @@ fn opencode_db_path_uses_shared_resolver_without_duplication() {
         o.contains("opencode_data_dir"),
         "the database path resolves through the shared resolver (FR-3)"
     );
-    assert!(o.contains("opencode.db"), "the database file is opencode.db (FR-3)");
+    assert!(
+        o.contains("opencode.db"),
+        "the database file is opencode.db (FR-3)"
+    );
     assert!(
         !o.contains("OPENCODE_DATA_DIR"),
         "no duplicate OPENCODE_DATA_DIR precedence logic (FR-2)"
@@ -748,12 +784,17 @@ fn opencode_metadata_notfound_is_silent_absence_and_other_failures_categorized()
 fn opencode_notes_are_fixed_and_secret_free() {
     let o = opencode_prod();
     assert!(
-        !o.contains("format!("),
-        "notes are fixed literals, never interpolated (FR-8)"
-    );
-    assert!(
         o.contains("opencode:"),
         "notes are bounded `opencode:` diagnostics (FR-8)"
+    );
+    assert_eq!(
+        o.matches("notes.push(format!(").count(),
+        2,
+        "only malformed and unsupported aggregate counts may format notes (FR-33)"
+    );
+    assert!(
+        !o.contains("format!(\"opencode: local usage database"),
+        "database notes stay fixed and never interpolate raw errors (FR-35)"
     );
 }
 
@@ -765,7 +806,7 @@ fn opencode_exposes_streaming_row_seam() {
         "the row seam is public for Task 3 (FR-11/FR-12)"
     );
     assert!(
-        o.contains("stmt.query"),
+        o.contains(".query(rusqlite::params!"),
         "rows flow through the rusqlite row iterator (FR-11)"
     );
     assert!(
@@ -784,5 +825,72 @@ fn opencode_collect_returns_shared_collected() {
     assert!(
         o.contains("Collected {"),
         "collect builds the shared Collected (FR-25)"
+    );
+}
+
+#[test]
+fn opencode_task3_declares_strict_parser_allowlist_aggregation_and_final_notes() {
+    let o = opencode_prod();
+    for needle in [
+        "fn parse_record",
+        "fn canonical_provider",
+        "saturating_add",
+        "estimate_cost",
+        "SourceKind::LocalLogs",
+        "opencode: skipped {malformed} malformed local usage record(s)",
+        "opencode: skipped {unsupported} local usage record(s) from unsupported provider(s)",
+        "opencode: local usage database is busy or unreadable",
+        "opencode: local usage database schema is unsupported",
+    ] {
+        assert!(
+            o.contains(needle),
+            "Task 3 production must contain `{needle}`"
+        );
+    }
+}
+
+#[test]
+fn opencode_task3_allowlist_contains_every_reviewed_alias_and_no_model_inference() {
+    let o = opencode_prod();
+    for alias in [
+        "alibaba",
+        "alibaba-cn",
+        "alibaba-coding-plan",
+        "alibaba-coding-plan-cn",
+        "alibaba-token-plan",
+        "alibaba-token-plan-cn",
+        "bailian-token-plan-personal",
+        "zai",
+        "zai-coding-plan",
+        "zhipuai",
+        "zhipuai-coding-plan",
+        "deepseek",
+        "kimi-for-coding",
+        "moonshot",
+        "moonshotai",
+        "kimi",
+        "openai",
+    ] {
+        assert!(
+            o.contains(&format!("\"{alias}\"")),
+            "missing provider alias {alias}"
+        );
+    }
+    assert!(
+        !o.contains("starts_with(\"qwen"),
+        "provider attribution never uses model prefixes"
+    );
+}
+
+#[test]
+fn opencode_task3_ignores_client_cost_and_preserves_fresh_input() {
+    let o = opencode_prod();
+    assert!(
+        !o.contains("[\"cost\"]"),
+        "OpenCode client cost is never read"
+    );
+    assert!(
+        !o.contains("saturating_sub"),
+        "cache is never subtracted from fresh input"
     );
 }
