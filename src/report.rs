@@ -137,6 +137,57 @@ pub fn fmt_int(n: u64) -> String {
     out
 }
 
+/// Compact human token count (`1.00k` / `11.1M` / `4.63B`). Keeps TUI
+/// columns narrow enough that cache-scale totals never truncate, and
+/// magnitudes stay readable at a glance.
+pub fn fmt_compact(n: u64) -> String {
+    let units: [(f64, &str); 5] = [(1e15, "P"), (1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "k")];
+    let x = n as f64;
+    for (i, (unit, suffix)) in units.iter().enumerate() {
+        if x >= *unit {
+            let m = x / unit;
+            let prec = if m < 10.0 {
+                2
+            } else if m < 100.0 {
+                1
+            } else {
+                0
+            };
+            let factor = 10f64.powi(prec);
+            let rounded = (m * factor).round() / factor;
+            if rounded >= 1000.0 {
+                if i == 0 {
+                    return format!("{:.0}{}", rounded, suffix);
+                }
+                let (next, next_suffix) = units[i - 1];
+                return format!("{:.2}{}", x / next, next_suffix);
+            }
+            let prec = if rounded < 10.0 {
+                2
+            } else if rounded < 100.0 {
+                1
+            } else {
+                0
+            };
+            return format!("{:.*}{}", prec, rounded, suffix);
+        }
+    }
+    n.to_string()
+}
+
+/// One-line token summary for the TUI header. Names the cache bucket
+/// explicitly so the breakdown adds up to the total:
+/// `tok <total> (in <fresh input> / out <output> / cache <read+write>)`.
+pub fn totals_summary(t: &Totals) -> String {
+    format!(
+        "tok {} (in {} / out {} / cache {})",
+        fmt_compact(t.total_tokens()),
+        fmt_compact(t.input_tokens),
+        fmt_compact(t.output_tokens),
+        fmt_compact(t.cache_read_tokens + t.cache_write_tokens),
+    )
+}
+
 pub fn fmt_cost(t: &Totals) -> String {
     if !t.has_cost {
         "-".into()
@@ -837,6 +888,36 @@ mod tests {
         assert_eq!(
             render_balance_history_csv(&[]),
             "from,to,provider,currency,opening,closing,spent,funded\n"
+        );
+    }
+
+    #[test]
+    fn compact_token_counts_use_readable_units_and_carry_rounding() {
+        assert_eq!(fmt_compact(0), "0");
+        assert_eq!(fmt_compact(999), "999");
+        assert_eq!(fmt_compact(1_000), "1.00k");
+        assert_eq!(fmt_compact(310_134), "310k");
+        assert_eq!(fmt_compact(11_088_638), "11.1M");
+        assert_eq!(fmt_compact(4_625_301_432), "4.63B");
+        assert_eq!(fmt_compact(9_996), "10.0k");
+        assert_eq!(fmt_compact(99_960), "100k");
+        assert_eq!(fmt_compact(999_999), "1.00M");
+        assert_eq!(fmt_compact(1_000_000_000_000_000), "1.00P");
+    }
+
+    #[test]
+    fn token_summary_labels_cache_so_the_breakdown_adds_up() {
+        let totals = Totals {
+            requests: 14_754,
+            input_tokens: 310_134,
+            output_tokens: 11_088_638,
+            cache_read_tokens: 4_613_902_660,
+            cache_write_tokens: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            totals_summary(&totals),
+            "tok 4.63B (in 310k / out 11.1M / cache 4.61B)"
         );
     }
 }

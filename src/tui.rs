@@ -340,11 +340,9 @@ fn draw(
             Style::new().bold().fg(Color::Cyan),
         ),
         Span::raw(format!(
-            "• req {} • tok {} (in {} / out {}) • ",
+            "• req {} • {} • ",
             report::fmt_int(g.requests),
-            report::fmt_int(g.total_tokens()),
-            report::fmt_int(g.input_tokens),
-            report::fmt_int(g.output_tokens),
+            report::totals_summary(&g),
         )),
         Span::styled(
             format!("est ${:.2}", g.est_cost_usd),
@@ -468,7 +466,7 @@ fn draw(
                 model.clone(),
                 src.clone(),
                 report::fmt_int(t.requests),
-                report::fmt_int(t.total_tokens()),
+                report::fmt_compact(t.total_tokens()),
                 report::fmt_cost(t),
             ])
             .style(Style::new().fg(provider_color(prov)))
@@ -824,5 +822,42 @@ mod tests {
     #[test]
     fn provider_color_maps_qwen_to_light_red() {
         assert_eq!(provider_color("qwen"), Color::LightRed);
+    }
+
+    /// The header names the cache bucket explicitly so the total
+    /// reconciles with fresh in/out, and cache-scale numbers render
+    /// compact instead of as 13-digit integers.
+    #[test]
+    fn header_labels_cached_tokens_separately_from_fresh_in_out() {
+        let d = Dashboard {
+            events: vec![UsageEvent {
+                provider: "anthropic".into(),
+                source: SourceKind::LocalLogs,
+                model: "claude-opus-5".into(),
+                start: Utc::now(),
+                requests: 14_754,
+                input_tokens: 310_134,
+                output_tokens: 11_088_638,
+                cache_read_tokens: 4_613_902_660,
+                cache_write_tokens: 0,
+                tool_calls: 0,
+                cost_usd: None,
+                cost_is_estimate: false,
+            }],
+            window_label: "30d".into(),
+            ..Default::default()
+        };
+        let backend = ratatui::backend::TestBackend::new(160, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|f| draw(f, &d, Period::Day, None, None, false))
+            .unwrap();
+
+        let rendered = terminal.backend().to_string();
+        assert!(
+            rendered.contains("tok 4.63B (in 310k / out 11.1M / cache 4.61B)"),
+            "header must label cache tokens so the total reconciles:\n{rendered}"
+        );
     }
 }
