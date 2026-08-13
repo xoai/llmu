@@ -1,4 +1,4 @@
-//! OpenCode local usage collector — foundation layer (Task 2).
+//! OpenCode local usage collector.
 //!
 //! Safely identifies the live database at
 //! `<discover::opencode_data_dir()>/opencode.db` (FR-3), probes metadata
@@ -6,18 +6,20 @@
 //! unreadable), opens strictly READONLY|NOMUTEX (FR-5), bounds busy
 //! waits to 250 ms (FR-6, NFR-3), forces `query_only` ON and verifies
 //! it, then streams exactly one time-bounded `message` query through
-//! the rusqlite row iterator (FR-9/10/11/12). Record parsing and
-//! normalization land in Task 3; this layer exposes the row seam and
-//! classifies failures into bounded, secret-free categories (FR-8).
+//! the rusqlite row iterator (FR-9/10/11/12). Completed assistant
+//! records are strictly validated, mapped through an explicit provider
+//! allowlist, normalized, and aggregated into hourly buckets (FR-13-22).
 //! Nothing here creates, writes, copies, or snapshots the database
-//! (FR-6/7, NFR-5), and notes are fixed literals: no raw rusqlite
-//! error, path, SQL, JSON, id, prompt, or credential can reach them
-//! (FR-8, NFR-6/7).
+//! (FR-6/7, NFR-5). Database notes are fixed literals and record notes
+//! interpolate counts only: no raw rusqlite error, path, SQL, JSON, id,
+//! prompt, or credential can reach them (FR-8, NFR-6/7).
 
-use crate::config::EnvLookup;
+use crate::config::{Config, EnvLookup};
 use crate::local::Collected;
-use chrono::{DateTime, Utc};
+use crate::types::{SourceKind, UsageEvent};
+use chrono::{DateTime, Timelike, Utc};
 use rusqlite::{Connection, OpenFlags};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -47,6 +49,97 @@ pub struct MessageRow {
     pub data: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedRecord {
+    provider_id: String,
+    model: String,
+    created: DateTime<Utc>,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+}
+
+/// Strictly validate one completed assistant record before provider
+/// attribution (FR-13-FR-18). Required numeric fields are never
+/// defaulted; `as_u64` rejects null, negative, fractional, nonnumeric,
+/// and values outside u64. OpenCode's client-local `cost` is ignored.
+fn parse_record(db_time_created: i64, raw: &str) -> Option<ParsedRecord> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let object = value.as_object()?;
+    if object.get("role")?.as_str()? != "assistant" {
+        return None;
+    }
+    if object.get("error").is_some_and(|error| !error.is_null()) {
+        return None;
+    }
+
+    let provider_id = object.get("providerID")?.as_str()?.trim();
+    let model = object.get("modelID")?.as_str()?.trim();
+    if provider_id.is_empty() || model.is_empty() {
+        return None;
+    }
+    if !matches!(
+        object.get("finish")?.as_str()?,
+        "tool-calls" | "stop" | "length"
+    ) {
+        return None;
+    }
+
+    let time = object.get("time")?.as_object()?;
+    let created_ms = i64::try_from(time.get("created")?.as_u64()?).ok()?;
+    i64::try_from(time.get("completed")?.as_u64()?).ok()?;
+    if created_ms != db_time_created {
+        return None;
+    }
+    let created = DateTime::from_timestamp_millis(created_ms)?;
+
+    let tokens = object.get("tokens")?.as_object()?;
+    let input_tokens = tokens.get("input")?.as_u64()?;
+    let output = tokens.get("output")?.as_u64()?;
+    let reasoning = tokens.get("reasoning")?.as_u64()?;
+    let cache = tokens.get("cache")?.as_object()?;
+    let cache_read_tokens = cache.get("read")?.as_u64()?;
+    let cache_write_tokens = cache.get("write")?.as_u64()?;
+    let output_tokens = output.saturating_add(reasoning);
+    let total = input_tokens
+        .saturating_add(output_tokens)
+        .saturating_add(cache_read_tokens)
+        .saturating_add(cache_write_tokens);
+    if total == 0 {
+        return None;
+    }
+
+    Some(ParsedRecord {
+        provider_id: provider_id.to_string(),
+        model: model.to_string(),
+        created,
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+    })
+}
+
+/// Exact, case-sensitive OpenCode provider attribution allowlist (FR-19/20).
+/// Whitespace is ignored, but model ids are never inspected or inferred.
+fn canonical_provider(provider_id: &str) -> Option<&'static str> {
+    match provider_id.trim() {
+        "alibaba"
+        | "alibaba-cn"
+        | "alibaba-coding-plan"
+        | "alibaba-coding-plan-cn"
+        | "alibaba-token-plan"
+        | "alibaba-token-plan-cn"
+        | "bailian-token-plan-personal" => Some("qwen"),
+        "zai" | "zai-coding-plan" | "zhipuai" | "zhipuai-coding-plan" => Some("glm"),
+        "deepseek" => Some("deepseek"),
+        "kimi-for-coding" | "moonshot" | "moonshotai" | "kimi" => Some("kimi"),
+        "openai" => Some("openai"),
+        _ => None,
+    }
+}
+
 /// The collector's single query (FR-9/FR-10/FR-11/FR-12): only the
 /// `message` table, only `time_created` and `data`, exact `[since,
 /// until)` bounds in UTC epoch milliseconds, deterministic order by
@@ -63,15 +156,13 @@ const MESSAGE_QUERY: &str = "SELECT time_created, data FROM message \
 fn classify(err: &rusqlite::Error) -> DbError {
     let (code, msg) = match err {
         rusqlite::Error::SqliteFailure(ffi_err, msg) => (Some(ffi_err.code), msg.as_deref()),
-        rusqlite::Error::SqlInputError { error, msg, .. } => {
-            (Some(error.code), Some(msg.as_str()))
-        }
+        rusqlite::Error::SqlInputError { error, msg, .. } => (Some(error.code), Some(msg.as_str())),
         _ => (None, None),
     };
     match code {
-        Some(
-            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked,
-        ) => DbError::Busy,
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
+            DbError::Busy
+        }
         Some(rusqlite::ErrorCode::NotADatabase) => DbError::Unreadable,
         _ if msg.is_some_and(|m| m.contains("no such table") || m.contains("no such column")) => {
             DbError::Incompatible
@@ -148,7 +239,9 @@ pub fn stream_message_rows(
     mut on_row: impl FnMut(MessageRow),
 ) -> Result<(), DbError> {
     let mut stmt = conn.prepare(MESSAGE_QUERY).map_err(|e| classify(&e))?;
-    let mut rows = stmt.query(rusqlite::params![since_ms, until_ms]).map_err(|e| classify(&e))?;
+    let mut rows = stmt
+        .query(rusqlite::params![since_ms, until_ms])
+        .map_err(|e| classify(&e))?;
     while let Some(row) = rows.next().map_err(|e| classify(&e))? {
         on_row(MessageRow {
             time_created_ms: row.get::<_, i64>(0).map_err(|e| classify(&e))?,
@@ -158,55 +251,118 @@ pub fn stream_message_rows(
     Ok(())
 }
 
-const NOTE_UNREADABLE: &str = "opencode: database unreadable (local usage skipped)";
-const NOTE_BUSY: &str = "opencode: database busy (local usage skipped)";
-const NOTE_INCOMPATIBLE: &str = "opencode: database schema incompatible (local usage skipped)";
+const NOTE_UNREADABLE: &str = "opencode: local usage database is busy or unreadable";
+const NOTE_INCOMPATIBLE: &str = "opencode: local usage database schema is unsupported";
 
 /// Collect from a concrete database path (FR-3/FR-25). Hermetic core:
 /// the path is injected so tests run against synthetic databases only
 /// (NFR-8); the std entry point resolves the live path. Events stay
-/// empty until Task 3 normalization (FR-25); failures emit only the
-/// fixed, secret-free notes above (FR-8/FR-34).
-pub fn collect_from(path: &Path, since: DateTime<Utc>, until: DateTime<Utc>) -> Collected {
-    let mut notes: Vec<String> = vec![];
+/// are staged until the row iterator completes, so a database-level
+/// failure cannot leak partial events or partial row counts (FR-34).
+pub fn collect_from(
+    cfg: &Config,
+    path: &Path,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+) -> Collected {
     match metadata_class(path) {
         Ok(()) => {}
         Err(DbError::Missing) => {
-            return Collected { events: vec![], notes };
+            return Collected {
+                events: vec![],
+                notes: vec![],
+            };
         }
         Err(_) => {
-            notes.push(NOTE_UNREADABLE.to_string());
-            return Collected { events: vec![], notes };
+            return database_failure(NOTE_UNREADABLE);
         }
     }
     let conn = match open_readonly(path) {
         Ok(conn) => conn,
-        Err(DbError::Busy) => {
-            notes.push(NOTE_BUSY.to_string());
-            return Collected { events: vec![], notes };
-        }
-        Err(_) => {
-            notes.push(NOTE_UNREADABLE.to_string());
-            return Collected { events: vec![], notes };
-        }
+        Err(_) => return database_failure(NOTE_UNREADABLE),
     };
     let since_ms = since.timestamp_millis();
     let until_ms = until.timestamp_millis();
-    match stream_message_rows(&conn, since_ms, until_ms, |_| {}) {
-        Ok(()) => {}
-        Err(DbError::Busy) => notes.push(NOTE_BUSY.to_string()),
-        Err(DbError::Incompatible) => notes.push(NOTE_INCOMPATIBLE.to_string()),
-        Err(_) => notes.push(NOTE_UNREADABLE.to_string()),
+
+    // (hour, provider, model) -> [requests, input, output, cache read, cache write]
+    let mut aggregate: BTreeMap<(DateTime<Utc>, String, String), [u64; 5]> = BTreeMap::new();
+    let mut malformed = 0u64;
+    let mut unsupported = 0u64;
+    let streamed = stream_message_rows(&conn, since_ms, until_ms, |row| {
+        let Some(record) = parse_record(row.time_created_ms, &row.data) else {
+            malformed = malformed.saturating_add(1);
+            return;
+        };
+        let Some(provider) = canonical_provider(&record.provider_id) else {
+            unsupported = unsupported.saturating_add(1);
+            return;
+        };
+        let hour = record
+            .created
+            .with_minute(0)
+            .and_then(|time| time.with_second(0))
+            .and_then(|time| time.with_nanosecond(0))
+            .expect("valid UTC timestamp can be truncated to an hour");
+        let entry = aggregate
+            .entry((hour, provider.to_string(), record.model))
+            .or_default();
+        entry[0] = entry[0].saturating_add(1);
+        entry[1] = entry[1].saturating_add(record.input_tokens);
+        entry[2] = entry[2].saturating_add(record.output_tokens);
+        entry[3] = entry[3].saturating_add(record.cache_read_tokens);
+        entry[4] = entry[4].saturating_add(record.cache_write_tokens);
+    });
+    if let Err(error) = streamed {
+        return match error {
+            DbError::Incompatible => database_failure(NOTE_INCOMPATIBLE),
+            _ => database_failure(NOTE_UNREADABLE),
+        };
     }
-    Collected { events: vec![], notes }
+
+    let events = aggregate
+        .into_iter()
+        .map(|((start, provider, model), values)| UsageEvent {
+            cost_usd: cfg.estimate_cost(&model, values[1], values[2], values[3], values[4]),
+            provider,
+            source: SourceKind::LocalLogs,
+            model,
+            start,
+            requests: values[0],
+            input_tokens: values[1],
+            output_tokens: values[2],
+            cache_read_tokens: values[3],
+            cache_write_tokens: values[4],
+            tool_calls: 0,
+            cost_is_estimate: true,
+        })
+        .collect();
+    let mut notes = vec![];
+    if malformed > 0 {
+        notes.push(format!(
+            "opencode: skipped {malformed} malformed local usage record(s)"
+        ));
+    }
+    if unsupported > 0 {
+        notes.push(format!(
+            "opencode: skipped {unsupported} local usage record(s) from unsupported provider(s)"
+        ));
+    }
+    Collected { events, notes }
+}
+
+fn database_failure(note: &str) -> Collected {
+    Collected {
+        events: vec![],
+        notes: vec![note.to_string()],
+    }
 }
 
 /// Std entry point (FR-3): resolves the live database through the
 /// shared resolver and defers to `collect_from`.
 #[allow(dead_code)] // not yet reachable; gather/CLI wiring lands in Task 5
-pub fn collect(since: DateTime<Utc>, until: DateTime<Utc>) -> Collected {
+pub fn collect(cfg: &Config, since: DateTime<Utc>, until: DateTime<Utc>) -> Collected {
     match std_db_path() {
-        Some(path) => collect_from(&path, since, until),
+        Some(path) => collect_from(cfg, &path, since, until),
         None => Collected {
             events: vec![],
             notes: vec![],
@@ -217,6 +373,7 @@ pub fn collect(since: DateTime<Utc>, until: DateTime<Utc>) -> Collected {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use chrono::{DateTime, Utc};
     use rusqlite::Connection;
     use std::collections::hash_map::DefaultHasher;
@@ -262,12 +419,51 @@ mod tests {
         DateTime::from_timestamp_millis(t).unwrap()
     }
 
+    fn config_with_price(model: &str, price: [f64; 4]) -> Config {
+        let mut cfg = Config::default();
+        cfg.pricing.insert(model.to_string(), price);
+        cfg
+    }
+
+    fn valid_data(provider: &str, model: &str, created: i64) -> serde_json::Value {
+        serde_json::json!({
+            "role": "assistant",
+            "providerID": provider,
+            "modelID": model,
+            "time": {"created": created, "completed": created + 1},
+            "finish": "stop",
+            "tokens": {
+                "input": 10,
+                "output": 20,
+                "reasoning": 5,
+                "cache": {"read": 3, "write": 2}
+            }
+        })
+    }
+
+    fn write_values(dir: &Path, rows: &[(i64, &str, serde_json::Value)]) -> PathBuf {
+        let owned: Vec<(i64, &str, String)> = rows
+            .iter()
+            .map(|(time, id, data)| (*time, *id, data.to_string()))
+            .collect();
+        let borrowed: Vec<(i64, &str, &str)> = owned
+            .iter()
+            .map(|(time, id, data)| (*time, *id, data.as_str()))
+            .collect();
+        write_db(dir, &borrowed)
+    }
+
     fn no_env(_k: &str) -> Option<String> {
         None
     }
 
     fn env_pairs<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
-        move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+        move |k: &str| {
+            pairs
+                .iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+        }
     }
 
     fn snapshot(path: &Path) -> (u64, u64, SystemTime) {
@@ -285,7 +481,10 @@ mod tests {
     fn db_path_joins_opencode_db_after_shared_resolver() {
         let home = Path::new("/tmp/llmu-opencode-t2-home");
         assert_eq!(
-            db_path(&env_pairs(&[("XDG_DATA_HOME", "/tmp/llmu-xdg")]), Some(home)),
+            db_path(
+                &env_pairs(&[("XDG_DATA_HOME", "/tmp/llmu-xdg")]),
+                Some(home)
+            ),
             Some(PathBuf::from("/tmp/llmu-xdg/opencode/opencode.db")),
             "XDG_DATA_HOME resolves to <xdg>/opencode/opencode.db (FR-3)"
         );
@@ -311,7 +510,12 @@ mod tests {
     #[test]
     fn collect_missing_db_is_silent_with_no_events_or_notes() {
         let dir = temp_dir("missing");
-        let out = collect_from(&dir.join("opencode.db"), ms(0), ms(1000));
+        let out = collect_from(
+            &Config::default(),
+            &dir.join("opencode.db"),
+            ms(0),
+            ms(1000),
+        );
         assert!(
             out.events.is_empty(),
             "no database -> no events (FR-3/FR-34)"
@@ -328,17 +532,21 @@ mod tests {
         let dir = temp_dir("meta");
         let blocker = dir.join("blocker");
         std::fs::write(&blocker, "x").unwrap();
-        let out = collect_from(&blocker.join("opencode.db"), ms(0), ms(1000));
+        let out = collect_from(
+            &Config::default(),
+            &blocker.join("opencode.db"),
+            ms(0),
+            ms(1000),
+        );
         assert!(out.events.is_empty());
         assert_eq!(
             out.notes.len(),
             1,
             "a non-NotFound metadata failure is categorized (FR-3)"
         );
-        assert!(
-            out.notes[0].contains("unreadable"),
-            "category: {:?}",
-            out.notes[0]
+        assert_eq!(
+            out.notes[0],
+            "opencode: local usage database is busy or unreadable"
         );
         assert!(
             !out.notes[0].contains("blocker"),
@@ -352,10 +560,13 @@ mod tests {
         let dir = temp_dir("garbage");
         let path = dir.join("opencode.db");
         std::fs::write(&path, "this is definitely not a sqlite database").unwrap();
-        let out = collect_from(&path, ms(0), ms(1000));
+        let out = collect_from(&Config::default(), &path, ms(0), ms(1000));
         assert!(out.events.is_empty());
         assert_eq!(out.notes.len(), 1);
-        assert!(out.notes[0].contains("unreadable"));
+        assert_eq!(
+            out.notes[0],
+            "opencode: local usage database is busy or unreadable"
+        );
         assert!(
             !out.notes[0].contains("not a sqlite"),
             "raw failure text never leaks (FR-8): {:?}",
@@ -403,7 +614,10 @@ mod tests {
         assert_eq!(got[1].data, r#"{"text":"three"}"#);
         let mut none = vec![];
         stream_message_rows(&conn, 400, 400, |r| none.push(r)).unwrap();
-        assert!(none.is_empty(), "an empty half-open window yields no rows (FR-10)");
+        assert!(
+            none.is_empty(),
+            "an empty half-open window yields no rows (FR-10)"
+        );
     }
 
     #[test]
@@ -483,11 +697,14 @@ mod tests {
 
     #[test]
     fn collect_roundtrip_streams_readonly_without_events_or_notes() {
-        let path = write_db(&temp_dir("roundtrip"), &[(100, "m1", "{}"), (500, "m2", "{}")]);
-        let out = collect_from(&path, ms(0), ms(1000));
+        let path = write_values(
+            &temp_dir("roundtrip"),
+            &[(100, "m1", valid_data("openai", "model-a", 100))],
+        );
+        let out = collect_from(&Config::default(), &path, ms(0), ms(1000));
         assert!(
-            out.events.is_empty(),
-            "normalization belongs to Task 3 (FR-25)"
+            !out.events.is_empty(),
+            "Task 3 normalizes eligible records (FR-13-FR-18)"
         );
         assert!(
             out.notes.is_empty(),
@@ -501,13 +718,12 @@ mod tests {
         let dir = temp_dir("collect-incompat");
         let empty_db = dir.join("opencode.db");
         Connection::open(&empty_db).unwrap();
-        let out = collect_from(&empty_db, ms(0), ms(1000));
+        let out = collect_from(&Config::default(), &empty_db, ms(0), ms(1000));
         assert!(out.events.is_empty());
         assert_eq!(out.notes.len(), 1);
-        assert!(
-            out.notes[0].contains("incompatible"),
-            "note: {:?}",
-            out.notes[0]
+        assert_eq!(
+            out.notes[0],
+            "opencode: local usage database schema is unsupported"
         );
         assert!(
             !out.notes[0].contains("opencode.db"),
@@ -518,18 +734,348 @@ mod tests {
 
     #[test]
     fn collect_never_touches_db_bytes_hash_or_mtime() {
-        let path = write_db(
+        let path = write_values(
             &temp_dir("nfr5"),
-            &[(100, "m1", r#"{"text":"a"}"#), (200, "m2", r#"{"text":"b"}"#)],
+            &[(100, "m1", valid_data("openai", "model-a", 100))],
         );
         let before = snapshot(&path);
-        let out = collect_from(&path, ms(0), ms(1000));
-        assert!(out.events.is_empty());
+        let out = collect_from(&Config::default(), &path, ms(0), ms(1000));
+        assert_eq!(out.events.len(), 1);
         assert!(out.notes.is_empty());
         let after = snapshot(&path);
         assert_eq!(
             before, after,
             "read-only collect leaves length, hash, and mtime unchanged (NFR-5)"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_finish_states_and_normalizes_tokens_without_cache_subtraction() {
+        for finish in ["tool-calls", "stop", "length"] {
+            let mut data = valid_data("openai", " model-a ", 1_000);
+            data["finish"] = serde_json::json!(finish);
+            data["error"] = serde_json::Value::Null;
+            data["cost"] = serde_json::json!(999_999.0);
+            let parsed = parse_record(1_000, &data.to_string()).expect("eligible record");
+            assert_eq!(parsed.provider_id, "openai");
+            assert_eq!(parsed.model, "model-a");
+            assert_eq!(parsed.input_tokens, 10, "cache is not subtracted");
+            assert_eq!(parsed.output_tokens, 25, "reasoning folds into output");
+            assert_eq!(parsed.cache_read_tokens, 3);
+            assert_eq!(parsed.cache_write_tokens, 2);
+        }
+    }
+
+    #[test]
+    fn parser_rejects_every_required_field_failure() {
+        let base = valid_data("openai", "model-a", 1_000);
+        let mut invalid = Vec::new();
+        invalid.push(serde_json::json!([]));
+        invalid.push({
+            let mut v = base.clone();
+            v["role"] = serde_json::json!("user");
+            v
+        });
+        invalid.push({
+            let mut v = base.clone();
+            v["role"] = serde_json::json!("system");
+            v
+        });
+        invalid.push({
+            let mut v = base.clone();
+            v["error"] = serde_json::json!({"name":"safe-test-error"});
+            v
+        });
+        invalid.push({
+            let mut v = base.clone();
+            v["finish"] = serde_json::json!("cancelled");
+            v
+        });
+        invalid.push({
+            let mut v = base.clone();
+            v["providerID"] = serde_json::json!("  ");
+            v
+        });
+        invalid.push({
+            let mut v = base.clone();
+            v["modelID"] = serde_json::Value::Null;
+            v
+        });
+        invalid.push({
+            let mut v = base.clone();
+            v["modelID"] = serde_json::json!("  ");
+            v
+        });
+        invalid.push({
+            let mut v = base.clone();
+            v["time"]["created"] = serde_json::json!(-1);
+            v
+        });
+        invalid.push({
+            let mut v = base.clone();
+            v["time"]["completed"] = serde_json::json!(1.5);
+            v
+        });
+        invalid.push({
+            let mut v = base.clone();
+            v["time"]["completed"] = serde_json::json!(-1);
+            v
+        });
+        invalid.push({
+            let mut v = base.clone();
+            v["time"].as_object_mut().unwrap().remove("completed");
+            v
+        });
+        invalid.push({
+            let mut v = base.clone();
+            v["tokens"]["input"] = serde_json::json!(-1);
+            v
+        });
+        invalid.push({
+            let mut v = base.clone();
+            v["tokens"] = serde_json::json!([]);
+            v
+        });
+        invalid.push({
+            let mut v = base.clone();
+            v["tokens"]["output"] = serde_json::json!(1.5);
+            v
+        });
+        invalid.push({
+            let mut v = base.clone();
+            v["tokens"]["reasoning"] = serde_json::Value::Null;
+            v
+        });
+        invalid.push({
+            let mut v = base.clone();
+            v["tokens"]["cache"]["read"] = serde_json::json!({});
+            v
+        });
+        invalid.push({
+            let mut v = base.clone();
+            v["tokens"]["cache"] = serde_json::Value::Null;
+            v
+        });
+        invalid.push({
+            let mut v = base.clone();
+            v["tokens"]["cache"]
+                .as_object_mut()
+                .unwrap()
+                .remove("write");
+            v
+        });
+        invalid.push({
+            let mut v = base.clone();
+            v["tokens"]["input"] = serde_json::json!(0);
+            v["tokens"]["output"] = serde_json::json!(0);
+            v["tokens"]["reasoning"] = serde_json::json!(0);
+            v["tokens"]["cache"]["read"] = serde_json::json!(0);
+            v["tokens"]["cache"]["write"] = serde_json::json!(0);
+            v
+        });
+
+        assert!(parse_record(1_000, "not-json").is_none());
+        for (index, value) in invalid.into_iter().enumerate() {
+            assert!(
+                parse_record(1_000, &value.to_string()).is_none(),
+                "invalid required-field case {index} was accepted: {value}"
+            );
+        }
+        assert!(
+            parse_record(999, &base.to_string()).is_none(),
+            "database/data created timestamp mismatch rejects the row"
+        );
+        let too_large = r#"{"role":"assistant","providerID":"openai","modelID":"m","time":{"created":18446744073709551616,"completed":1},"finish":"stop","tokens":{"input":1,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}"#;
+        assert!(parse_record(1, too_large).is_none());
+        let invalid_timestamp = format!(
+            r#"{{"role":"assistant","providerID":"openai","modelID":"m","time":{{"created":{},"completed":{}}},"finish":"stop","tokens":{{"input":1,"output":0,"reasoning":0,"cache":{{"read":0,"write":0}}}}}}"#,
+            i64::MAX,
+            i64::MAX
+        );
+        assert!(parse_record(i64::MAX, &invalid_timestamp).is_none());
+        let token_overflow = r#"{"role":"assistant","providerID":"openai","modelID":"m","time":{"created":1,"completed":2},"finish":"stop","tokens":{"input":18446744073709551616,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}"#;
+        assert!(parse_record(1, token_overflow).is_none());
+    }
+
+    #[test]
+    fn provider_allowlist_is_exact_trimmed_and_case_sensitive() {
+        for (expected, ids) in [
+            (
+                "qwen",
+                &[
+                    "alibaba",
+                    "alibaba-cn",
+                    "alibaba-coding-plan",
+                    "alibaba-coding-plan-cn",
+                    "alibaba-token-plan",
+                    "alibaba-token-plan-cn",
+                    "bailian-token-plan-personal",
+                ][..],
+            ),
+            (
+                "glm",
+                &["zai", "zai-coding-plan", "zhipuai", "zhipuai-coding-plan"][..],
+            ),
+            ("deepseek", &["deepseek"][..]),
+            (
+                "kimi",
+                &["kimi-for-coding", "moonshot", "moonshotai", "kimi"][..],
+            ),
+            ("openai", &["openai"][..]),
+        ] {
+            for id in ids {
+                assert_eq!(canonical_provider(id), Some(expected), "alias {id}");
+                assert_eq!(canonical_provider(&format!(" {id} ")), Some(expected));
+            }
+        }
+        for id in ["opencode", "OpenAI", "QWEN", "unknown", ""] {
+            assert_eq!(canonical_provider(id), None, "unsupported id {id}");
+        }
+    }
+
+    #[test]
+    fn collector_aggregates_hourly_prices_normalized_buckets_and_exact_bounds() {
+        let hour = 3_600_000;
+        let mut first = valid_data("openai", "priced-model", hour);
+        first["cost"] = serde_json::json!(42_000.0);
+        let second = valid_data("openai", "priced-model", hour + 3_599_999);
+        let excluded = valid_data("openai", "priced-model", hour + 3_600_000);
+        let path = write_values(
+            &temp_dir("aggregate"),
+            &[
+                (hour, "a", first),
+                (hour + 3_599_999, "b", second),
+                (hour + 3_600_000, "c", excluded),
+            ],
+        );
+        let cfg = config_with_price("priced-model", [1.0, 2.0, 3.0, 4.0]);
+        let out = collect_from(&cfg, &path, ms(hour), ms(hour + 3_600_000));
+        assert!(out.notes.is_empty(), "notes: {:?}", out.notes);
+        assert_eq!(out.events.len(), 1);
+        let event = &out.events[0];
+        assert_eq!(event.provider, "openai");
+        assert_eq!(event.model, "priced-model");
+        assert_eq!(event.start, ms(hour));
+        assert_eq!(event.requests, 2);
+        assert_eq!(event.input_tokens, 20);
+        assert_eq!(event.output_tokens, 50);
+        assert_eq!(event.cache_read_tokens, 6);
+        assert_eq!(event.cache_write_tokens, 4);
+        assert_eq!(event.tool_calls, 0);
+        assert!(event.cost_is_estimate);
+        let expected = (20.0 + 100.0 + 18.0 + 16.0) / 1_000_000.0;
+        assert_eq!(event.cost_usd, Some(expected), "OpenCode cost is ignored");
+    }
+
+    #[test]
+    fn collector_separates_keys_orders_deterministically_and_saturates() {
+        let mut saturated = valid_data("deepseek", "same-model", 3_600_000);
+        saturated["tokens"]["input"] = serde_json::json!(u64::MAX);
+        saturated["tokens"]["output"] = serde_json::json!(u64::MAX);
+        saturated["tokens"]["reasoning"] = serde_json::json!(1);
+        let mut saturated_next = saturated.clone();
+        saturated_next["time"]["created"] = serde_json::json!(3_600_001);
+        saturated_next["time"]["completed"] = serde_json::json!(3_600_002);
+        let path = write_values(
+            &temp_dir("separate"),
+            &[
+                (7_200_000, "z", valid_data("openai", "z-model", 7_200_000)),
+                (3_600_000, "b", saturated.clone()),
+                (3_600_001, "c", saturated_next),
+                (3_600_002, "a", valid_data("zai", "a-model", 3_600_002)),
+            ],
+        );
+        let out = collect_from(&Config::default(), &path, ms(0), ms(10_800_000));
+        assert_eq!(out.events.len(), 3);
+        assert_eq!(out.events[0].provider, "deepseek");
+        assert_eq!(out.events[0].requests, 2);
+        assert_eq!(out.events[0].input_tokens, u64::MAX);
+        assert_eq!(out.events[0].output_tokens, u64::MAX);
+        assert_eq!(
+            out.events[0].cost_usd, None,
+            "an unknown pricing key produces no estimate"
+        );
+        assert_eq!(out.events[1].provider, "glm");
+        assert_eq!(out.events[2].provider, "openai");
+        assert_eq!(out.events[2].start, ms(7_200_000));
+    }
+
+    #[test]
+    fn collector_counts_malformed_and_unsupported_once_without_leaking_values() {
+        let mut malformed_unknown = valid_data("private-unknown", "secret-model", 100);
+        malformed_unknown["finish"] = serde_json::json!("cancelled");
+        let path = write_values(
+            &temp_dir("notes"),
+            &[
+                (100, "private-id", malformed_unknown),
+                (
+                    200,
+                    "unknown-id",
+                    valid_data("private-unknown", "secret-model", 200),
+                ),
+                (
+                    300,
+                    "generic-id",
+                    valid_data("opencode", "secret-generic", 300),
+                ),
+            ],
+        );
+        let out = collect_from(&Config::default(), &path, ms(0), ms(1_000));
+        assert!(out.events.is_empty());
+        assert_eq!(
+            out.notes,
+            vec![
+                "opencode: skipped 1 malformed local usage record(s)",
+                "opencode: skipped 2 local usage record(s) from unsupported provider(s)",
+            ]
+        );
+        let notes = out.notes.join("\n");
+        for secret in [
+            "private-unknown",
+            "secret-model",
+            "secret-generic",
+            "private-id",
+        ] {
+            assert!(!notes.contains(secret));
+        }
+    }
+
+    #[test]
+    fn database_row_failure_discards_previously_staged_events_atomically() {
+        let dir = temp_dir("atomic");
+        let path = write_values(
+            &dir,
+            &[(100, "a-valid", valid_data("openai", "model-a", 100))],
+        );
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute(
+                "INSERT INTO message (id, time_created, data) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["z-invalid-type", 200_i64, vec![0xff_u8]],
+            )
+            .unwrap();
+        drop(writer);
+        let out = collect_from(&Config::default(), &path, ms(0), ms(1_000));
+        assert!(out.events.is_empty(), "partial events must be discarded");
+        assert_eq!(
+            out.notes,
+            vec!["opencode: local usage database is busy or unreadable"]
+        );
+    }
+
+    #[test]
+    fn collector_busy_failure_is_atomic_and_uses_exact_bounded_note() {
+        let path = write_values(
+            &temp_dir("collect-busy"),
+            &[(100, "a-valid", valid_data("openai", "model-a", 100))],
+        );
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let out = collect_from(&Config::default(), &path, ms(0), ms(1_000));
+        assert!(out.events.is_empty());
+        assert_eq!(
+            out.notes,
+            vec!["opencode: local usage database is busy or unreadable"]
         );
     }
 }
