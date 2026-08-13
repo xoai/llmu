@@ -548,3 +548,241 @@ fn opencode_token_plan_fallback_loses_to_qwen_settings() {
         "no key value may leak into output:\n{stdout}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Task 2 source contracts (FR-3, FR-5, FR-6, FR-8, FR-9, FR-10, FR-11, FR-12,
+// FR-25, FR-34, NFR-1, NFR-3, NFR-5, NFR-6/7, NFR-9). The collector is not
+// wired into the binary yet, so these pin the foundation textually; the
+// synthetic temporary-database behavior tests live inline in
+// `src/local/opencode.rs` where the private seam is reachable (NFR-8).
+// ---------------------------------------------------------------------------
+
+/// Production portion of `src/local/opencode.rs` (before `#[cfg(test)]`):
+/// inline fixtures legitimately carry synthetic write SQL (NFR-8), so the
+/// collector's query-shape contracts scan production only.
+fn opencode_prod() -> String {
+    let o = read("src/local/opencode.rs");
+    match o.find("#[cfg(test)]") {
+        Some(i) => o[..i].to_string(),
+        None => o,
+    }
+}
+
+#[test]
+fn local_owns_shared_collected_and_exports_opencode() {
+    let m = read("src/local/mod.rs");
+    assert!(
+        m.contains("pub mod opencode;"),
+        "local/mod.rs must export the opencode collector"
+    );
+    assert!(
+        m.contains("pub struct Collected"),
+        "local/mod.rs owns the shared Collected (FR-25)"
+    );
+    assert!(
+        m.contains("pub events") && m.contains("pub notes"),
+        "Collected carries events + notes (FR-25)"
+    );
+    let cc = read("src/local/claude_code.rs");
+    assert!(
+        !cc.contains("pub struct Collected"),
+        "claude_code must use the shared Collected, not define its own (FR-25)"
+    );
+    assert!(
+        cc.contains("use super::Collected") || cc.contains("use crate::local::Collected"),
+        "claude_code refers to the shared Collected (FR-25)"
+    );
+}
+
+#[test]
+fn opencode_db_path_uses_shared_resolver_without_duplication() {
+    let o = opencode_prod();
+    assert!(
+        o.contains("opencode_data_dir"),
+        "the database path resolves through the shared resolver (FR-3)"
+    );
+    assert!(o.contains("opencode.db"), "the database file is opencode.db (FR-3)");
+    assert!(
+        !o.contains("OPENCODE_DATA_DIR"),
+        "no duplicate OPENCODE_DATA_DIR precedence logic (FR-2)"
+    );
+    assert!(
+        !o.contains("XDG_DATA_HOME"),
+        "no duplicate XDG_DATA_HOME precedence logic (FR-2)"
+    );
+}
+
+#[test]
+fn opencode_open_flags_are_exactly_readonly_nomutex() {
+    let o = opencode_prod();
+    assert!(
+        o.contains("SQLITE_OPEN_READ_ONLY"),
+        "the database opens READONLY (FR-5)"
+    );
+    assert!(
+        o.contains("SQLITE_OPEN_NO_MUTEX"),
+        "the database opens NOMUTEX (FR-5)"
+    );
+    for absent in [
+        "SQLITE_OPEN_READ_WRITE",
+        "SQLITE_OPEN_CREATE",
+        "SQLITE_OPEN_URI",
+        "immutable",
+    ] {
+        assert!(
+            !o.contains(absent),
+            "forbidden open flag `{absent}` (FR-5/FR-7)"
+        );
+    }
+}
+
+#[test]
+fn opencode_busy_timeout_bounded_250ms() {
+    let o = opencode_prod();
+    assert!(
+        o.contains("busy_timeout(Duration::from_millis(250))"),
+        "the busy timeout is exactly 250 ms (FR-6, NFR-3)"
+    );
+}
+
+#[test]
+fn opencode_query_only_enabled_and_verified() {
+    let o = opencode_prod();
+    assert!(
+        o.contains("pragma_update(None, \"query_only\", true)"),
+        "query_only is set ON (FR-6)"
+    );
+    assert!(
+        o.contains("pragma_query_value(None, \"query_only\""),
+        "query_only is verified after being set (FR-6)"
+    );
+    assert_eq!(
+        o.matches("pragma_update").count(),
+        1,
+        "exactly one pragma set — nothing else may mutate connection state (FR-6)"
+    );
+}
+
+#[test]
+fn opencode_query_is_single_streamed_message_read_with_exact_bounds() {
+    let o = opencode_prod();
+    assert!(
+        o.contains("SELECT time_created, data FROM message"),
+        "selects only time_created and data from message (FR-9)"
+    );
+    assert!(
+        o.contains("time_created >= ?1"),
+        "the lower bound is inclusive `>=` (FR-10)"
+    );
+    assert!(
+        o.contains("time_created < ?2"),
+        "the upper bound is exclusive `<` (FR-10)"
+    );
+    assert!(
+        o.contains("ORDER BY time_created, id"),
+        "deterministic order by time then id (FR-9/FR-10)"
+    );
+    assert_eq!(
+        o.matches("FROM ").count(),
+        1,
+        "exactly one table read — message only (FR-9, NFR-1)"
+    );
+    for absent in [
+        "FROM event",
+        "FROM part",
+        "FROM transcript",
+        "SELECT *",
+        "JOIN",
+        "GROUP BY",
+        "LIMIT",
+    ] {
+        assert!(
+            !o.contains(absent),
+            "forbidden query shape `{absent}` (FR-9, NFR-1)"
+        );
+    }
+}
+
+#[test]
+fn opencode_has_no_write_sql_or_ddl() {
+    let o = opencode_prod();
+    for absent in [
+        "INSERT",
+        "UPDATE message",
+        "DELETE FROM",
+        "CREATE TABLE",
+        "DROP TABLE",
+        "ALTER TABLE",
+        "journal_mode",
+        "VACUUM",
+        "ATTACH",
+        "REPLACE INTO",
+    ] {
+        assert!(
+            !o.contains(absent),
+            "no write SQL or DDL may exist (FR-6/NFR-1/NFR-9): `{absent}`"
+        );
+    }
+}
+
+#[test]
+fn opencode_metadata_notfound_is_silent_absence_and_other_failures_categorized() {
+    let o = opencode_prod();
+    assert!(
+        o.contains("std::fs::metadata"),
+        "metadata is probed before open (FR-3)"
+    );
+    assert!(
+        o.contains("ErrorKind::NotFound"),
+        "NotFound is the one normal-absence path (FR-3)"
+    );
+    for cat in ["Missing", "Unreadable", "Busy", "Incompatible"] {
+        assert!(
+            o.contains(&format!("DbError::{cat}")),
+            "failure category DbError::{cat} must exist (FR-8)"
+        );
+    }
+}
+
+#[test]
+fn opencode_notes_are_fixed_and_secret_free() {
+    let o = opencode_prod();
+    assert!(
+        !o.contains("format!("),
+        "notes are fixed literals, never interpolated (FR-8)"
+    );
+    assert!(
+        o.contains("opencode:"),
+        "notes are bounded `opencode:` diagnostics (FR-8)"
+    );
+}
+
+#[test]
+fn opencode_exposes_streaming_row_seam() {
+    let o = opencode_prod();
+    assert!(
+        o.contains("pub fn stream_message_rows"),
+        "the row seam is public for Task 3 (FR-11/FR-12)"
+    );
+    assert!(
+        o.contains("stmt.query"),
+        "rows flow through the rusqlite row iterator (FR-11)"
+    );
+    assert!(
+        !o.contains("collect::<Vec<"),
+        "production never materializes rows (FR-11)"
+    );
+}
+
+#[test]
+fn opencode_collect_returns_shared_collected() {
+    let o = opencode_prod();
+    assert!(
+        o.contains("pub fn collect"),
+        "a collect entry exists for later wiring (FR-25)"
+    );
+    assert!(
+        o.contains("Collected {"),
+        "collect builds the shared Collected (FR-25)"
+    );
+}
