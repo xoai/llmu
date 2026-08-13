@@ -9,6 +9,9 @@
 //! the rusqlite row iterator (FR-9/10/11/12). Completed assistant
 //! records are strictly validated, mapped through an explicit provider
 //! allowlist, normalized, and aggregated into hourly buckets (FR-13-22).
+//! Task 4 adds a bounded availability probe (`available_from` /
+//! `available`) that answers `llmu providers` status with the same
+//! FR-13 invariants enforced in SQL; it never runs the collector.
 //! Nothing here creates, writes, copies, or snapshots the database
 //! (FR-6/7, NFR-5). Database notes are fixed literals and record notes
 //! interpolate counts only: no raw rusqlite error, path, SQL, JSON, id,
@@ -18,7 +21,7 @@ use crate::config::{Config, EnvLookup};
 use crate::local::Collected;
 use crate::types::{SourceKind, UsageEvent};
 use chrono::{DateTime, Timelike, Utc};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -148,6 +151,93 @@ const MESSAGE_QUERY: &str = "SELECT time_created, data FROM message \
      WHERE time_created >= ?1 AND time_created < ?2 \
      ORDER BY time_created, id";
 
+/// Task 4 bounded eligibility probe: a constant-1 single-row read over
+/// `message` with every FR-13 parser invariant enforced in SQL, so the
+/// status answer matches the collector exactly. SQLite JSON integers
+/// are signed 64-bit, but `json_type` reports 'integer' even for
+/// literals that overflow i64 — those surface as REAL at storage
+/// level — so each integer field also guards
+/// `typeof(json_extract(...)) = 'integer'` to bound extracted values
+/// inside i64 (and therefore u64) parser limits. Positivity of the
+/// normalized saturated total is expressed as an OR over the
+/// nonnegative token fields, avoiding SQLite signed-addition overflow.
+const AVAILABLE_QUERY: &str = "SELECT 1 FROM message WHERE \
+     json_valid(data) = 1 AND json_type(data) = 'object' \
+     AND json_extract(data, '$.role') = 'assistant' \
+     AND TRIM(json_extract(data, '$.providerID')) <> '' \
+     AND TRIM(json_extract(data, '$.providerID')) IN ( \
+         'alibaba', 'alibaba-cn', 'alibaba-coding-plan', 'alibaba-coding-plan-cn', \
+         'alibaba-token-plan', 'alibaba-token-plan-cn', 'bailian-token-plan-personal', \
+         'zai', 'zai-coding-plan', 'zhipuai', 'zhipuai-coding-plan', \
+         'deepseek', 'kimi-for-coding', 'moonshot', 'moonshotai', 'kimi', 'openai') \
+     AND json_type(data, '$.modelID') = 'text' \
+     AND TRIM(json_extract(data, '$.modelID')) <> '' \
+     AND json_type(data, '$.time.created') = 'integer' \
+     AND typeof(json_extract(data, '$.time.created')) = 'integer' \
+     AND json_extract(data, '$.time.created') >= 0 \
+     AND json_type(data, '$.time.completed') = 'integer' \
+     AND typeof(json_extract(data, '$.time.completed')) = 'integer' \
+     AND json_extract(data, '$.time.completed') >= 0 \
+     AND json_extract(data, '$.time.created') = time_created \
+     AND (json_type(data, '$.error') IS NULL OR json_type(data, '$.error') = 'null') \
+     AND json_extract(data, '$.finish') IN ('tool-calls', 'stop', 'length') \
+     AND json_type(data, '$.tokens') = 'object' \
+     AND json_type(data, '$.tokens.input') = 'integer' \
+     AND typeof(json_extract(data, '$.tokens.input')) = 'integer' \
+     AND json_extract(data, '$.tokens.input') >= 0 \
+     AND json_type(data, '$.tokens.output') = 'integer' \
+     AND typeof(json_extract(data, '$.tokens.output')) = 'integer' \
+     AND json_extract(data, '$.tokens.output') >= 0 \
+     AND json_type(data, '$.tokens.reasoning') = 'integer' \
+     AND typeof(json_extract(data, '$.tokens.reasoning')) = 'integer' \
+     AND json_extract(data, '$.tokens.reasoning') >= 0 \
+     AND json_type(data, '$.tokens.cache') = 'object' \
+     AND json_type(data, '$.tokens.cache.read') = 'integer' \
+     AND typeof(json_extract(data, '$.tokens.cache.read')) = 'integer' \
+     AND json_extract(data, '$.tokens.cache.read') >= 0 \
+     AND json_type(data, '$.tokens.cache.write') = 'integer' \
+     AND typeof(json_extract(data, '$.tokens.cache.write')) = 'integer' \
+     AND json_extract(data, '$.tokens.cache.write') >= 0 \
+     AND (json_extract(data, '$.tokens.input') > 0 \
+          OR json_extract(data, '$.tokens.output') > 0 \
+          OR json_extract(data, '$.tokens.reasoning') > 0 \
+          OR json_extract(data, '$.tokens.cache.read') > 0 \
+          OR json_extract(data, '$.tokens.cache.write') > 0) \
+     LIMIT 1";
+
+/// Task 4 eligibility probe over a concrete database path: `yes` iff
+/// the metadata safety check passes, the shared READONLY|NOMUTEX +
+/// 250 ms + query_only connection succeeds, and the bounded SQL finds
+/// at least one eligible supported-provider assistant message. Every
+/// failure — missing, unreadable, busy, incompatible schema, corrupt,
+/// rejected-only — answers `false`; the status never prints DB
+/// diagnostics (FR-8).
+pub fn available_from(path: &Path) -> bool {
+    if metadata_class(path).is_err() {
+        return false;
+    }
+    let conn = match open_readonly(path) {
+        Ok(conn) => conn,
+        Err(_) => return false,
+    };
+    matches!(
+        conn.query_row(AVAILABLE_QUERY, [], |row| row.get::<_, i64>(0))
+            .optional(),
+        Ok(Some(1))
+    )
+}
+
+/// Task 4 production eligibility probe: resolves the live database
+/// through the shared resolver and defers to `available_from`. The
+/// answer is a plain boolean — no note, path, or raw error ever
+/// reaches `llmu providers` output.
+pub fn available() -> bool {
+    match std_db_path() {
+        Some(path) => available_from(&path),
+        None => false,
+    }
+}
+
 /// Map a rusqlite failure to a bounded category (FR-8). Internal only:
 /// the raw error is never emitted. Covers both the open/query variants
 /// (`SqliteFailure`) and statement-preparation variants
@@ -186,7 +276,6 @@ fn std_env(k: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-#[allow(dead_code)] // std entry chain; wired by gather/CLI in Task 5
 fn std_db_path() -> Option<PathBuf> {
     db_path(&std_env, dirs::home_dir().as_deref())
 }
@@ -257,7 +346,7 @@ const NOTE_INCOMPATIBLE: &str = "opencode: local usage database schema is unsupp
 /// Collect from a concrete database path (FR-3/FR-25). Hermetic core:
 /// the path is injected so tests run against synthetic databases only
 /// (NFR-8); the std entry point resolves the live path. Events stay
-/// are staged until the row iterator completes, so a database-level
+/// staged until the row iterator completes, so a database-level
 /// failure cannot leak partial events or partial row counts (FR-34).
 pub fn collect_from(
     cfg: &Config,
@@ -1076,6 +1165,297 @@ mod tests {
         assert_eq!(
             out.notes,
             vec!["opencode: local usage database is busy or unreadable"]
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Task 4: bounded availability probe.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn available_missing_unreadable_and_incompatible_all_false() {
+        let dir = temp_dir("avail-missing");
+        assert!(
+            !available_from(&dir.join("opencode.db")),
+            "a missing database answers no (FR-3)"
+        );
+        let garbage = dir.join("garbage.db");
+        std::fs::write(&garbage, "definitely not a sqlite database").unwrap();
+        assert!(!available_from(&garbage), "a corrupt file answers no");
+        let empty = dir.join("empty.db");
+        Connection::open(&empty).unwrap();
+        assert!(
+            !available_from(&empty),
+            "a database without the message table answers no"
+        );
+    }
+
+    #[test]
+    fn available_eligible_db_yes_and_rejected_only_db_no() {
+        let eligible = write_values(
+            &temp_dir("avail-elig"),
+            &[(1_000, "m1", valid_data("openai", "model-a", 1_000))],
+        );
+        assert!(
+            available_from(&eligible),
+            "at least one eligible record answers yes"
+        );
+        let before = snapshot(&eligible);
+        assert!(available_from(&eligible));
+        let after = snapshot(&eligible);
+        assert_eq!(
+            before, after,
+            "the probe never writes: length, hash, and mtime stay untouched (NFR-5)"
+        );
+
+        let unknown = write_values(
+            &temp_dir("avail-rejected"),
+            &[(1_000, "m1", valid_data("private-unknown", "model-a", 1_000))],
+        );
+        assert!(
+            !available_from(&unknown),
+            "records from unsupported providers answer no"
+        );
+        let generic = write_values(
+            &temp_dir("avail-generic"),
+            &[(1_000, "m1", valid_data("opencode", "model-a", 1_000))],
+        );
+        assert!(
+            !available_from(&generic),
+            "the generic `opencode` provider id answers no"
+        );
+    }
+
+    #[test]
+    fn available_finds_any_eligible_record_without_window_bound() {
+        let path = write_values(
+            &temp_dir("avail-window"),
+            &[(0, "ancient", valid_data("deepseek", "model-a", 0))],
+        );
+        assert!(
+            available_from(&path),
+            "eligibility is window-free: an ancient eligible record still answers yes"
+        );
+    }
+
+    #[test]
+    fn available_parity_accepted_finishes_and_aliases_also_collect() {
+        let aliases = [
+            "alibaba",
+            "alibaba-cn",
+            "alibaba-coding-plan",
+            "alibaba-coding-plan-cn",
+            "alibaba-token-plan",
+            "alibaba-token-plan-cn",
+            "bailian-token-plan-personal",
+            "zai",
+            "zai-coding-plan",
+            "zhipuai",
+            "zhipuai-coding-plan",
+            "deepseek",
+            "kimi-for-coding",
+            "moonshot",
+            "moonshotai",
+            "kimi",
+            "openai",
+        ];
+        let mut case = 0;
+        for alias in aliases {
+            for finish in ["tool-calls", "stop", "length"] {
+                let mut data = valid_data(alias, "model-a", 1_000);
+                data["finish"] = serde_json::json!(finish);
+                data["error"] = serde_json::Value::Null;
+                let path = write_values(
+                    &temp_dir(&format!("avail-accept-{case}")),
+                    &[(1_000, &format!("m-{case}"), data)],
+                );
+                assert!(
+                    available_from(&path),
+                    "alias {alias} with finish {finish} must answer yes"
+                );
+                let out = collect_from(&Config::default(), &path, ms(0), ms(10_000));
+                assert_eq!(
+                    out.events.len(),
+                    1,
+                    "alias {alias} with finish {finish} must collect an event"
+                );
+                assert!(out.notes.is_empty(), "notes: {:?}", out.notes);
+                case += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn available_parity_rejected_dimensions_collect_nothing() {
+        let base = valid_data("openai", "model-a", 1_000);
+        let mut invalid = Vec::new();
+        invalid.push(serde_json::json!([{ "role": "assistant" }]));
+        for role in ["user", "system"] {
+            let mut v = base.clone();
+            v["role"] = serde_json::json!(role);
+            invalid.push(v);
+        }
+        let mut v = base.clone();
+        v["error"] = serde_json::json!({"name": "safe-test-error"});
+        invalid.push(v);
+        let mut v = base.clone();
+        v["finish"] = serde_json::json!("cancelled");
+        invalid.push(v);
+        for provider in ["  ", "OpenAI", "opencode", "private-unknown"] {
+            let mut v = base.clone();
+            v["providerID"] = serde_json::json!(provider);
+            invalid.push(v);
+        }
+        let mut v = base.clone();
+        v["providerID"] = serde_json::json!(42);
+        invalid.push(v);
+        for model in [
+            serde_json::Value::Null,
+            serde_json::json!("  "),
+            serde_json::json!(7),
+        ] {
+            let mut v = base.clone();
+            v["modelID"] = model;
+            invalid.push(v);
+        }
+        for created in [serde_json::json!(-1), serde_json::json!(1.5)] {
+            let mut v = base.clone();
+            v["time"]["created"] = created;
+            invalid.push(v);
+        }
+        for completed in [serde_json::json!(-1), serde_json::json!(1.5)] {
+            let mut v = base.clone();
+            v["time"]["completed"] = completed;
+            invalid.push(v);
+        }
+        let mut v = base.clone();
+        v["time"].as_object_mut().unwrap().remove("completed");
+        invalid.push(v);
+        let mut v = base.clone();
+        v["time"].as_object_mut().unwrap().remove("created");
+        invalid.push(v);
+        let mut v = base.clone();
+        v["time"]["created"] = serde_json::json!(999);
+        invalid.push(v); // the DB row time_created stays 1000 -> mismatch
+        for input in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::Value::Null,
+        ] {
+            let mut v = base.clone();
+            v["tokens"]["input"] = input;
+            invalid.push(v);
+        }
+        for output in [serde_json::json!(-1), serde_json::json!(1.5)] {
+            let mut v = base.clone();
+            v["tokens"]["output"] = output;
+            invalid.push(v);
+        }
+        let mut v = base.clone();
+        v["tokens"]["reasoning"] = serde_json::Value::Null;
+        invalid.push(v);
+        let mut v = base.clone();
+        v["tokens"]["cache"]["read"] = serde_json::json!({});
+        invalid.push(v);
+        let mut v = base.clone();
+        v["tokens"]["cache"]["write"] = serde_json::json!(-1);
+        invalid.push(v);
+        let mut v = base.clone();
+        v["tokens"]["cache"] = serde_json::Value::Null;
+        invalid.push(v);
+        let mut v = base.clone();
+        v["tokens"]["cache"].as_object_mut().unwrap().remove("read");
+        invalid.push(v);
+        let mut v = base.clone();
+        v["tokens"] = serde_json::json!([]);
+        invalid.push(v);
+        let mut v = base.clone();
+        v["tokens"]["input"] = serde_json::json!(0);
+        v["tokens"]["output"] = serde_json::json!(0);
+        v["tokens"]["reasoning"] = serde_json::json!(0);
+        v["tokens"]["cache"]["read"] = serde_json::json!(0);
+        v["tokens"]["cache"]["write"] = serde_json::json!(0);
+        invalid.push(v);
+
+        for (index, data) in invalid.into_iter().enumerate() {
+            let path = write_values(
+                &temp_dir(&format!("avail-reject-{index}")),
+                &[(1_000, "m", data)],
+            );
+            assert!(
+                !available_from(&path),
+                "rejected case {index} must answer no"
+            );
+            let out = collect_from(&Config::default(), &path, ms(0), ms(10_000));
+            assert_eq!(
+                out.events.len(),
+                0,
+                "rejected case {index} must collect no events"
+            );
+        }
+
+        let malformed = write_db(
+            &temp_dir("avail-reject-malformed"),
+            &[(1_000, "m", "{not json")],
+        );
+        assert!(!available_from(&malformed), "malformed JSON answers no");
+        let out = collect_from(&Config::default(), &malformed, ms(0), ms(10_000));
+        assert_eq!(out.events.len(), 0);
+    }
+
+    #[test]
+    fn available_parity_overflowing_json_integer_literals_answer_no() {
+        for (index, literal) in ["9223372036854775808", "18446744073709551616"]
+            .iter()
+            .enumerate()
+        {
+            let row = format!(
+                r#"{{"role":"assistant","providerID":"openai","modelID":"m","time":{{"created":{literal},"completed":1}},"finish":"stop","tokens":{{"input":1,"output":0,"reasoning":0,"cache":{{"read":0,"write":0}}}}}}"#
+            );
+            let path = write_db(
+                &temp_dir(&format!("avail-overflow-time-{index}")),
+                &[(1, "m", &row)],
+            );
+            assert!(
+                !available_from(&path),
+                "created literal {literal} must answer no"
+            );
+            let out = collect_from(&Config::default(), &path, ms(0), ms(10_000));
+            assert_eq!(
+                out.events.len(),
+                0,
+                "created literal {literal} must collect no events"
+            );
+        }
+        let row = r#"{"role":"assistant","providerID":"openai","modelID":"m","time":{"created":1,"completed":2},"finish":"stop","tokens":{"input":18446744073709551616,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}"#;
+        let path = write_db(&temp_dir("avail-overflow-token"), &[(1, "m", row)]);
+        assert!(
+            !available_from(&path),
+            "an input token literal past u64 must answer no"
+        );
+        let out = collect_from(&Config::default(), &path, ms(0), ms(10_000));
+        assert_eq!(out.events.len(), 0);
+    }
+
+    #[test]
+    fn available_busy_db_waits_250ms_then_answers_no() {
+        let path = write_values(
+            &temp_dir("avail-busy"),
+            &[(1_000, "m1", valid_data("openai", "model-a", 1_000))],
+        );
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let start = Instant::now();
+        let answer = available_from(&path);
+        let elapsed = start.elapsed();
+        assert!(!answer, "a busy database answers no");
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "the busy bound is honored (NFR-3): {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "still bounded: {elapsed:?}"
         );
     }
 }
