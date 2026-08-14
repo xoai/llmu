@@ -14,10 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
-pub struct Collected {
-    pub events: Vec<UsageEvent>,
-    pub notes: Vec<String>,
-}
+use super::Collected;
 
 fn default_dirs() -> Vec<PathBuf> {
     let mut v = vec![];

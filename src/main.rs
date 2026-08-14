@@ -219,6 +219,30 @@ fn merge_provider(
     }
 }
 
+/// Move one OpenCode collection result into `Gathered` (FR-26), parallel
+/// to `merge_provider`: canonicalized events pass the shared
+/// `--provider` predicate exactly like provider/local events (FR-21),
+/// notes append unfiltered, and a panicked worker surfaces as one
+/// bounded fixed `opencode:` note without failing any other source.
+fn merge_opencode(
+    g: &mut Gathered,
+    res: std::thread::Result<local::Collected>,
+    provider_filter: Option<&[String]>,
+    want_usage: bool,
+) {
+    match res {
+        Ok(c) => {
+            let mut events = c.events;
+            events.retain(|e| filter_admits(provider_filter, &e.provider));
+            if want_usage {
+                g.events.extend(events);
+            }
+            g.notes.extend(c.notes);
+        }
+        Err(_) => g.notes.push("opencode: parser panicked".into()),
+    }
+}
+
 /// One shared `--provider` filter predicate (FR-6.1): a None filter admits
 /// every provider; a Some filter admits exactly the listed ids. Provider
 /// worker selection and the local Claude Code event path both go through
@@ -299,6 +323,16 @@ pub(crate) fn gather(
             None
         };
 
+        // OpenCode SQLite records in parallel too — but only when usage
+        // is wanted (FR-26, NFR-8): quota/balance gathers never touch the
+        // database. It is independent of provider worker selection and
+        // of any adapter's `configured()`.
+        let opencode_handle = if want_usage {
+            Some(s.spawn(move || local::opencode::collect(cfg, since, until)))
+        } else {
+            None
+        };
+
         let mut to_cache = vec![];
         for (id, h) in handles {
             merge_provider(&mut g, id, h.join(), &mut to_cache);
@@ -333,6 +367,9 @@ pub(crate) fn gather(
                 Ok(Err(e)) => g.notes.push(format!("claude-code: {e}")),
                 Err(_) => g.notes.push("claude-code: parser panicked".into()),
             }
+        }
+        if let Some(h) = opencode_handle {
+            merge_opencode(&mut g, h.join(), provider_filter, want_usage);
         }
     });
     g
@@ -374,6 +411,11 @@ fn main() -> Result<()> {
                 "{:<10} {:<11} subscription usage from local ~/.claude/projects JSONL transcripts",
                 "claude-code",
                 if cfg.claude_code.enabled { "yes" } else { "no" },
+            );
+            println!(
+                "{:<10} {:<11} read-only local usage from OpenCode's SQLite message records across supported providers",
+                "opencode",
+                if local::opencode::available() { "yes" } else { "no" },
             );
             let mut prov = cfg.found.clone();
             prov.extend(discover::env_provenance());
@@ -702,6 +744,118 @@ mod tests {
         assert!(!filter_admits(qwen_only.as_deref(), "anthropic"));
         assert!(filter_admits(None, "anthropic"));
         assert!(filter_admits(None, "qwen"));
+    }
+
+    fn opencode_event(provider: &str) -> UsageEvent {
+        UsageEvent {
+            provider: provider.into(),
+            source: SourceKind::LocalLogs,
+            model: "m".into(),
+            start: Utc::now(),
+            requests: 1,
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            tool_calls: 0,
+            cost_usd: None,
+            cost_is_estimate: true,
+        }
+    }
+
+    /// FR-21/26: the fail-soft OpenCode merge admits events through the
+    /// shared `filter_admits` predicate and appends notes unfiltered.
+    #[test]
+    fn merge_opencode_admits_matching_provider_and_appends_notes() {
+        let mut g = empty_gathered();
+        merge_opencode(
+            &mut g,
+            Ok(local::Collected {
+                events: vec![opencode_event("qwen")],
+                notes: vec!["opencode: skipped 1 malformed local usage record(s)".into()],
+            }),
+            Some(&["qwen".to_string()]),
+            true,
+        );
+        assert_eq!(g.events.len(), 1);
+        assert_eq!(g.events[0].provider, "qwen");
+        assert_eq!(
+            g.notes,
+            vec!["opencode: skipped 1 malformed local usage record(s)".to_string()]
+        );
+    }
+
+    /// FR-21: OpenCode events from excluded providers never reach the
+    /// usage report.
+    #[test]
+    fn merge_opencode_excludes_non_matching_providers() {
+        let mut g = empty_gathered();
+        merge_opencode(
+            &mut g,
+            Ok(local::Collected {
+                events: vec![opencode_event("qwen")],
+                notes: vec![],
+            }),
+            Some(&["glm".to_string()]),
+            true,
+        );
+        assert!(g.events.is_empty());
+    }
+
+    /// FR-26: when `want_usage` is false the events are dropped but
+    /// diagnostic notes still surface.
+    #[test]
+    fn merge_opencode_without_usage_drops_events_but_keeps_notes() {
+        let mut g = empty_gathered();
+        merge_opencode(
+            &mut g,
+            Ok(local::Collected {
+                events: vec![opencode_event("qwen")],
+                notes: vec!["opencode: local usage database is busy or unreadable".into()],
+            }),
+            None,
+            false,
+        );
+        assert!(g.events.is_empty());
+        assert_eq!(
+            g.notes,
+            vec!["opencode: local usage database is busy or unreadable".to_string()]
+        );
+    }
+
+    /// FR-26: a panicked OpenCode worker surfaces as one bounded fixed
+    /// `opencode:` note and never fails unrelated provider results.
+    #[test]
+    fn panicked_opencode_worker_yields_bounded_note() {
+        let mut g = empty_gathered();
+        merge_opencode(&mut g, Err(Box::new("boom")), None, true);
+        assert_eq!(g.notes, vec!["opencode: parser panicked".to_string()]);
+        assert!(g.events.is_empty());
+        assert!(g.quotas.is_empty());
+        assert!(g.balances.is_empty());
+    }
+
+    /// FR-26/NFR-8: the OpenCode collector runs only when `want_usage` —
+    /// quota and balance gathers must never touch the database.
+    #[test]
+    fn gather_spawns_opencode_collector_only_when_want_usage() {
+        let src = include_str!("main.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        let gather = prod
+            .split("pub(crate) fn gather")
+            .nth(1)
+            .expect("gather body");
+        let lines: Vec<&str> = gather.lines().collect();
+        let i = lines
+            .iter()
+            .position(|l| l.contains("local::opencode::collect"))
+            .expect("gather must spawn local::opencode::collect (FR-26)");
+        assert!(
+            lines[i].contains("want_usage") || lines[i - 1].contains("want_usage"),
+            "the OpenCode collector spawn must be gated on want_usage (quota/balance must not touch the DB): {} / {}",
+            lines[i - 1],
+            lines[i]
+        );
     }
 
     fn quota(provider: &str) -> QuotaSnapshot {

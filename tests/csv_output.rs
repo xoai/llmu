@@ -85,7 +85,10 @@ fn integration_tests_never_import_llmu() {
 /// the platform data dir the binary resolves via `dirs::data_dir()`, so
 /// `balances.jsonl` lives at `<sandbox>/data/llmu/balances.jsonl`;
 /// `HOME` is where the local Claude Code transcript walker looks
-/// (`~/.claude/projects`). No credential env var survives the run.
+/// (`~/.claude/projects`); `OPENCODE_DATA_DIR` is pinned to an empty
+/// sandbox subdir so the OpenCode collector resolves an isolated (missing)
+/// database — no real data dir, no inherited override, no network. No
+/// credential env var survives the run (NFR-8).
 struct Sandbox {
     dir: PathBuf,
 }
@@ -103,6 +106,7 @@ impl Sandbox {
         fs::create_dir_all(dir.join("data/llmu")).unwrap();
         fs::create_dir_all(dir.join("config")).unwrap();
         fs::create_dir_all(dir.join("home")).unwrap();
+        fs::create_dir_all(dir.join("opencode")).unwrap();
         Sandbox { dir }
     }
 
@@ -136,14 +140,28 @@ impl Sandbox {
             .env("XDG_DATA_HOME", self.data_dir())
             .env("XDG_CONFIG_HOME", self.dir.join("config"))
             .env("HOME", self.home())
+            .env("OPENCODE_DATA_DIR", self.dir.join("opencode"))
             .env_remove("DEEPSEEK_API_KEY")
             .env_remove("MOONSHOT_API_KEY")
             .env_remove("KIMI_API_KEY")
             .env_remove("KIMI_CODE_API_KEY")
+            .env_remove("KIMI_SHARE_DIR")
             .env_remove("ZAI_API_KEY")
             .env_remove("ZHIPU_API_KEY")
+            .env_remove("DASHSCOPE_API_KEY")
+            .env_remove("BAILIAN_API_KEY")
+            .env_remove("BAILIAN_CODING_PLAN_API_KEY")
+            .env_remove("BAILIAN_TOKEN_PLAN_API_KEY")
+            .env_remove("QWEN_HOME")
+            .env_remove("QWEN_RUNTIME_DIR")
             .env_remove("ANTHROPIC_ADMIN_KEY")
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("ANTHROPIC_AUTH_TOKEN")
+            .env_remove("ANTHROPIC_BASE_URL")
             .env_remove("OPENAI_ADMIN_KEY")
+            .env_remove("OPENAI_API_KEY")
+            .env_remove("GOOGLE_CLOUD_PROJECT")
+            .env_remove("GOOGLE_CLOUD_PROJECT_ID")
             .env_remove("GEMINI_CLI_HOME")
             .env_remove("CLAUDE_CONFIG_DIR")
             .env_remove("CODEX_HOME")
@@ -203,6 +221,35 @@ fn fixed_fixture_base() -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::parse_from_rfc3339("2026-08-02T02:00:00Z")
         .unwrap()
         .with_timezone(&chrono::Utc)
+}
+
+/// Task 5 (NFR-8): the CSV gather harness pins `OPENCODE_DATA_DIR` to an
+/// empty sandbox subdir, so the OpenCode collector resolves a missing
+/// database — silent, no events, no notes — and the existing Claude CSV
+/// regressions stay byte-for-byte exact.
+#[test]
+fn opencode_sandbox_isolation_keeps_claude_csv_regressions_exact() {
+    let sb = Sandbox::new("opencode-isolation");
+    sb.write_logs(&fixture_lines(fixed_fixture_base()));
+    let out = sb.run(&[
+        "usage",
+        "--csv",
+        "--group-by",
+        "source,model",
+        "--since",
+        "2026-07-01",
+    ]);
+    assert!(out.status.success());
+    let stderr = sb.stderr(&out);
+    assert!(
+        !stderr.contains("opencode:"),
+        "a missing sandbox OpenCode DB must stay silent in CSV mode: {stderr}"
+    );
+    assert!(
+        !stderr.contains("note:"),
+        "healthy usage CSV must not leak any notes, got: {stderr:?}"
+    );
+    let _ = fs::remove_dir_all(&sb.dir);
 }
 
 #[test]

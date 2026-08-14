@@ -72,11 +72,25 @@ fn route_by_base(base: &str) -> Option<&'static str> {
     }
 }
 
+/// Shared OpenCode data-directory resolver (FR-1, FR-2): supplies the
+/// auth.json path here and the database path for the OpenCode usage
+/// collector. Precedence: non-empty `OPENCODE_DATA_DIR`; non-empty
+/// `XDG_DATA_HOME` joined with `opencode`; the user home joined with
+/// `.local/share/opencode`; unavailable when no home resolves. Pure seam:
+/// the environment lookup and home are injected so inline tests exercise
+/// every branch hermetically (NFR-8).
+pub(crate) fn opencode_data_dir(env: EnvLookup, home: Option<&Path>) -> Option<PathBuf> {
+    if let Some(d) = env("OPENCODE_DATA_DIR") {
+        return Some(PathBuf::from(d));
+    }
+    if let Some(x) = env("XDG_DATA_HOME") {
+        return Some(PathBuf::from(x).join("opencode"));
+    }
+    home.map(|h| h.join(".local/share/opencode"))
+}
+
 fn opencode_auth() -> Option<(Value, String)> {
-    let dir = env("OPENCODE_DATA_DIR")
-        .map(PathBuf::from)
-        .or_else(|| env("XDG_DATA_HOME").map(|x| PathBuf::from(x).join("opencode")))
-        .or_else(|| dirs::home_dir().map(|h| h.join(".local/share/opencode")))?;
+    let dir = opencode_data_dir(&std_env, dirs::home_dir().as_deref())?;
     let p = dir.join("auth.json");
     read_json(&p).map(|v| (v, p.display().to_string()))
 }
@@ -201,6 +215,27 @@ fn apply_qwen(cfg: &mut Config, env: EnvLookup) {
     }
 }
 
+/// Qwen token-plan key from OpenCode auth API entries, in exact priority
+/// order (FR-31): `alibaba-token-plan`, `alibaba-token-plan-cn`,
+/// `bailian-token-plan-personal`. Only `type == "api"` entries with a
+/// string `key` qualify; oauth entries and missing/wrong-typed keys never
+/// map. Provenance names the source, never the key (FR-32).
+fn opencode_token_plan_key(auth: &Value, src: &str) -> Option<(String, String)> {
+    [
+        "alibaba-token-plan",
+        "alibaba-token-plan-cn",
+        "bailian-token-plan-personal",
+    ]
+    .iter()
+    .find_map(|id| {
+        let e = &auth[*id];
+        (e["type"].as_str() == Some("api"))
+            .then(|| e["key"].as_str())
+            .flatten()
+            .map(|k| (k.to_string(), format!("opencode auth {src}")))
+    })
+}
+
 /// Fill unset cfg fields from local sources; record (field, source).
 pub fn apply(cfg: &mut Config) {
     let found = |cfg_found: &mut Vec<(String, String)>, field: &str, src: String| {
@@ -285,7 +320,8 @@ pub fn apply(cfg: &mut Config) {
     }
 
     // --- OpenCode auth.json ------------------------------------------
-    if let Some((auth, src)) = opencode_auth() {
+    let opencode = opencode_auth();
+    if let Some((auth, src)) = &opencode {
         let api_key = |ids: &[&str]| {
             ids.iter().find_map(|id| {
                 let e = &auth[*id];
@@ -344,6 +380,20 @@ pub fn apply(cfg: &mut Config) {
 
     // --- Qwen Cloud: env + Qwen Code settings.json (FR-1, FR-2) ------
     apply_qwen(cfg, &std_env);
+
+    // --- OpenCode Qwen token-plan fallback (FR-31) --------------------
+    // Runs after apply_qwen so explicit config, env, and Qwen Code
+    // settings always precede it; fills ONLY a still-empty
+    // token_plan_key — never standard_key or coding_plan_key — with
+    // secret-free provenance (FR-32).
+    if cfg.qwen.token_plan_key.is_none() {
+        if let Some((auth, src)) = &opencode {
+            if let Some((v, psrc)) = opencode_token_plan_key(auth, src) {
+                cfg.qwen.token_plan_key = Some(v);
+                found(&mut cfg.found, "qwen.token_plan_key", psrc);
+            }
+        }
+    }
 }
 
 /// Human string of env-var-configured fields (for `llmu providers`).
@@ -386,6 +436,117 @@ mod tests {
 
     fn no_env(_k: &str) -> Option<String> {
         None
+    }
+
+    fn env_pairs<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k: &str| {
+            pairs
+                .iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // OpenCode shared data-dir resolver and token-plan fallback (FR-1,
+    // FR-2, FR-31, FR-32) — injected pure seams, hermetic.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn opencode_data_dir_precedence_override_then_xdg_then_home_then_none() {
+        let home = Path::new("/tmp/llmu-opencode-home");
+        assert_eq!(
+            opencode_data_dir(
+                &env_pairs(&[
+                    ("OPENCODE_DATA_DIR", "/tmp/llmu-opencode-override"),
+                    ("XDG_DATA_HOME", "/tmp/llmu-xdg"),
+                ]),
+                Some(home),
+            ),
+            Some(PathBuf::from("/tmp/llmu-opencode-override")),
+            "non-empty OPENCODE_DATA_DIR wins over XDG and home (FR-1)"
+        );
+        assert_eq!(
+            opencode_data_dir(
+                &env_pairs(&[("XDG_DATA_HOME", "/tmp/llmu-xdg")]),
+                Some(home)
+            ),
+            Some(PathBuf::from("/tmp/llmu-xdg/opencode")),
+            "XDG_DATA_HOME joins `opencode` (FR-1)"
+        );
+        assert_eq!(
+            opencode_data_dir(&no_env, Some(home)),
+            Some(PathBuf::from(
+                "/tmp/llmu-opencode-home/.local/share/opencode"
+            )),
+            "the user home joins `.local/share/opencode` (FR-1)"
+        );
+        assert_eq!(
+            opencode_data_dir(&no_env, None),
+            None,
+            "no override, no XDG, no home -> no data dir (FR-1)"
+        );
+    }
+
+    #[test]
+    fn opencode_token_plan_key_uses_exact_priority_order() {
+        let mut auth: Value = serde_json::from_str(
+            r#"{"alibaba-token-plan":{"type":"api","key":"sk-token-plan"},"alibaba-token-plan-cn":{"type":"api","key":"sk-token-plan-cn"},"bailian-token-plan-personal":{"type":"api","key":"sk-token-per"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            opencode_token_plan_key(&auth, "/tmp/llmu/auth.json"),
+            Some((
+                "sk-token-plan".into(),
+                "opencode auth /tmp/llmu/auth.json".into()
+            )),
+            "`alibaba-token-plan` precedes the other aliases (FR-31)"
+        );
+        auth.as_object_mut().unwrap().remove("alibaba-token-plan");
+        assert_eq!(
+            opencode_token_plan_key(&auth, "/tmp/llmu/auth.json")
+                .unwrap()
+                .0,
+            "sk-token-plan-cn",
+            "`alibaba-token-plan-cn` precedes `bailian-token-plan-personal` (FR-31)"
+        );
+        auth.as_object_mut()
+            .unwrap()
+            .remove("alibaba-token-plan-cn");
+        let (v, src) = opencode_token_plan_key(&auth, "/tmp/llmu/auth.json").unwrap();
+        assert_eq!(v, "sk-token-per");
+        assert!(
+            !src.contains("sk-"),
+            "provenance names the source, never the key (FR-32)"
+        );
+    }
+
+    #[test]
+    fn opencode_token_plan_key_skips_non_api_entries_and_missing_keys() {
+        let auth: Value = serde_json::from_str(
+            r#"{"alibaba-token-plan":{"type":"oauth","access":"tok"},"alibaba-token-plan-cn":{"type":"api","key":"sk-cn"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            opencode_token_plan_key(&auth, "/x/auth.json").unwrap().0,
+            "sk-cn",
+            "an oauth entry is never a token-plan API key (FR-31)"
+        );
+        let auth: Value = serde_json::from_str(r#"{"alibaba-token-plan":{"type":"api"}}"#).unwrap();
+        assert!(
+            opencode_token_plan_key(&auth, "/x/auth.json").is_none(),
+            "an api entry without a key yields nothing (FR-31)"
+        );
+        let auth: Value = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(
+            opencode_token_plan_key(&auth, "/x/auth.json").is_none(),
+            "an auth document without the aliases yields nothing (FR-31)"
+        );
+        let auth: Value = serde_json::from_str(r#"{"alibaba-token-plan":42}"#).unwrap();
+        assert!(
+            opencode_token_plan_key(&auth, "/x/auth.json").is_none(),
+            "a wrong-typed entry yields nothing (FR-31)"
+        );
     }
 
     #[test]
