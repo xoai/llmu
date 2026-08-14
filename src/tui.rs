@@ -3,7 +3,7 @@
 //! Two refresh cadences run on a background worker thread so the UI
 //! never blocks:
 //!   - LOCAL tick (default 3s): re-parses Claude Code, Codex, Gemini,
-//!     and Qwen local usage records — no network requests.
+//!     Qwen, and OpenCode local usage records — no network requests.
 //!   - NETWORK tick (default 60s): full fetch including provider usage
 //!     APIs, quotas, and balances. Kept slow deliberately — the Claude
 //!     oauth/usage endpoint rate-limits aggressively.
@@ -80,6 +80,20 @@ fn apply_local_refresh(
     let mut events = api_events.to_vec();
     events.extend(local_events.iter().cloned());
     events
+}
+
+/// Task 6 (FR-27/AC-5): a database-level OpenCode failure downgrades the
+/// whole partial local refresh so `apply_local_refresh` preserves the
+/// previous complete snapshot. Only the two fixed database notes count —
+/// bounded malformed/unsupported skip notes are a completed query whose
+/// valid events stay. OpenCode's note constants are private to the
+/// collector, so the exact literals are pinned here.
+fn opencode_db_failed(notes: &[String]) -> bool {
+    const BUSY_OR_UNREADABLE: &str = "opencode: local usage database is busy or unreadable";
+    const INCOMPATIBLE: &str = "opencode: local usage database schema is unsupported";
+    notes
+        .iter()
+        .any(|n| n == BUSY_OR_UNREADABLE || n == INCOMPATIBLE)
 }
 
 fn provider_color(id: &str) -> Color {
@@ -210,6 +224,18 @@ pub fn run(
                                 Err(_) => complete = false,
                             }
                         }
+                    }
+                    // OpenCode is another file-backed local stream with
+                    // its own read-only database; collect it directly,
+                    // never through gather. A database-level failure (the
+                    // two fixed notes) downgrades the whole tick so the
+                    // previous snapshot survives; bounded skip notes are
+                    // a completed query and keep their valid events.
+                    let opencode = crate::local::opencode::collect(&cfg, since, now);
+                    if opencode_db_failed(&opencode.notes) {
+                        complete = false;
+                    } else {
+                        refreshed.extend(opencode.events);
                     }
                     let events =
                         apply_local_refresh(&api_events, &mut local_events, refreshed, complete);
@@ -750,6 +776,167 @@ mod tests {
         assert!(
             rendered.contains("q quit"),
             "quota rows must not crowd the footer off-screen:\n{rendered}"
+        );
+    }
+
+    /// Task 6 (FR-27): the predicate recognizes exactly the two fixed
+    /// database-level OpenCode failure notes — never the bounded
+    /// malformed/unsupported skip notes, which are a completed query.
+    #[test]
+    fn opencode_db_failure_predicate_matches_only_the_two_fixed_notes() {
+        assert!(
+            opencode_db_failed(&["opencode: local usage database is busy or unreadable".into()]),
+            "busy/unreadable must downgrade the partial refresh"
+        );
+        assert!(
+            opencode_db_failed(&["opencode: local usage database schema is unsupported".into()]),
+            "unsupported schema must downgrade the partial refresh"
+        );
+        assert!(
+            !opencode_db_failed(&["opencode: skipped 3 malformed local usage record(s)".into()]),
+            "bounded malformed skip notes are a completed query"
+        );
+        assert!(
+            !opencode_db_failed(&[
+                ("opencode: skipped 2 local usage record(s) from unsupported provider(s)".into())
+            ]),
+            "bounded unsupported-provider skip notes are a completed query"
+        );
+        assert!(
+            !opencode_db_failed(&[]),
+            "a missing database (silent, empty) is a successful refresh"
+        );
+    }
+
+    /// Task 6 (FR-27/FR-28): a mixed snapshot holding canonical
+    /// qwen/glm/deepseek/kimi/openai local rows plus unrelated streams
+    /// must survive an incomplete partial refresh untouched.
+    #[test]
+    fn opencode_canonical_rows_survive_incomplete_partial_refresh() {
+        let api = vec![usage("openai", SourceKind::Api)];
+        let mut local = vec![
+            usage("anthropic", SourceKind::LocalLogs),
+            usage("codex", SourceKind::LocalLogs),
+            usage("gemini", SourceKind::LocalLogs),
+            usage("qwen", SourceKind::LocalLogs),
+            usage("glm", SourceKind::LocalLogs),
+            usage("deepseek", SourceKind::LocalLogs),
+            usage("kimi", SourceKind::LocalLogs),
+            usage("openai", SourceKind::LocalLogs),
+        ];
+
+        let next = apply_local_refresh(&api, &mut local, vec![], false);
+        let providers: Vec<&str> = next.iter().map(|e| e.provider.as_str()).collect();
+
+        assert_eq!(
+            providers,
+            vec![
+                "openai",
+                "anthropic",
+                "codex",
+                "gemini",
+                "qwen",
+                "glm",
+                "deepseek",
+                "kimi",
+                "openai"
+            ],
+            "a failed OpenCode refresh must preserve the entire prior local snapshot"
+        );
+    }
+
+    /// Task 6 (FR-27/FR-28): a complete partial refresh replaces local
+    /// rows with the combined Claude/Codex/Gemini/Qwen/OpenCode streams
+    /// and always preserves API rows.
+    #[test]
+    fn complete_refresh_replaces_with_combined_streams_including_opencode_rows() {
+        let api = vec![usage("openai", SourceKind::Api)];
+        let mut local = vec![usage("anthropic", SourceKind::LocalLogs)];
+
+        let next = apply_local_refresh(
+            &api,
+            &mut local,
+            vec![
+                usage("anthropic", SourceKind::LocalLogs),
+                usage("codex", SourceKind::LocalLogs),
+                usage("gemini", SourceKind::LocalLogs),
+                usage("qwen", SourceKind::LocalLogs),
+                usage("glm", SourceKind::LocalLogs),
+                usage("deepseek", SourceKind::LocalLogs),
+                usage("kimi", SourceKind::LocalLogs),
+                usage("openai", SourceKind::LocalLogs),
+            ],
+            true,
+        );
+        let providers: Vec<&str> = next.iter().map(|e| e.provider.as_str()).collect();
+
+        assert_eq!(
+            providers,
+            vec![
+                "openai",
+                "anthropic",
+                "codex",
+                "gemini",
+                "qwen",
+                "glm",
+                "deepseek",
+                "kimi",
+                "openai"
+            ]
+        );
+    }
+
+    /// Task 6 (FR-27): OpenCode rows render with the canonical provider,
+    /// their model, and `local` provenance in the by-model feed title;
+    /// the footer and layout stay visible.
+    #[test]
+    fn opencode_canonical_rows_render_local_provenance_and_keep_the_footer() {
+        let mk = |provider: &str| UsageEvent {
+            provider: provider.into(),
+            source: SourceKind::LocalLogs,
+            model: format!("{provider}-code"),
+            start: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            requests: 1,
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            tool_calls: 0,
+            cost_usd: None,
+            cost_is_estimate: true,
+        };
+        let d = Dashboard {
+            events: vec![
+                mk("qwen"),
+                mk("glm"),
+                mk("deepseek"),
+                mk("kimi"),
+                mk("openai"),
+            ],
+            window_label: "30d".into(),
+            ..Default::default()
+        };
+        let backend = ratatui::backend::TestBackend::new(160, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|f| draw(f, &d, Period::Day, None, None, false))
+            .unwrap();
+
+        let rendered = terminal.backend().to_string();
+        for provider in ["qwen", "glm", "deepseek", "kimi", "openai"] {
+            assert!(
+                rendered.contains(&format!("{provider}·local")),
+                "the by-model feed title must show {provider} with local provenance:\n{rendered}"
+            );
+            assert!(
+                rendered.contains(&format!("{provider}-code")),
+                "the by-model table must render the canonical {provider} model row:\n{rendered}"
+            );
+        }
+        assert!(
+            rendered.contains("q quit"),
+            "OpenCode rows must not crowd the footer off-screen:\n{rendered}"
         );
     }
 
