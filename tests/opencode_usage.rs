@@ -13,6 +13,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
@@ -738,6 +739,11 @@ fn opencode_query_is_single_streamed_message_read_with_exact_bounds() {
         region.matches("FROM ").count(),
         1,
         "exactly one table read in the collector query — message only (FR-9, NFR-1)"
+    );
+    assert_eq!(
+        region.matches("SELECT").count(),
+        1,
+        "exactly one collection SELECT — one streaming bounded-window read (NFR-1)"
     );
     for absent in [
         "FROM event",
@@ -1960,5 +1966,166 @@ fn opencode_tui_local_tick_collects_directly_and_preserves_snapshot_on_db_failur
     assert!(
         !predicate.contains("apply_local_refresh"),
         "the predicate only classifies notes; it must not apply state"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 7: WAL / busy / privacy / source hardening contracts. The WAL-only
+// committed-row behavior fixtures live inline in `src/local/opencode.rs`
+// (private seams); these contracts pin source shape, cross-file parity,
+// secret-free diagnostics, and the busy status black-box.
+// ---------------------------------------------------------------------------
+
+/// The stale `#[allow(dead_code)] // ... lands in Task 5` annotations were
+/// Task 2/3 scaffolding: `collect` is wired into `gather` (FR-26) and
+/// `available` into `providers` (FR-29), so no dead-code allow or
+/// not-yet-reachable comment may remain in the collector (plan Task 7).
+#[test]
+fn opencode_collector_has_no_stale_dead_code_allows() {
+    let o = opencode_prod();
+    assert!(
+        !o.contains("#[allow(dead_code)]"),
+        "the collector is reachable via gather and providers; no stale dead-code allow may remain"
+    );
+    for stale in [
+        "not yet reachable",
+        "wired by gather/CLI in Task 5",
+        "lands in Task 5",
+    ] {
+        assert!(
+            !o.contains(stale),
+            "stale wiring-comment marker `{stale}` must be gone"
+        );
+    }
+}
+
+/// NFR-9 + §17: production `src/local/opencode.rs` must stay free of
+/// scraping markers (browser/console/cookie/sec_token), snapshot/copy
+/// behavior, and SQL write/DDL/migration/vacuum/attach/detach vocabulary.
+/// The scan targets precise code markers, never bare words, so the
+/// read-only doc comments ("never copies or snapshots") cannot false
+/// positive; the `query_only` verification itself is separately pinned
+/// above and must not be trapped here.
+#[test]
+fn opencode_production_has_no_scraping_snapshot_or_migration_markers() {
+    let o = opencode_prod();
+    for absent in [
+        "browser",
+        "console",
+        "cookie",
+        "sec_token",
+        "fs::copy",
+        "snapshot(",
+        "migration",
+        "DETACH",
+        "detach",
+    ] {
+        assert!(
+            !o.contains(absent),
+            "forbidden production marker `{absent}` (NFR-9/§17)"
+        );
+    }
+}
+
+/// FR-35 + §17: adversarial records carrying sentinel secret/path/id/
+/// provider/model text must never reach the bounded notes. The collector's
+/// own inline test covers the behavior; this pins the source side: notes
+/// interpolate only the two aggregate counts and the two fixed database
+/// literals.
+#[test]
+fn opencode_notes_interpolate_counts_only() {
+    let o = opencode_prod();
+    assert!(
+        o.contains("opencode: skipped {malformed} malformed local usage record(s)")
+            && o.contains("opencode: skipped {unsupported} local usage record(s) from unsupported provider(s)"),
+        "record notes interpolate the aggregate count only (FR-33)"
+    );
+    for forbidden in [
+        "note.push_str",
+        "eprintln",
+        "println!(\"opencode",
+        "writeln",
+    ] {
+        assert!(
+            !o.contains(forbidden),
+            "notes must be built only through the two bounded pushes: `{forbidden}`"
+        );
+    }
+}
+
+/// T6 pins the two fixed OpenCode database-failure note literals inside
+/// `tui.rs::opencode_db_failed`; the collector owns those literals as
+/// `NOTE_UNREADABLE` / `NOTE_INCOMPATIBLE`. This cross-file contract keeps
+/// the TUI predicate byte-exact with the collector constants so a future
+/// wording drift cannot silently break the `apply_local_refresh`
+/// preservation invariant (FR-27/AC-5).
+#[test]
+fn tui_opencode_db_failed_pins_collector_note_constants_byte_exact() {
+    let o = opencode_prod();
+    let extract_const = |name: &str| -> String {
+        let marker = format!("const {name}: &str = \"");
+        let start = o
+            .find(&marker)
+            .unwrap_or_else(|| panic!("collector const {name} missing"));
+        let rest = &o[start + marker.len()..];
+        let end = rest
+            .find('"')
+            .unwrap_or_else(|| panic!("collector const {name} unterminated"));
+        rest[..end].to_string()
+    };
+    let unreadable = extract_const("NOTE_UNREADABLE");
+    let incompatible = extract_const("NOTE_INCOMPATIBLE");
+    let tui = read("src/tui.rs");
+    let predicate_start = tui
+        .find("fn opencode_db_failed")
+        .expect("tui must own the opencode_db_failed predicate");
+    let predicate = &tui[predicate_start..];
+    assert!(
+        predicate.contains(&format!("\"{unreadable}\"")),
+        "tui::opencode_db_failed must carry the byte-exact NOTE_UNREADABLE literal {unreadable:?}"
+    );
+    assert!(
+        predicate.contains(&format!("\"{incompatible}\"")),
+        "tui::opencode_db_failed must carry the byte-exact NOTE_INCOMPATIBLE literal {incompatible:?}"
+    );
+}
+
+/// FR-30/NFR-3 black-box: a busy (exclusively locked) database prints
+/// `opencode no` within the 250 ms bound plus CI tolerance, and the status
+/// path never surfaces a diagnostic on stderr.
+#[test]
+fn providers_opencode_busy_db_answers_no_bounded_without_diagnostics() {
+    let sb = Sandbox::new("t7-busy");
+    let dir = sb.dir.join("busy-data");
+    write_opencode_db(&dir, &[(1000, "m1", &eligible_message("openai"))]);
+    let lock = rusqlite::Connection::open(dir.join("opencode.db")).unwrap();
+    lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    let start = Instant::now();
+    let out = sb
+        .cmd(Some(&dir), Some(&sb.data()))
+        .args(["--config", sb.config_path().to_str().unwrap(), "providers"])
+        .output()
+        .expect("spawning llmu binary");
+    let elapsed = start.elapsed();
+    drop(lock);
+    assert!(
+        out.status.success(),
+        "providers must succeed: {}",
+        sb.stderr(&out)
+    );
+    let stdout = sb.stdout(&out);
+    let row = stdout
+        .lines()
+        .find(|l| l.trim_start().starts_with("opencode"))
+        .expect("providers must list an opencode row");
+    assert!(row.contains("no"), "a busy DB answers no:\n{row}");
+    assert!(
+        elapsed >= Duration::from_millis(150) && elapsed < Duration::from_secs(2),
+        "the busy bound (250 ms) plus CI tolerance must hold: {elapsed:?}"
+    );
+    assert!(
+        !sb.stderr(&out).contains("note:"),
+        "status never surfaces diagnostics on a busy DB: {}",
+        sb.stderr(&out)
     );
 }

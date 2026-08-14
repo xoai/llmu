@@ -1607,3 +1607,117 @@ fn shell_run_blocks_bind_contexts_through_env() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Task 7: release portability — bundled SQLite must stay self-contained
+// (FR-4, NFR-11, NFR-12). The exact rusqlite pin, its lockfile transitives,
+// and the workflow's no-system-SQLite / no-bindgen / no-clang surface are
+// pinned here; the five-target matrix and ten-asset contracts above stay
+// unchanged.
+// ---------------------------------------------------------------------------
+
+/// FR-4/NFR-11: the release pin is exact rusqlite 0.31.0 with the bundled
+/// feature (self-contained SQLite) and the dependency-free `functions`
+/// feature; no direct system-SQLite crate may appear in Cargo.toml.
+#[test]
+fn cargo_toml_pins_exact_bundled_rusqlite_for_release() {
+    let cargo = cargo_text();
+    let exact = "rusqlite = { version = \"=0.31.0\", features = [\"bundled\", \"functions\"] }";
+    assert!(
+        cargo.contains(exact),
+        "Cargo.toml must declare exact `{}` (FR-4)",
+        exact
+    );
+    for direct in [
+        "libsqlite3-sys",
+        "sqlite3-sys",
+        "rusqlite = { version = \"0.31.0\"",
+    ] {
+        assert!(
+            !cargo.contains(direct),
+            "no direct system-SQLite or unexact dependency `{direct}` may exist (NFR-11)"
+        );
+    }
+}
+
+/// NFR-12: Cargo.lock pins rusqlite 0.31.0, the bundled build of
+/// libsqlite3-sys 0.28.0 whose own dependency list includes `cc`, and
+/// contains no bindgen package — so no bindgen/clang runtime requirement
+/// exists anywhere in the lockfile.
+#[test]
+fn cargo_lock_pins_rusqlite_transitives_with_cc_and_without_bindgen() {
+    let lock = read_named(&repo_root().join("Cargo.lock"), "Cargo.lock");
+    assert!(
+        lock.contains("name = \"rusqlite\"") && lock.contains("version = \"0.31.0\""),
+        "Cargo.lock must pin rusqlite 0.31.0 (NFR-12)"
+    );
+    assert!(
+        lock.contains("name = \"libsqlite3-sys\"") && lock.contains("version = \"0.28.0\""),
+        "Cargo.lock must pin libsqlite3-sys 0.28.0 (NFR-12)"
+    );
+    let name_at = lock
+        .find("name = \"libsqlite3-sys\"")
+        .expect("libsqlite3-sys package entry");
+    let block_start = lock[..name_at]
+        .rfind("[[package]]")
+        .expect("package block start");
+    let block_end = lock[name_at..]
+        .find("\n[[package]]")
+        .map(|e| name_at + e)
+        .unwrap_or(lock.len());
+    let block = &lock[block_start..block_end];
+    assert!(
+        block.contains("\"cc\""),
+        "libsqlite3-sys must build the bundled SQLite through the `cc` crate (NFR-12)"
+    );
+    assert!(
+        !block.contains("bindgen"),
+        "libsqlite3-sys 0.28.0 must not carry a bindgen build dependency"
+    );
+    assert!(
+        !lock.contains("name = \"bindgen\""),
+        "no bindgen package may exist in the lockfile (NFR-12)"
+    );
+    assert!(
+        lock.contains("name = \"cc\""),
+        "the `cc` build dependency must be locked (NFR-12)"
+    );
+}
+
+/// NFR-11/NFR-12: the release workflow never installs or links a system
+/// SQLite (no apt/brew/choco/vcpkg sqlite, no pkg-config sqlite, no
+/// system sqlite3) and never requires bindgen/libclang/clang. The only
+/// system package install is the legitimate musl-tools toolchain; the
+/// bundled libsqlite3-sys compiles SQLite with `cc`, so no clang is
+/// needed and none may be installed.
+#[test]
+fn release_workflow_never_installs_or_links_system_sqlite_or_requires_bindgen_clang() {
+    let wf = workflow_text();
+    for absent in [
+        "sqlite3",
+        "sqlite",
+        "pkg-config",
+        "bindgen",
+        "libclang",
+        "clang",
+    ] {
+        assert!(
+            !wf.contains(absent),
+            "the release workflow must never touch `{absent}` (NFR-11/12)"
+        );
+    }
+    let b = job_block(&wf, "build").expect("missing job `build`");
+    for line in b.lines() {
+        let t = line.trim_start();
+        if t.contains("apt-get install") {
+            assert!(
+                t.contains("musl-tools") && !t.contains("sqlite"),
+                "the only system package install must be the musl toolchain, got: {t}"
+            );
+        }
+        assert!(
+            !t.contains("vcpkg") && !t.contains("brew ") && !t.contains("choco"),
+            "no platform package manager may install a system SQLite: {t}"
+        );
+    }
+}
