@@ -237,8 +237,12 @@ impl Sandbox {
             "BAILIAN_TOKEN_PLAN_API_KEY",
             "QWEN_HOME",
             "QWEN_RUNTIME_DIR",
+            "ANTHROPIC_API_KEY",
             "ANTHROPIC_AUTH_TOKEN",
             "ANTHROPIC_BASE_URL",
+            "OPENAI_API_KEY",
+            "GOOGLE_CLOUD_PROJECT",
+            "GOOGLE_CLOUD_PROJECT_ID",
             "KIMI_SHARE_DIR",
             "DEEPSEEK_API_KEY",
             "MOONSHOT_API_KEY",
@@ -1218,4 +1222,679 @@ fn providers_opencode_status_never_leaks_db_diagnostics() {
             "status must never surface DB diagnostics: `{leak}` in:\n{combined}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Task 5: usage delivery — black-box OpenCode CLI coverage (FR-21, FR-23,
+// FR-24, FR-26-28, §17 CLI tests). The synthetic SQLite helpers above are
+// reused; fixed UTC windows only, no now-based membership except the bare
+// overview whose window is inherently now-relative (no paths/IDs/dates in
+// expected diagnostics).
+// ---------------------------------------------------------------------------
+
+const WINDOW_SINCE: &str = "2026-08-01";
+const WINDOW_UNTIL: &str = "2026-08-31";
+
+fn ms_at(s: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .unwrap()
+        .with_timezone(&chrono::Utc)
+        .timestamp_millis()
+}
+
+/// One strict-valid OpenCode assistant record whose `time.created` equals
+/// the database `time_created` (FR-13). `tokens` is
+/// `[input, output, reasoning, cache_read, cache_write]` — all in fixed
+/// buckets (input, output+reasoning, cache read, cache write).
+fn record(provider: &str, model: &str, created_ms: i64, tokens: [u64; 5]) -> String {
+    format!(
+        r#"{{"role":"assistant","providerID":"{provider}","modelID":"{model}","time":{{"created":{created_ms},"completed":{completed}}},"finish":"stop","tokens":{{"input":{input},"output":{output},"reasoning":{reasoning},"cache":{{"read":{cr},"write":{cw}}}}}}}"#,
+        completed = created_ms + 1,
+        input = tokens[0],
+        output = tokens[1],
+        reasoning = tokens[2],
+        cr = tokens[3],
+        cw = tokens[4]
+    )
+}
+
+fn run_usage(sb: &Sandbox, db: &Path, extra: &[&str]) -> Output {
+    // `OPENCODE_DATA_DIR` is the data DIRECTORY; the collector joins
+    // `opencode.db` (FR-3), so the file path's parent is the env value.
+    let mut cmd = sb.cmd(Some(db.parent().unwrap()), Some(&sb.data()));
+    cmd.args([
+        "--config",
+        sb.config_path().to_str().unwrap(),
+        "usage",
+        "--since",
+        WINDOW_SINCE,
+        "--until",
+        WINDOW_UNTIL,
+    ]);
+    cmd.args(extra);
+    cmd.output().expect("spawning llmu binary")
+}
+
+fn usage_rows(sb: &Sandbox, db: &Path, extra: &[&str]) -> Vec<serde_json::Value> {
+    let out = run_usage(sb, db, extra);
+    assert!(
+        out.status.success(),
+        "llmu usage must succeed: {}",
+        sb.stderr(&out)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("bad JSON ({e}): {}", sb.stdout(&out)));
+    let rows = v.as_array().expect("usage --json emits an array");
+    assert!(
+        rows.iter().all(|r| r["keys"].is_array()),
+        "aggregated rows carry their keys: {}",
+        sb.stdout(&out)
+    );
+    rows.clone()
+}
+
+/// One synthetic DB with all 17 reviewed aliases, each under a distinct
+/// model so aggregation cannot merge them and coverage stays observable.
+fn alias_db(dir: &Path) -> PathBuf {
+    let t = ms_at("2026-08-10T10:00:00Z");
+    let aliases: [&str; 17] = [
+        "alibaba",
+        "alibaba-cn",
+        "alibaba-coding-plan",
+        "alibaba-coding-plan-cn",
+        "alibaba-token-plan",
+        "alibaba-token-plan-cn",
+        "bailian-token-plan-personal",
+        "zai",
+        "zai-coding-plan",
+        "zhipuai",
+        "zhipuai-coding-plan",
+        "deepseek",
+        "kimi-for-coding",
+        "moonshot",
+        "moonshotai",
+        "kimi",
+        "openai",
+    ];
+    let owned: Vec<(i64, String, String)> = aliases
+        .iter()
+        .enumerate()
+        .map(|(i, alias)| {
+            let at = t + i as i64;
+            (
+                at,
+                format!("id-{alias}"),
+                record(alias, &format!("m-{alias}"), at, [10, 20, 5, 3, 2]),
+            )
+        })
+        .collect();
+    let refs: Vec<(i64, &str, &str)> = owned
+        .iter()
+        .map(|(t, id, d)| (*t, id.as_str(), d.as_str()))
+        .collect();
+    write_opencode_db(dir, &refs)
+}
+
+fn models(rows: &[serde_json::Value]) -> Vec<String> {
+    rows.iter()
+        .map(|r| r["keys"][2].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// FR-21 + FR-19: every canonical `--provider` filter admits all of its
+/// aliases and excludes every other alias; unknown filters admit nothing.
+#[test]
+fn opencode_alias_filters_admit_every_canonical_provider_and_exclude_others() {
+    let sb = Sandbox::new("t5-aliases");
+    let db = alias_db(&sb.dir.join("aliases"));
+
+    let rows = usage_rows(&sb, &db, &["--group-by", "provider,model", "--json"]);
+    assert_eq!(rows.len(), 17, "all 17 reviewed aliases emit events");
+    let providers: Vec<String> = rows
+        .iter()
+        .map(|r| r["keys"][1].as_str().unwrap().to_string())
+        .collect();
+    for p in ["qwen", "glm", "deepseek", "kimi", "openai"] {
+        assert!(
+            providers.contains(&p.to_string()),
+            "canonical provider {p} must appear in the unfiltered report"
+        );
+    }
+
+    for (provider, expected) in [
+        (
+            "qwen",
+            &[
+                "m-alibaba",
+                "m-alibaba-cn",
+                "m-alibaba-coding-plan",
+                "m-alibaba-coding-plan-cn",
+                "m-alibaba-token-plan",
+                "m-alibaba-token-plan-cn",
+                "m-bailian-token-plan-personal",
+            ][..],
+        ),
+        (
+            "glm",
+            &[
+                "m-zai",
+                "m-zai-coding-plan",
+                "m-zhipuai",
+                "m-zhipuai-coding-plan",
+            ][..],
+        ),
+        ("deepseek", &["m-deepseek"][..]),
+        (
+            "kimi",
+            &["m-kimi-for-coding", "m-moonshot", "m-moonshotai", "m-kimi"][..],
+        ),
+        ("openai", &["m-openai"][..]),
+    ] {
+        let rows = usage_rows(
+            &sb,
+            &db,
+            &[
+                "--provider",
+                provider,
+                "--group-by",
+                "provider,model",
+                "--json",
+            ],
+        );
+        let got = models(&rows);
+        assert_eq!(got.len(), expected.len(), "{provider} filter: {got:?}");
+        for m in expected {
+            assert!(
+                got.contains(&m.to_string()),
+                "{provider} must admit {m}, got {got:?}"
+            );
+        }
+    }
+
+    let rows = usage_rows(
+        &sb,
+        &db,
+        &[
+            "--provider",
+            "anthropic",
+            "--group-by",
+            "provider,model",
+            "--json",
+        ],
+    );
+    assert!(
+        rows.is_empty(),
+        "a non-OpenCode provider filter must exclude every alias: {rows:?}"
+    );
+}
+
+/// `--model` is a case-insensitive substring; `--source local` admits
+/// OpenCode events, `--source api` excludes them; the report shows the
+/// `local` provenance through the source group key.
+#[test]
+fn opencode_model_filter_case_insensitive_and_source_filters() {
+    let sb = Sandbox::new("t5-filters");
+    let t = ms_at("2026-08-10T10:00:00Z");
+    let db = write_opencode_db(
+        &sb.dir.join("filters"),
+        &[(
+            t,
+            "id-1",
+            record("alibaba", "Qwen-Max", t, [10, 20, 5, 3, 2]).as_str(),
+        )],
+    );
+
+    let rows = usage_rows(
+        &sb,
+        &db,
+        &[
+            "--model",
+            "qwen-m",
+            "--group-by",
+            "provider,model",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        rows.len(),
+        1,
+        "lowercase substring must match case-insensitively"
+    );
+    assert_eq!(rows[0]["keys"][2], "Qwen-Max");
+
+    let rows = usage_rows(
+        &sb,
+        &db,
+        &[
+            "--model",
+            "QWEN-MAX",
+            "--group-by",
+            "provider,model",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        rows.len(),
+        1,
+        "uppercase substring must match case-insensitively"
+    );
+
+    let rows = usage_rows(
+        &sb,
+        &db,
+        &["--model", "zzz", "--group-by", "provider,model", "--json"],
+    );
+    assert!(
+        rows.is_empty(),
+        "a non-matching model substring admits nothing"
+    );
+
+    let rows = usage_rows(
+        &sb,
+        &db,
+        &[
+            "--source",
+            "local",
+            "--group-by",
+            "provider,source",
+            "--json",
+        ],
+    );
+    assert_eq!(rows.len(), 1, "--source local admits OpenCode events");
+    assert_eq!(
+        rows[0]["keys"][2], "local",
+        "the source group key shows local provenance"
+    );
+
+    let rows = usage_rows(
+        &sb,
+        &db,
+        &["--source", "api", "--group-by", "provider,source", "--json"],
+    );
+    assert!(
+        rows.is_empty(),
+        "--source api must exclude OpenCode local events"
+    );
+}
+
+/// FR-23: OpenCode events are additive with local Claude transcripts —
+/// no cross-source dedup. The two fixtures share provider/model/hour, so
+/// aggregation merges them and the merged row carries both sources' sums.
+#[test]
+fn opencode_adds_to_local_claude_transcripts_without_dedup() {
+    let sb = Sandbox::new("t5-additive");
+    let t = ms_at("2026-08-11T12:00:00Z");
+    let db = write_opencode_db(
+        &sb.dir.join("add"),
+        &[(
+            t,
+            "id-open",
+            record("alibaba", "qwen-max", t, [1500, 800, 200, 1000, 0]).as_str(),
+        )],
+    );
+    let dir = sb.home().join(".claude/projects/demo");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("session.jsonl"),
+        r#"{"timestamp":"2026-08-11T12:00:00Z","requestId":"cc-req-1","message":{"id":"cc-msg-1","model":"qwen-max","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":25,"cache_creation_input_tokens":0},"content":[]}}"#
+            .to_string()
+            + "\n",
+    )
+    .unwrap();
+
+    let rows = usage_rows(
+        &sb,
+        &db,
+        &[
+            "--provider",
+            "qwen",
+            "--group-by",
+            "provider,model",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        rows.len(),
+        1,
+        "both sources share provider/model/hour and merge into one additive row: {rows:?}"
+    );
+    let r = &rows[0];
+    assert_eq!(r["requests"], 2, "requests add across sources, no dedup");
+    assert_eq!(
+        r["input_tokens"], 1600,
+        "input adds (1500 opencode + 100 transcript)"
+    );
+    assert_eq!(
+        r["output_tokens"], 1050,
+        "output adds (1000 opencode + 50 transcript)"
+    );
+    assert_eq!(r["cache_read_tokens"], 1025, "cache read adds (1000 + 25)");
+    assert_eq!(r["total_tokens"], 3675);
+}
+
+/// FR-33/35 + §17: malformed and unsupported records yield exactly the
+/// bounded stderr notes; stdout stays pure JSON/CSV with the valid rows;
+/// no path/id/provider/model/SQL/JSON fragment ever reaches stderr.
+#[test]
+fn opencode_malformed_and_unsupported_notes_bounded_and_never_leak() {
+    let sb = Sandbox::new("t5-notes");
+    let t = ms_at("2026-08-10T10:00:00Z");
+    let db = write_opencode_db(
+        &sb.dir.join("notes"),
+        &[
+            (
+                t,
+                "id-ok",
+                record("openai", "model-a", t, [10, 20, 5, 3, 2]).as_str(),
+            ),
+            (
+                t + 1,
+                "id-bad",
+                r#"{"role":"assistant","providerID":"openai""#,
+            ),
+            (
+                t + 2,
+                "id-unknown",
+                record("google", "model-g", t + 2, [1, 1, 0, 0, 0]).as_str(),
+            ),
+        ],
+    );
+
+    let out = run_usage(&sb, &db, &["--group-by", "provider,model", "--json"]);
+    assert!(out.status.success(), "{}", sb.stderr(&out));
+    let stdout = sb.stdout(&out);
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&stdout).expect("pure JSON stdout");
+    assert_eq!(rows.len(), 1, "only the valid record reaches the report");
+    assert_eq!(rows[0]["keys"][1], "openai");
+    assert_eq!(rows[0]["keys"][2], "model-a");
+    assert!(
+        !stdout.contains("opencode: skipped"),
+        "notes must never contaminate JSON stdout"
+    );
+    let stderr = sb.stderr(&out);
+    assert!(
+        stderr.contains("note: opencode: skipped 1 malformed local usage record(s)"),
+        "the malformed note must be exactly bounded: {stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "note: opencode: skipped 1 local usage record(s) from unsupported provider(s)"
+        ),
+        "the unsupported-provider note must be exactly bounded: {stderr}"
+    );
+    assert_eq!(
+        stderr.matches("note: opencode:").count(),
+        2,
+        "exactly two opencode notes, one per category: {stderr}"
+    );
+    for leak in [
+        "google",
+        "model-g",
+        "model-a",
+        "providerID",
+        "modelID",
+        "id-unknown",
+        "INSERT",
+        "CREATE",
+        "opencode.db",
+        "session.jsonl",
+    ] {
+        assert!(
+            !stderr.contains(leak),
+            "stderr must not leak `{leak}`: {stderr}"
+        );
+    }
+    assert!(
+        !stderr.contains(&sb.dir.display().to_string()),
+        "stderr must not leak sandbox paths"
+    );
+
+    let out = run_usage(&sb, &db, &["--group-by", "provider,model", "--csv"]);
+    assert!(out.status.success(), "{}", sb.stderr(&out));
+    assert_eq!(
+        sb.stdout(&out),
+        "period,provider,model,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,total_tokens,tool_calls,est_cost_usd,has_cost\n\
+         2026-08-10,openai,model-a,1,10,25,3,2,40,0,0,false\n",
+        "CSV stays pure and exact while notes go to stderr"
+    );
+    assert!(
+        !sb.stdout(&out).contains("opencode: skipped"),
+        "notes must never contaminate CSV stdout"
+    );
+}
+
+/// §17: JSON/CSV schemas stay byte-exact with OpenCode rows present.
+#[test]
+fn opencode_usage_json_and_csv_schemas_are_unchanged() {
+    let sb = Sandbox::new("t5-schema");
+    let t = ms_at("2026-08-10T10:00:00Z");
+    let db = write_opencode_db(
+        &sb.dir.join("schema"),
+        &[(
+            t,
+            "id-1",
+            record("openai", "model-a", t, [10, 20, 5, 3, 2]).as_str(),
+        )],
+    );
+    let rows = usage_rows(&sb, &db, &["--group-by", "provider,model", "--json"]);
+    let mut keys: Vec<&str> = rows[0]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(|k| k.as_str())
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "est_cost_usd",
+            "has_cost",
+            "input_tokens",
+            "keys",
+            "output_tokens",
+            "requests",
+            "tool_calls",
+            "total_tokens",
+        ],
+        "the JSON schema is the exact existing shape"
+    );
+
+    let out = run_usage(&sb, &db, &["--group-by", "provider,model", "--csv"]);
+    assert!(out.status.success(), "{}", sb.stderr(&out));
+    assert_eq!(
+        sb.stdout(&out),
+        "period,provider,model,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,total_tokens,tool_calls,est_cost_usd,has_cost\n\
+         2026-08-10,openai,model-a,1,10,25,3,2,40,0,0,false\n"
+    );
+}
+
+/// FR-26/NFR-8: the collector must run only when `want_usage` — quota and
+/// balance gathers never touch the OpenCode database, so a
+/// diagnostic-producing DB emits no `opencode:` note on those commands.
+#[test]
+fn opencode_collector_stays_gated_for_quota_and_balance() {
+    let sb = Sandbox::new("t5-gated");
+    let t = ms_at("2026-08-10T10:00:00Z");
+    let db = write_opencode_db(
+        &sb.dir.join("gated"),
+        &[(t, "id-bad", r#"{"role":"assistant","providerID":"openai""#)],
+    );
+
+    let out = sb
+        .cmd(Some(db.parent().unwrap()), Some(&sb.data()))
+        .args(["--config", sb.config_path().to_str().unwrap(), "quota"])
+        .output()
+        .expect("spawning llmu binary");
+    assert!(out.status.success(), "quota: {}", sb.stderr(&out));
+    assert!(
+        !sb.stderr(&out).contains("opencode:"),
+        "quota (want_usage=false) must not run the OpenCode collector: {}",
+        sb.stderr(&out)
+    );
+
+    let out = sb
+        .cmd(Some(db.parent().unwrap()), Some(&sb.data()))
+        .args(["--config", sb.config_path().to_str().unwrap(), "balance"])
+        .output()
+        .expect("spawning llmu binary");
+    assert!(out.status.success(), "balance: {}", sb.stderr(&out));
+    assert!(
+        !sb.stderr(&out).contains("opencode:"),
+        "balance (want_usage=false) must not run the OpenCode collector: {}",
+        sb.stderr(&out)
+    );
+
+    let out = run_usage(&sb, &db, &["--json"]);
+    assert!(
+        sb.stderr(&out)
+            .contains("note: opencode: skipped 1 malformed local usage record(s)"),
+        "sanity: the same DB must produce the bounded note when usage runs: {}",
+        sb.stderr(&out)
+    );
+}
+
+/// FR-24 + §17: maximum-token OpenCode fixtures saturate every bucket and
+/// the derived total to `u64::MAX` through JSON and CSV with unchanged
+/// headers, and render the human table grand total without panic.
+#[test]
+fn opencode_max_tokens_saturate_json_csv_and_table() {
+    let sb = Sandbox::new("t5-saturation");
+    let t = ms_at("2026-08-10T10:00:00Z");
+    let max_row = record("alibaba", "m-max", t, [u64::MAX, u64::MAX, 10, u64::MAX, 5]);
+    let pos_row = record("alibaba", "m-pos", t + 60_000, [1, 1, 1, 1, 1]);
+    let db = write_opencode_db(
+        &sb.dir.join("sat"),
+        &[
+            (t, "id-max", max_row.as_str()),
+            (t + 60_000, "id-pos", pos_row.as_str()),
+        ],
+    );
+
+    let rows = usage_rows(&sb, &db, &["--group-by", "provider,model", "--json"]);
+    assert_eq!(rows.len(), 2);
+    let max_r = rows.iter().find(|r| r["keys"][2] == "m-max").unwrap();
+    assert_eq!(max_r["requests"], 1);
+    assert_eq!(max_r["tool_calls"], 0, "OpenCode rows carry no tool calls");
+    assert_eq!(max_r["input_tokens"], serde_json::json!(u64::MAX));
+    assert_eq!(
+        max_r["output_tokens"],
+        serde_json::json!(u64::MAX),
+        "output+reasoning saturates"
+    );
+    assert_eq!(max_r["cache_read_tokens"], serde_json::json!(u64::MAX));
+    assert_eq!(max_r["cache_write_tokens"], 5);
+    assert_eq!(
+        max_r["total_tokens"],
+        serde_json::json!(u64::MAX),
+        "the derived total saturates"
+    );
+    let pos_r = rows.iter().find(|r| r["keys"][2] == "m-pos").unwrap();
+    assert_eq!(pos_r["input_tokens"], 1);
+    assert_eq!(pos_r["output_tokens"], 2, "1 output + 1 reasoning");
+    assert_eq!(pos_r["total_tokens"], 5);
+
+    let out = run_usage(&sb, &db, &["--group-by", "provider,model", "--csv"]);
+    assert!(out.status.success(), "{}", sb.stderr(&out));
+    assert_eq!(
+        sb.stdout(&out),
+        "period,provider,model,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,total_tokens,tool_calls,est_cost_usd,has_cost\n\
+         2026-08-10,qwen,m-max,1,18446744073709551615,18446744073709551615,18446744073709551615,5,18446744073709551615,0,0,false\n\
+         2026-08-10,qwen,m-pos,1,1,2,1,1,5,0,0,false\n",
+        "CSV keeps the exact header and machine values, saturated"
+    );
+
+    let out = run_usage(&sb, &db, &["--group-by", "provider,model"]);
+    assert!(
+        out.status.success(),
+        "the human table must not panic on saturated values: {}",
+        sb.stderr(&out)
+    );
+    let stdout = sb.stdout(&out);
+    assert!(
+        stdout.contains("18,446,744,073,709,551,615"),
+        "the table grand total must saturate without panic:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("TOTAL"),
+        "the grand total row renders:\n{stdout}"
+    );
+}
+
+/// Bare `llmu` overview: OpenCode events render with `local` provenance
+/// and saturated values never panic the table (FR-24, §17).
+#[test]
+fn opencode_overview_shows_local_provenance_and_saturates_without_panic() {
+    let sb = Sandbox::new("t5-overview");
+    let t = chrono::Utc::now().timestamp_millis() - 2 * 60 * 60 * 1000;
+    let db = write_opencode_db(
+        &sb.dir.join("ov"),
+        &[(
+            t,
+            "id-ov",
+            record(
+                "alibaba",
+                "qwen-max",
+                t,
+                [u64::MAX, u64::MAX, 10, u64::MAX, 5],
+            )
+            .as_str(),
+        )],
+    );
+    let out = sb
+        .cmd(Some(db.parent().unwrap()), Some(&sb.data()))
+        .args(["--config", sb.config_path().to_str().unwrap()])
+        .output()
+        .expect("spawning llmu binary");
+    assert!(
+        out.status.success(),
+        "overview must not panic: {}",
+        sb.stderr(&out)
+    );
+    let stdout = sb.stdout(&out);
+    assert!(
+        stdout.contains("usage counted from: qwen (local logs)"),
+        "the overview scope line must show OpenCode local provenance:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("18,446,744,073,709,551,615"),
+        "saturated totals render without panic/wrap:\n{stdout}"
+    );
+}
+
+/// FR-26/FR-23 (additive-API note): llmu's test suite has no local HTTP
+/// stub, so OpenCode+API additivity is pinned structurally — OpenCode
+/// events join the identical shared usage stream as provider API events
+/// (the same `g.events.extend` merge) — and the existing
+/// provider-additivity regression (`tests/qwen_wiring.rs`) stays green.
+#[test]
+fn gather_merges_opencode_events_into_the_shared_usage_stream() {
+    let src = read("src/main.rs");
+    assert!(
+        src.contains("local::opencode::collect"),
+        "gather must spawn the OpenCode collector (FR-26)"
+    );
+    assert!(
+        src.contains("fn merge_opencode"),
+        "a fail-soft OpenCode merge must exist (FR-26)"
+    );
+    let arm = src.split("fn merge_opencode").nth(1).expect("merge body");
+    let merge = arm.split("#[cfg(test)]").next().expect("production merge");
+    assert!(
+        merge.contains("g.events.extend"),
+        "OpenCode events join the shared usage stream like every provider (FR-23/26)"
+    );
+    assert!(
+        merge.contains("g.notes.extend"),
+        "OpenCode notes append unfiltered (FR-26)"
+    );
+    assert!(
+        merge.contains("filter_admits"),
+        "OpenCode events pass the shared provider filter (FR-21)"
+    );
+    assert!(
+        merge.contains("parser panicked"),
+        "a panicked OpenCode worker yields a bounded fixed note (FR-26)"
+    );
 }

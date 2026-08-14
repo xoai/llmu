@@ -322,16 +322,7 @@ fn draw(
     // --- header: grand totals + freshness ---
     let mut g = report::Totals::default();
     for e in &d.events {
-        g.requests += e.requests;
-        g.input_tokens += e.input_tokens;
-        g.output_tokens += e.output_tokens;
-        g.cache_read_tokens += e.cache_read_tokens;
-        g.cache_write_tokens += e.cache_write_tokens;
-        g.tool_calls += e.tool_calls;
-        if let Some(c) = e.cost_usd {
-            g.est_cost_usd += c;
-            g.has_cost = true;
-        }
+        g.add_event(e);
     }
     let billed_total: f64 = d.billed.iter().map(|b| b.amount_usd).sum();
     let header = Line::from(vec![
@@ -397,13 +388,16 @@ fn draw(
                 .duration_trunc(CDuration::hours(1))
                 .unwrap_or(e.start),
         ) {
-            *v += e.total_tokens();
+            *v = v.saturating_add(e.total_tokens());
         }
     }
-    let spark: Vec<u64> = hours.values().copied().collect();
+    // Scale to ktok before handing values to the widget: a saturated
+    // u64::MAX hour bucket would overflow the widget's internal
+    // value*height*8 scaling in debug builds (FR-24).
+    let spark: Vec<u64> = hours.values().map(|v| v / 1000).collect();
     f.render_widget(
         Sparkline::default()
-            .block(Block::bordered().title(" activity — tokens/hour, last 24h "))
+            .block(Block::bordered().title(" activity — ktok/hour, last 24h "))
             .style(Style::new().fg(Color::Cyan))
             .data(&spark),
         chunks[1],
@@ -412,7 +406,8 @@ fn draw(
     // --- bar chart: total tokens per period bucket ---
     let mut buckets: BTreeMap<String, u64> = BTreeMap::new();
     for e in &d.events {
-        *buckets.entry(period.key(e.start)).or_default() += e.total_tokens();
+        let entry = buckets.entry(period.key(e.start)).or_default();
+        *entry = entry.saturating_add(e.total_tokens());
     }
     let labels: Vec<(String, u64)> = buckets
         .into_iter()
@@ -446,15 +441,7 @@ fn draw(
     let mut merged: BTreeMap<(String, String, String), report::Totals> = BTreeMap::new();
     for r in rows_agg {
         let key = (r.keys[1].clone(), r.keys[2].clone(), r.keys[3].clone());
-        let t = merged.entry(key).or_default();
-        t.requests += r.totals.requests;
-        t.input_tokens += r.totals.input_tokens;
-        t.output_tokens += r.totals.output_tokens;
-        t.cache_read_tokens += r.totals.cache_read_tokens;
-        t.cache_write_tokens += r.totals.cache_write_tokens;
-        t.tool_calls += r.totals.tool_calls;
-        t.est_cost_usd += r.totals.est_cost_usd;
-        t.has_cost |= r.totals.has_cost;
+        merged.entry(key).or_default().add_totals(&r.totals);
     }
     let mut sorted: Vec<_> = merged.into_iter().collect();
     sorted.sort_by_key(|(_, u)| std::cmp::Reverse(u.total_tokens()));
@@ -815,6 +802,57 @@ mod tests {
         assert!(
             src.contains("provider.usage(&cfg, &ctx, since, now)"),
             "direct local-provider usage must receive the context"
+        );
+    }
+
+    /// Task 5 (FR-24): the header aggregation, hourly sparkline, period
+    /// buckets, and merged by-model totals all saturate — a dashboard
+    /// holding a maximum-value OpenCode event plus a positive event must
+    /// render every path without panic or wrap, and the by-model feed
+    /// title must show the canonical provider with `local` provenance.
+    #[test]
+    fn saturated_local_events_render_header_chart_and_model_paths_without_panic() {
+        let mk = |requests: u64, input: u64, output: u64, cr: u64, cw: u64| UsageEvent {
+            provider: "qwen".into(),
+            source: SourceKind::LocalLogs,
+            model: "qwen-max".into(),
+            start: Utc::now(),
+            requests,
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: cr,
+            cache_write_tokens: cw,
+            tool_calls: 0,
+            cost_usd: None,
+            cost_is_estimate: true,
+        };
+        let d = Dashboard {
+            events: vec![
+                mk(u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX),
+                mk(1, 1, 2, 1, 1),
+            ],
+            window_label: "30d".into(),
+            ..Default::default()
+        };
+        let backend = ratatui::backend::TestBackend::new(160, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|f| draw(f, &d, Period::Day, None, None, false))
+            .unwrap();
+
+        let rendered = terminal.backend().to_string();
+        assert!(
+            rendered.contains("18,446,744,073,709,551,615"),
+            "the header requests grand total must saturate without panic:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("qwen·local"),
+            "the by-model feed title must show the canonical provider with local provenance:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("by model"),
+            "the by-model panel must render:\n{rendered}"
         );
     }
 

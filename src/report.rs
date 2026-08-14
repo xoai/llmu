@@ -84,20 +84,41 @@ pub struct Totals {
 }
 
 impl Totals {
-    fn add(&mut self, e: &UsageEvent) {
-        self.requests += e.requests;
-        self.input_tokens += e.input_tokens;
-        self.output_tokens += e.output_tokens;
-        self.cache_read_tokens += e.cache_read_tokens;
-        self.cache_write_tokens += e.cache_write_tokens;
-        self.tool_calls += e.tool_calls;
+    /// Shared event accumulator (FR-24): integer fields saturating-add so
+    /// a valid saturated source event never panics (debug) or wraps
+    /// (release); costs stay ordinary `f64` addition and `has_cost`
+    /// accumulates with OR semantics.
+    pub fn add_event(&mut self, e: &UsageEvent) {
+        self.requests = self.requests.saturating_add(e.requests);
+        self.input_tokens = self.input_tokens.saturating_add(e.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(e.output_tokens);
+        self.cache_read_tokens = self.cache_read_tokens.saturating_add(e.cache_read_tokens);
+        self.cache_write_tokens = self.cache_write_tokens.saturating_add(e.cache_write_tokens);
+        self.tool_calls = self.tool_calls.saturating_add(e.tool_calls);
         if let Some(c) = e.cost_usd {
             self.est_cost_usd += c;
             self.has_cost = true;
         }
     }
+
+    /// Shared row/grand-total accumulator (FR-24): same saturation and
+    /// cost semantics as [`Totals::add_event`], but over another `Totals`.
+    pub fn add_totals(&mut self, o: &Totals) {
+        self.requests = self.requests.saturating_add(o.requests);
+        self.input_tokens = self.input_tokens.saturating_add(o.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(o.output_tokens);
+        self.cache_read_tokens = self.cache_read_tokens.saturating_add(o.cache_read_tokens);
+        self.cache_write_tokens = self.cache_write_tokens.saturating_add(o.cache_write_tokens);
+        self.tool_calls = self.tool_calls.saturating_add(o.tool_calls);
+        self.est_cost_usd += o.est_cost_usd;
+        self.has_cost = self.has_cost || o.has_cost;
+    }
+
     pub fn total_tokens(&self) -> u64 {
-        self.input_tokens + self.output_tokens + self.cache_read_tokens + self.cache_write_tokens
+        self.input_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_write_tokens)
     }
 }
 
@@ -114,7 +135,7 @@ pub fn aggregate(events: &[UsageEvent], period: Period, groups: &[Group]) -> Vec
     for e in events {
         let mut key = vec![period.key(e.start)];
         key.extend(groups.iter().map(|g| g.value(e)));
-        map.entry(key).or_default().add(e);
+        map.entry(key).or_default().add_event(e);
     }
     map.into_iter()
         .map(|(keys, totals)| Row {
@@ -184,7 +205,7 @@ pub fn totals_summary(t: &Totals) -> String {
         fmt_compact(t.total_tokens()),
         fmt_compact(t.input_tokens),
         fmt_compact(t.output_tokens),
-        fmt_compact(t.cache_read_tokens + t.cache_write_tokens),
+        fmt_compact(t.cache_read_tokens.saturating_add(t.cache_write_tokens)),
     )
 }
 
@@ -224,14 +245,7 @@ pub fn render_table(period: Period, groups: &[Group], rows: &[Row]) -> String {
         row.push(fmt_int(r.totals.tool_calls));
         row.push(fmt_cost(&r.totals));
         cells.push(row);
-        grand.requests += r.totals.requests;
-        grand.input_tokens += r.totals.input_tokens;
-        grand.output_tokens += r.totals.output_tokens;
-        grand.cache_read_tokens += r.totals.cache_read_tokens;
-        grand.cache_write_tokens += r.totals.cache_write_tokens;
-        grand.tool_calls += r.totals.tool_calls;
-        grand.est_cost_usd += r.totals.est_cost_usd;
-        grand.has_cost |= r.totals.has_cost;
+        grand.add_totals(&r.totals);
     }
     let mut total_row: Vec<String> = vec!["TOTAL".into()];
     total_row.extend(std::iter::repeat(String::new()).take(n_keys - 1));
@@ -918,6 +932,181 @@ mod tests {
         assert_eq!(
             totals_summary(&totals),
             "tok 4.63B (in 310k / out 11.1M / cache 4.61B)"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Task 5 (FR-24): every shared integer accumulator saturates, so
+    // saturated OpenCode source events survive every report layer without
+    // panic (debug) or wrap (release); costs stay ordinary f64 adds and
+    // `has_cost` stays OR-accumulated.
+    // -------------------------------------------------------------------
+
+    fn max_event(provider: &str, model: &str) -> UsageEvent {
+        UsageEvent {
+            provider: provider.into(),
+            source: SourceKind::LocalLogs,
+            model: model.into(),
+            start: at("2026-08-10T10:00:00Z"),
+            requests: u64::MAX,
+            input_tokens: u64::MAX,
+            output_tokens: u64::MAX,
+            cache_read_tokens: u64::MAX,
+            cache_write_tokens: u64::MAX,
+            tool_calls: u64::MAX,
+            cost_usd: Some(1.5),
+            cost_is_estimate: true,
+        }
+    }
+
+    fn positive_event() -> UsageEvent {
+        UsageEvent {
+            provider: "qwen".into(),
+            source: SourceKind::LocalLogs,
+            model: "m".into(),
+            start: at("2026-08-10T10:00:00Z"),
+            requests: 1,
+            input_tokens: 1,
+            output_tokens: 2,
+            cache_read_tokens: 1,
+            cache_write_tokens: 1,
+            tool_calls: 2,
+            cost_usd: Some(0.5),
+            cost_is_estimate: true,
+        }
+    }
+
+    #[test]
+    fn totals_add_event_saturates_every_integer_bucket_and_preserves_cost() {
+        let mut t = Totals::default();
+        t.add_event(&max_event("qwen", "m"));
+        t.add_event(&positive_event());
+        assert_eq!(t.requests, u64::MAX);
+        assert_eq!(t.tool_calls, u64::MAX);
+        assert_eq!(t.input_tokens, u64::MAX);
+        assert_eq!(t.output_tokens, u64::MAX);
+        assert_eq!(t.cache_read_tokens, u64::MAX);
+        assert_eq!(t.cache_write_tokens, u64::MAX);
+        assert_eq!(t.total_tokens(), u64::MAX, "the derived total saturates");
+        assert_eq!(t.est_cost_usd, 2.0, "costs stay ordinary f64 addition");
+        assert!(t.has_cost);
+    }
+
+    #[test]
+    fn totals_add_totals_saturates_integers_and_preserves_cost() {
+        let mut a = Totals {
+            requests: u64::MAX,
+            input_tokens: u64::MAX,
+            output_tokens: u64::MAX,
+            cache_read_tokens: u64::MAX,
+            cache_write_tokens: u64::MAX,
+            tool_calls: u64::MAX,
+            est_cost_usd: 1.0,
+            has_cost: true,
+        };
+        let b = Totals {
+            requests: 1,
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_tokens: 1,
+            cache_write_tokens: 1,
+            tool_calls: 1,
+            est_cost_usd: 2.0,
+            has_cost: false,
+        };
+        a.add_totals(&b);
+        assert_eq!(a.requests, u64::MAX);
+        assert_eq!(a.tool_calls, u64::MAX);
+        assert_eq!(a.total_tokens(), u64::MAX);
+        assert_eq!(a.est_cost_usd, 3.0);
+        assert!(a.has_cost, "has_cost accumulates with OR semantics");
+    }
+
+    #[test]
+    fn totals_derived_total_saturates_at_u64_max() {
+        let t = Totals {
+            input_tokens: u64::MAX,
+            output_tokens: 100,
+            cache_read_tokens: u64::MAX,
+            cache_write_tokens: 1,
+            ..Default::default()
+        };
+        assert_eq!(t.total_tokens(), u64::MAX);
+    }
+
+    #[test]
+    fn totals_summary_saturates_the_cache_bucket() {
+        let t = Totals {
+            cache_read_tokens: u64::MAX,
+            cache_write_tokens: 1,
+            ..Default::default()
+        };
+        let s = totals_summary(&t);
+        assert!(
+            s.contains("18447P"),
+            "cache read+write must saturate in the summary, got: {s}"
+        );
+    }
+
+    #[test]
+    fn aggregate_saturates_rows_within_a_group() {
+        let rows = aggregate(
+            &[max_event("qwen", "m"), positive_event()],
+            Period::Day,
+            &[Group::Provider, Group::Model],
+        );
+        assert_eq!(rows.len(), 1, "both events share period/provider/model");
+        assert_eq!(rows[0].totals.requests, u64::MAX);
+        assert_eq!(rows[0].totals.tool_calls, u64::MAX);
+        assert_eq!(rows[0].total_tokens, u64::MAX);
+        assert_eq!(rows[0].totals.est_cost_usd, 2.0);
+        assert!(rows[0].totals.has_cost);
+    }
+
+    #[test]
+    fn render_table_grand_totals_saturate_across_rows() {
+        let row_of = |provider: &str, t: Totals| Row {
+            keys: vec!["2026-08-10".to_string(), provider.to_string()],
+            total_tokens: t.total_tokens(),
+            totals: t,
+        };
+        let rows = vec![
+            row_of(
+                "p1",
+                Totals {
+                    requests: u64::MAX,
+                    input_tokens: u64::MAX,
+                    output_tokens: u64::MAX,
+                    cache_read_tokens: u64::MAX,
+                    cache_write_tokens: u64::MAX,
+                    tool_calls: u64::MAX,
+                    est_cost_usd: 1.5,
+                    has_cost: true,
+                },
+            ),
+            row_of(
+                "p2",
+                Totals {
+                    requests: 1,
+                    input_tokens: 1,
+                    output_tokens: 2,
+                    cache_read_tokens: 1,
+                    cache_write_tokens: 1,
+                    tool_calls: 1,
+                    est_cost_usd: 0.5,
+                    has_cost: false,
+                },
+            ),
+        ];
+        let s = render_table(Period::Day, &[Group::Provider], &rows);
+        assert!(
+            s.contains("18,446,744,073,709,551,615"),
+            "the TOTAL row must saturate every integer column:\n{s}"
+        );
+        assert!(s.contains("TOTAL"), "the grand total row renders:\n{s}");
+        assert!(
+            s.contains("2.00"),
+            "grand-total costs still sum as f64 over the rows:\n{s}"
         );
     }
 }
