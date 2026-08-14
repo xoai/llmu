@@ -42,8 +42,14 @@ pub struct UsageEvent {
 }
 
 impl UsageEvent {
+    /// Saturated sum of the four token buckets (FR-24): a valid source
+    /// event at `u64::MAX` must never panic in debug builds or wrap in
+    /// release builds at any downstream total.
     pub fn total_tokens(&self) -> u64 {
-        self.input_tokens + self.output_tokens + self.cache_read_tokens + self.cache_write_tokens
+        self.input_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_write_tokens)
     }
 }
 
@@ -130,5 +136,38 @@ mod tests {
         let mut f = Fetch::default();
         f.notes.push("quota row skipped".to_string());
         assert_eq!(f.notes, vec!["quota row skipped".to_string()]);
+    }
+
+    fn event(buckets: [u64; 4]) -> UsageEvent {
+        UsageEvent {
+            provider: "qwen".into(),
+            source: SourceKind::LocalLogs,
+            model: "m".into(),
+            start: Utc::now(),
+            requests: 1,
+            input_tokens: buckets[0],
+            output_tokens: buckets[1],
+            cache_read_tokens: buckets[2],
+            cache_write_tokens: buckets[3],
+            tool_calls: 0,
+            cost_usd: None,
+            cost_is_estimate: true,
+        }
+    }
+
+    /// FR-24: `total_tokens` must saturating-add the four buckets, so a
+    /// valid saturated source event never panics in debug builds or wraps
+    /// in release builds at the very first downstream total.
+    #[test]
+    fn total_tokens_saturates_across_all_four_buckets() {
+        let e = event([u64::MAX, 1, u64::MAX, 1]);
+        assert_eq!(e.total_tokens(), u64::MAX);
+    }
+
+    /// Ordinary buckets keep summing exactly — no behavior change for
+    /// values that cannot overflow.
+    #[test]
+    fn total_tokens_sums_normal_buckets_exactly() {
+        assert_eq!(event([10, 20, 3, 2]).total_tokens(), 35);
     }
 }
