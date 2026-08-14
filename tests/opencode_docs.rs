@@ -9,9 +9,10 @@
 //! the dedicated OpenCode local-usage section in `docs/providers.md`
 //! (path precedence, exact 17-alias allowlist, strict eligibility, token
 //! and cost semantics, standalone status, trust boundary, bounded
-//! diagnostics), the CHANGELOG Unreleased coverage, the complete Markdown
-//! inventory (AGENTS.md classified as generated and non-user-facing), the
-//! inventoried `src/config.rs` sample and `src/main.rs` help/status wording
+//! diagnostics), the CHANGELOG Unreleased coverage, the complete tracked
+//! Markdown inventory (via `git ls-files`, with AGENTS.md classified as
+//! generated and non-user-facing), the inventoried `src/config.rs` sample
+//! and `src/main.rs` help/status wording
 //! that already need no edits, and the no-overclaim / no-realistic-secret
 //! rules.
 
@@ -95,32 +96,31 @@ fn has_realistic_key(text: &str) -> bool {
     false
 }
 
-/// Every Markdown file in the repository, relative to the repo root,
-/// excluding build artifacts and the git directory.
+/// Every TRACKED Markdown file in the repository, relative to the repo
+/// root, as reported by git itself. Ignored workspace tooling —
+/// `.opencode/`, `.sage/`, `sage/`, `target/`, and generated process
+/// files — is never tracked, so it can never pollute the user-facing
+/// documentation inventory (DOC-4). Git is already required by the
+/// project's release tooling.
 fn markdown_inventory() -> Vec<String> {
-    fn walk(dir: &Path, prefix: &Path, out: &mut Vec<String>) {
-        let mut entries: Vec<_> = fs::read_dir(dir)
-            .unwrap_or_else(|e| panic!("reading {dir:?}: {e}"))
-            .filter_map(|e| e.ok())
-            .collect();
-        entries.sort_by_key(|e| e.file_name());
-        for entry in entries {
-            let path = entry.path();
-            let rel = prefix.join(entry.file_name());
-            if path.is_dir() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name == "target" || name == ".git" {
-                    continue;
-                }
-                walk(&path, &rel, out);
-            } else if rel.extension().is_some_and(|e| e == "md") {
-                out.push(rel.to_string_lossy().into_owned());
-            }
-        }
-    }
-    let mut out = vec![];
-    walk(&repo_root(), Path::new(""), &mut out);
-    out
+    let out = Command::new("git")
+        .args(["ls-files", "--", "*.md"])
+        .current_dir(repo_root())
+        .output()
+        .expect("running git ls-files");
+    assert!(
+        out.status.success(),
+        "git ls-files must succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut files: Vec<String> = String::from_utf8(out.stdout)
+        .expect("git ls-files output must be UTF-8")
+        .lines()
+        .map(|line| line.trim_end_matches('\r').to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+    files.sort();
+    files
 }
 
 // ---------------------------------------------------------------------------
