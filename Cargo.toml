@@ -1,6 +1,6 @@
 [package]
 name = "llmu"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 rust-version = "1.75"
 description = "Lean multi-provider LLM usage, cost, quota & balance reporter (CLI + TUI)"
