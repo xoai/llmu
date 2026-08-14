@@ -30,6 +30,10 @@ fn watch_local_refresh_preserves_every_local_usage_stream() {
         local_tick.contains("local::claude_code::collect"),
         "the local tick must refresh Claude Code transcripts"
     );
+    assert!(
+        local_tick.contains("local::opencode::collect"),
+        "the local tick must refresh OpenCode local usage directly"
+    );
     for provider in ["codex::Codex", "gemini::Gemini", "qwen::Qwen"] {
         assert!(
             local_tick.contains(provider),
@@ -60,5 +64,38 @@ fn watch_local_refresh_preserves_every_local_usage_stream() {
     assert!(
         local_tick.contains("apply_local_refresh("),
         "the local tick must preserve API rows while replacing local rows"
+    );
+}
+
+#[test]
+fn watch_local_tick_downgrades_completion_for_opencode_db_failure_before_apply() {
+    let src = include_str!("../src/tui.rs");
+    let local_tick = src
+        .split("} else if !is_paused && last_local.elapsed() >= locald {")
+        .nth(1)
+        .and_then(|section| section.split("std::thread::sleep").next())
+        .expect("local refresh branch");
+
+    let opencode_site = local_tick
+        .find("local::opencode::collect")
+        .expect("the local tick must collect OpenCode usage directly");
+    let failure_arm = local_tick
+        .find("opencode_db_failed(")
+        .expect("the local tick must consult the OpenCode DB-failure predicate");
+    let apply = local_tick
+        .find("apply_local_refresh(")
+        .expect("the local tick must apply the refresh state");
+
+    assert!(
+        opencode_site < failure_arm && failure_arm < apply,
+        "OpenCode DB failure must downgrade completion before apply_local_refresh"
+    );
+    assert!(
+        !local_tick.contains("available"),
+        "the local tick must not run an availability precursor probe"
+    );
+    assert!(
+        local_tick.contains("opencode_db_failed(&opencode.notes)"),
+        "the predicate must classify the OpenCode collector's own notes"
     );
 }

@@ -1898,3 +1898,67 @@ fn gather_merges_opencode_events_into_the_shared_usage_stream() {
         "a panicked OpenCode worker yields a bounded fixed note (FR-26)"
     );
 }
+
+/// FR-27/FR-28/AC-5: the TUI local tick owns OpenCode partial-refresh
+/// collection. It calls the collector directly (no gather, no provider
+/// filter, no availability precursor), recognizes exactly the two fixed
+/// database-level notes to downgrade completion so prior local rows
+/// survive, and never logs the (secret-free) notes.
+#[test]
+fn opencode_tui_local_tick_collects_directly_and_preserves_snapshot_on_db_failure() {
+    let src = read("src/tui.rs");
+    let local_tick = src
+        .split("} else if !is_paused && last_local.elapsed() >= locald {")
+        .nth(1)
+        .and_then(|section| section.split("std::thread::sleep").next())
+        .expect("local refresh branch");
+
+    assert!(
+        local_tick.contains("local::opencode::collect"),
+        "the local tick must call the OpenCode collector directly (FR-27)"
+    );
+    assert!(
+        !local_tick.contains("crate::gather"),
+        "the local tick must not invoke the general provider gather path"
+    );
+    assert!(
+        !local_tick.contains("Some(&filt)"),
+        "a provider filter is CLI report semantics, not local-source selection"
+    );
+    assert!(
+        !local_tick.contains("available"),
+        "the local tick must not run an availability precursor probe"
+    );
+    assert!(
+        !local_tick.contains("println") && !local_tick.contains("eprintln"),
+        "collection notes are never logged by the TUI"
+    );
+
+    for note in [
+        "opencode: local usage database is busy or unreadable",
+        "opencode: local usage database schema is unsupported",
+    ] {
+        assert!(
+            src.contains(note),
+            "the TUI must pin the fixed DB-failure note: {note}"
+        );
+    }
+    let predicate = src
+        .split("fn opencode_db_failed")
+        .nth(1)
+        .and_then(|arm| arm.split("\n}\n").next())
+        .expect("opencode_db_failed body");
+    assert!(
+        predicate.contains("opencode: local usage database is busy or unreadable")
+            && predicate.contains("opencode: local usage database schema is unsupported"),
+        "the predicate must match exactly the two fixed DB-failure notes"
+    );
+    assert!(
+        !predicate.contains("skipped"),
+        "bounded skip notes must never downgrade the refresh"
+    );
+    assert!(
+        !predicate.contains("apply_local_refresh"),
+        "the predicate only classifies notes; it must not apply state"
+    );
+}
