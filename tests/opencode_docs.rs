@@ -9,7 +9,8 @@
 //! the dedicated OpenCode local-usage section in `docs/providers.md`
 //! (path precedence, exact 17-alias allowlist, strict eligibility, token
 //! and cost semantics, standalone status, trust boundary, bounded
-//! diagnostics), the CHANGELOG Unreleased coverage, the complete tracked
+//! diagnostics), the CHANGELOG OpenCode release-note coverage (located by
+//! content marker so it survives the release finalizer), the complete tracked
 //! Markdown inventory (via `git ls-files`, with AGENTS.md classified as
 //! generated and non-user-facing), the inventoried `src/config.rs` sample
 //! and `src/main.rs` help/status wording
@@ -50,16 +51,18 @@ fn opencode_section() -> String {
     section(&read("docs/providers.md"), "## OpenCode local usage").to_string()
 }
 
-/// Body of the CHANGELOG `## [Unreleased]` section: everything up to the
-/// next `## [` version heading.
-fn unreleased_notes() -> String {
+/// Body of the changelog section holding the OpenCode release notes.
+/// Located by a content marker across the WHOLE changelog, never by the
+/// `## [Unreleased]` heading: the release finalizer moves that same body
+/// into a dated version section, so a heading-pinned contract turns every
+/// generated release PR red (prior correction: never pin mutable release
+/// lifecycle state). Passes both before finalization (Unreleased) and
+/// after (the dated release section).
+fn opencode_changelog_notes() -> String {
     read("CHANGELOG.md")
-        .split("## [Unreleased]")
-        .nth(1)
-        .expect("CHANGELOG must have an Unreleased section")
         .split("\n## [")
-        .next()
-        .unwrap()
+        .find(|section| section.contains("OpenCode local usage"))
+        .expect("one changelog section must contain the OpenCode release notes")
         .to_string()
 }
 
@@ -596,12 +599,14 @@ fn provider_sections_cross_reference_the_opencode_section() {
 }
 
 // ---------------------------------------------------------------------------
-// CHANGELOG: Unreleased coverage (DOC-3).
+// CHANGELOG: OpenCode release-note coverage (DOC-3), located by content
+// marker so the contract survives the release finalizer moving the same
+// body from Unreleased into the dated release section.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn changelog_unreleased_covers_opencode() {
-    let notes = unreleased_notes();
+    let notes = opencode_changelog_notes();
     for needle in [
         "OpenCode",
         "Qwen",
@@ -630,6 +635,10 @@ fn changelog_unreleased_covers_opencode() {
     assert!(
         !notes.contains("quota"),
         "the CHANGELOG must not overclaim a quota source (DOC-3)"
+    );
+    assert!(
+        notes.contains("OpenCode local usage"),
+        "the located section must be the OpenCode release notes (DOC-3)"
     );
 }
 
@@ -678,7 +687,7 @@ fn opencode_docs_make_no_forbidden_claims() {
         "{}\n{}\n{}",
         opencode_section(),
         readme_section("## OpenCode local usage records"),
-        unreleased_notes()
+        opencode_changelog_notes()
     );
     for bad in [
         "deduplicated",

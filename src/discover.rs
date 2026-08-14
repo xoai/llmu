@@ -221,15 +221,19 @@ fn apply_qwen(cfg: &mut Config, env: EnvLookup) {
 /// string `key` qualify; oauth entries and missing/wrong-typed keys never
 /// map. Provenance names the source, never the key (FR-32).
 fn opencode_token_plan_key(auth: &Value, src: &str) -> Option<(String, String)> {
-    ["alibaba-token-plan", "alibaba-token-plan-cn", "bailian-token-plan-personal"]
-        .iter()
-        .find_map(|id| {
-            let e = &auth[*id];
-            (e["type"].as_str() == Some("api"))
-                .then(|| e["key"].as_str())
-                .flatten()
-                .map(|k| (k.to_string(), format!("opencode auth {src}")))
-        })
+    [
+        "alibaba-token-plan",
+        "alibaba-token-plan-cn",
+        "bailian-token-plan-personal",
+    ]
+    .iter()
+    .find_map(|id| {
+        let e = &auth[*id];
+        (e["type"].as_str() == Some("api"))
+            .then(|| e["key"].as_str())
+            .flatten()
+            .map(|k| (k.to_string(), format!("opencode auth {src}")))
+    })
 }
 
 /// Fill unset cfg fields from local sources; record (field, source).
@@ -463,13 +467,18 @@ mod tests {
             "non-empty OPENCODE_DATA_DIR wins over XDG and home (FR-1)"
         );
         assert_eq!(
-            opencode_data_dir(&env_pairs(&[("XDG_DATA_HOME", "/tmp/llmu-xdg")]), Some(home)),
+            opencode_data_dir(
+                &env_pairs(&[("XDG_DATA_HOME", "/tmp/llmu-xdg")]),
+                Some(home)
+            ),
             Some(PathBuf::from("/tmp/llmu-xdg/opencode")),
             "XDG_DATA_HOME joins `opencode` (FR-1)"
         );
         assert_eq!(
             opencode_data_dir(&no_env, Some(home)),
-            Some(PathBuf::from("/tmp/llmu-opencode-home/.local/share/opencode")),
+            Some(PathBuf::from(
+                "/tmp/llmu-opencode-home/.local/share/opencode"
+            )),
             "the user home joins `.local/share/opencode` (FR-1)"
         );
         assert_eq!(
@@ -495,11 +504,15 @@ mod tests {
         );
         auth.as_object_mut().unwrap().remove("alibaba-token-plan");
         assert_eq!(
-            opencode_token_plan_key(&auth, "/tmp/llmu/auth.json").unwrap().0,
+            opencode_token_plan_key(&auth, "/tmp/llmu/auth.json")
+                .unwrap()
+                .0,
             "sk-token-plan-cn",
             "`alibaba-token-plan-cn` precedes `bailian-token-plan-personal` (FR-31)"
         );
-        auth.as_object_mut().unwrap().remove("alibaba-token-plan-cn");
+        auth.as_object_mut()
+            .unwrap()
+            .remove("alibaba-token-plan-cn");
         let (v, src) = opencode_token_plan_key(&auth, "/tmp/llmu/auth.json").unwrap();
         assert_eq!(v, "sk-token-per");
         assert!(

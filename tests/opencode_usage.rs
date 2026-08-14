@@ -2090,6 +2090,212 @@ fn tui_opencode_db_failed_pins_collector_note_constants_byte_exact() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Task 9 (AC-1): one coherent WAL-backed OpenCode Qwen fixture produces
+// exact provider/model/request/fresh-input/output+reasoning/cache totals
+// through CLI table, JSON, CSV, and the default overview. The inline WAL
+// fixtures in `src/local/opencode.rs` prove WAL visibility at the
+// collector/probe level; the pre-T9 report fixtures used non-WAL databases
+// — this is the missing end-to-end leg.
+// ---------------------------------------------------------------------------
+
+/// WAL-mode fixture (FR-7/AC-1): the schema is committed BEFORE the
+/// journal switches to WAL, so the main file holds the schema while the
+/// committed rows live only in `opencode.db-wal` frames (no checkpoint
+/// runs afterward). The returned writer connection stays open for the
+/// whole test — its closure would checkpoint/clean the WAL, which is
+/// exactly what these fixtures must avoid.
+fn write_wal_opencode_db(dir: &Path, rows: &[(i64, &str, &str)]) -> rusqlite::Connection {
+    fs::create_dir_all(dir).unwrap();
+    let path = dir.join("opencode.db");
+    let w = rusqlite::Connection::open(&path).unwrap();
+    w.execute_batch(
+        "CREATE TABLE message (id TEXT PRIMARY KEY, sessionID TEXT, time_created INTEGER, \
+         time_updated INTEGER, role TEXT, providerID TEXT, modelID TEXT, data TEXT)",
+    )
+    .unwrap();
+    w.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+    let mode: String = w
+        .pragma_query_value(None, "journal_mode", |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal", "the fixture must run in WAL journal mode");
+    for (t, id, data) in rows {
+        w.execute(
+            "INSERT INTO message (id, time_created, data) VALUES (?1, ?2, ?3)",
+            rusqlite::params![id, t, data],
+        )
+        .unwrap();
+    }
+    w
+}
+
+/// AC-1: a WAL-backed OpenCode fixture with Qwen records emits exact
+/// provider/model/request/fresh-input/output+reasoning/cache-read/cache-write
+/// totals through the CLI table, JSON, and CSV paths, and the default
+/// overview — while a copy of the main database alone holds no rows, so
+/// the totals genuinely come from committed WAL frames (FR-7). The TUI
+/// leg composes with the existing deterministic TestBackend render
+/// contracts in `src/tui.rs`
+/// (`opencode_canonical_rows_render_local_provenance_and_keep_the_footer`,
+/// `saturated_local_events_render_header_chart_and_model_paths_without_panic`)
+/// plus the source contract pinning the TUI local tick to the same
+/// `local::opencode::collect` entry point
+/// (`opencode_tui_local_tick_collects_directly_and_preserves_snapshot_on_db_failure`);
+/// a real terminal process is not appropriate for CI.
+#[test]
+fn opencode_wal_backed_qwen_fixture_emits_exact_cli_totals_end_to_end() {
+    let sb = Sandbox::new("t9-ac1-wal");
+    let dir = sb.dir.join("wal-usage");
+    let t1 = ms_at("2026-08-10T10:00:00Z");
+    let t2 = ms_at("2026-08-10T11:00:00Z");
+    let _w = write_wal_opencode_db(
+        &dir,
+        &[
+            (
+                t1,
+                "id-max",
+                record("alibaba", "qwen3.8-max", t1, [1500, 800, 200, 1000, 0]).as_str(),
+            ),
+            (
+                t2,
+                "id-preview",
+                record(
+                    "alibaba-token-plan",
+                    "qwen3.8-max-preview",
+                    t2,
+                    [100, 50, 10, 0, 25],
+                )
+                .as_str(),
+            ),
+        ],
+    );
+
+    // WAL-backedness proof: the -wal file carries committed frames, and a
+    // copy of the main database alone holds no rows (FR-7/AC-6).
+    let wal_len = fs::metadata(dir.join("opencode.db-wal"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    assert!(
+        wal_len > 0,
+        "opencode.db-wal must exist and carry committed frames"
+    );
+    let main_only = dir.join("main-only.db");
+    fs::copy(dir.join("opencode.db"), &main_only).unwrap();
+    let ro = rusqlite::Connection::open_with_flags(
+        &main_only,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .unwrap();
+    let main_count: i64 = ro
+        .query_row("SELECT COUNT(*) FROM message", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        main_count, 0,
+        "the main database file alone holds no rows — the fixture is genuinely WAL-only"
+    );
+
+    // JSON: exact provider/model/request/fresh-input/output+reasoning/cache totals.
+    let db = dir.join("opencode.db");
+    let rows = usage_rows(&sb, &db, &["--group-by", "provider,model", "--json"]);
+    assert_eq!(rows.len(), 2, "both WAL-backed Qwen records emit events");
+    assert_eq!(
+        rows[0]["keys"],
+        serde_json::json!(["2026-08-10", "qwen", "qwen3.8-max"]),
+        "the first row carries period, canonical provider, and the preserved OpenCode model id"
+    );
+    assert_eq!(rows[0]["requests"], 1);
+    assert_eq!(
+        rows[0]["input_tokens"], 1500,
+        "fresh input is never cache-subtracted"
+    );
+    assert_eq!(
+        rows[0]["output_tokens"], 1000,
+        "output + reasoning (800 + 200) fold into output"
+    );
+    assert_eq!(rows[0]["cache_read_tokens"], 1000);
+    assert_eq!(rows[0]["cache_write_tokens"], 0);
+    assert_eq!(rows[0]["total_tokens"], 3500);
+    assert_eq!(rows[0]["tool_calls"], 0);
+    assert_eq!(
+        rows[1]["keys"],
+        serde_json::json!(["2026-08-10", "qwen", "qwen3.8-max-preview"])
+    );
+    assert_eq!(rows[1]["requests"], 1);
+    assert_eq!(rows[1]["input_tokens"], 100);
+    assert_eq!(rows[1]["output_tokens"], 60, "50 output + 10 reasoning");
+    assert_eq!(rows[1]["cache_read_tokens"], 0);
+    assert_eq!(rows[1]["cache_write_tokens"], 25);
+    assert_eq!(rows[1]["total_tokens"], 185);
+
+    // CSV: exact machine output, unchanged schema, WAL-backed totals.
+    let out = run_usage(&sb, &db, &["--group-by", "provider,model", "--csv"]);
+    assert!(out.status.success(), "{}", sb.stderr(&out));
+    assert_eq!(
+        sb.stdout(&out),
+        "period,provider,model,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,total_tokens,tool_calls,est_cost_usd,has_cost\n\
+         2026-08-10,qwen,qwen3.8-max,1,1500,1000,1000,0,3500,0,0,false\n\
+         2026-08-10,qwen,qwen3.8-max-preview,1,100,60,0,25,185,0,0,false\n",
+        "the CSV keeps the exact header and carries the WAL-backed exact totals"
+    );
+    assert!(
+        !sb.stderr(&out).contains("opencode:"),
+        "a fully valid WAL-backed fixture emits no OpenCode diagnostics: {}",
+        sb.stderr(&out)
+    );
+
+    // Human table: canonical provider, preserved model ids, exact totals.
+    let out = run_usage(&sb, &db, &["--group-by", "provider,model"]);
+    assert!(out.status.success(), "{}", sb.stderr(&out));
+    let stdout = sb.stdout(&out);
+    for needle in [
+        "qwen",
+        "qwen3.8-max",
+        "qwen3.8-max-preview",
+        "1,500",
+        "1,000",
+        "3,500",
+        "TOTAL",
+    ] {
+        assert!(
+            stdout.contains(needle),
+            "the WAL-backed table must render `{needle}`:\n{stdout}"
+        );
+    }
+
+    // Default overview: the bare `llmu` landing view over a WAL-backed DB.
+    // The overview window is inherently now-relative (the same accepted
+    // exception as `opencode_overview_shows_local_provenance_and_saturates_without_panic`).
+    let ov_dir = sb.dir.join("wal-overview");
+    let t_now = chrono::Utc::now().timestamp_millis() - 2 * 60 * 60 * 1000;
+    let _w2 = write_wal_opencode_db(
+        &ov_dir,
+        &[(
+            t_now,
+            "id-ov",
+            record("alibaba", "qwen-max", t_now, [10, 20, 5, 3, 2]).as_str(),
+        )],
+    );
+    let out = sb
+        .cmd(Some(&ov_dir), Some(&sb.data()))
+        .args(["--config", sb.config_path().to_str().unwrap()])
+        .output()
+        .expect("spawning llmu binary");
+    assert!(
+        out.status.success(),
+        "the overview must not fail: {}",
+        sb.stderr(&out)
+    );
+    let stdout = sb.stdout(&out);
+    assert!(
+        stdout.contains("usage counted from: qwen (local logs)"),
+        "the overview scope line must show the WAL-backed Qwen local feed:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("TOTAL") && stdout.contains("usage counted from"),
+        "the overview table must render the WAL-backed provider row:\n{stdout}"
+    );
+}
+
 /// FR-30/NFR-3 black-box: a busy (exclusively locked) database prints
 /// `opencode no` within the 250 ms bound plus CI tolerance, and the status
 /// path never surfaces a diagnostic on stderr.
