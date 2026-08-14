@@ -67,7 +67,7 @@ Claude Code / Codex logs are re-parsed every 3 s (mtime-filtered, so it
 costs milliseconds), while usage APIs, quotas, and balances refresh every
 60 s — deliberately slow, since the Claude oauth/usage endpoint
 rate-limits aggressively. Tune with `--local-refresh` / `--refresh`
-(floor 15 s for network). The view: 24 h tokens/hour sparkline, per-period
+(floor 15 s for network). The view: 24 h ktok/hour sparkline, per-period
 bar chart, per-provider colored model table, threshold-colored quota
 gauges (green < 60 % < yellow < 85 % < red), balances. Keys: `q` quit,
 `d/w/m` period, `r` force a network refresh (bypasses the optional HTTP
@@ -94,7 +94,8 @@ tokens are never touched. Detected sources:
 | `~/.claude/.credentials.json` | live Claude session/weekly meters |
 | `~/.claude/settings.json` `env` block | GLM / Kimi-Code / DeepSeek keys from routed Claude Code setups (`ANTHROPIC_BASE_URL` decides which) |
 | `$CODEX_HOME` (`~/.codex`) sessions + `auth.json` | ChatGPT-plan usage + 5h/weekly limits |
-| OpenCode `auth.json` (`~/.local/share/opencode`, override: `OPENCODE_DATA_DIR`) | DeepSeek / Z.ai / Moonshot keys, Claude OAuth fallback |
+| OpenCode `auth.json` (`~/.local/share/opencode` default; `XDG_DATA_HOME/opencode`, override: `OPENCODE_DATA_DIR`) | DeepSeek / Z.ai / Moonshot keys, Claude OAuth fallback |
+| OpenCode `opencode.db` (same directory resolver, default `~/.local/share/opencode/opencode.db`) | read-only local usage records mapped to qwen / glm / deepseek / kimi / openai — additive with APIs and client logs (possible overlap, no request dedup) |
 | kimi-cli `~/.kimi/credentials/*.json` (override: `KIMI_SHARE_DIR`) | Kimi For Coding quota |
 | `~/.gemini/oauth_creds.json` (override: `[gemini] credentials` / `GEMINI_CLI_HOME`) | Gemini Code Assist quotas (plaintext OAuth, auto-refreshed; encrypted/keychain stores unsupported) |
 | `~/.qwen/settings.json` `env` block + `usage/` ledgers (override: `[qwen]` home/runtime, `QWEN_HOME`, `QWEN_RUNTIME_DIR`) | Qwen (Alibaba Cloud Model Studio) local request/legacy usage records — read-only, no Qwen network call; QwenCloud account quota/billing stays console-only |
@@ -122,6 +123,7 @@ normalizes three record types instead of pretending everything is uniform:
 | GLM (Z.ai / bigmodel.cn) | ⚠️ model-usage endpoint (best effort) | ❌ | – | ✅ Coding-Plan session/weekly % + tool quota via `/api/monitor/usage/quota/limit` |
 | Gemini API | ⚠️ client-side: log `usageMetadata` per response | via Google Cloud Billing only | – | ✅ Code Assist quotas via Gemini CLI OAuth (auto-refreshed) |
 | Qwen (Alibaba Cloud Model Studio / QwenCloud) | ✅ local Qwen Code records (request ledger + legacy session summaries; routed Claude Code `qwen*` rows included) | est. only — no built-in Qwen price guesses | – | – (QwenCloud analytics/quota/billing is console-only; no inference-key account API) |
+| OpenCode (local usage records) | ✅ local `opencode.db` message records → qwen / glm / deepseek / kimi / openai (additive with APIs/client logs) | est. only | – | – |
 
 Legend: ✅ official API · ⚠️ workaround (local logs / undocumented endpoint) · ❌ not exposed.
 
@@ -138,6 +140,32 @@ Consequences baked into the design:
   Claude Code writes per-message token usage into JSONL transcripts; llmu
   parses, dedupes on `(message.id, requestId)`, and buckets hourly so the
   rolling 5-hour window is cheap to compute.
+
+## OpenCode local usage records
+
+OpenCode's local SQLite database (`~/.local/share/opencode/opencode.db`, or
+`XDG_DATA_HOME/opencode` / `OPENCODE_DATA_DIR` — the same resolver that
+finds `auth.json`) holds per-message usage records for many providers. `llmu
+usage` reads completed assistant records read-only and reports them under
+llmu's canonical provider ids (qwen / glm / deepseek / kimi / openai); see
+`docs/providers.md` for the exact provider-id allowlist, eligibility rules,
+and trust boundary. `llmu providers` shows a standalone `opencode` row that
+is `yes` only when the database is readable and holds an eligible record.
+
+OpenCode records are additive with provider APIs and other client logs: a
+request run through OpenCode may also appear in another feed (possible
+overlap), llmu never deduplicates across sources, and only the
+`[pricing]`-table estimate is shown for them — never a billed or account
+amount from OpenCode.
+
+Reproduce a Qwen-through-OpenCode setup:
+
+```
+llmu providers                         # opencode row should be "yes"
+llmu usage --since 7d --provider qwen  # Alibaba OpenCode records under qwen
+llmu usage --since 7d --provider qwen --model qwen-plus   # model substring
+llmu usage --since 7d --provider qwen --source local      # local records only
+```
 
 ## Configuration
 
@@ -342,10 +370,11 @@ entry (longest-prefix match). Add one to `~/.config/llmu/config.toml`.
 The header totals, activity sparkline, bar chart, and by-model table sum
 **only sources that produce usage events**: local Claude Code transcripts,
 local Codex session logs, Qwen Code's local request/legacy ledgers (plus
-routed Claude Code `qwen*` rows), the Anthropic/OpenAI org usage APIs (admin
-keys), GLM's model-usage endpoint (best effort), and the Gemini usage log.
-Both UIs print exactly which feeds are being counted, and which configured
-providers can't contribute:
+routed Claude Code `qwen*` rows), OpenCode's local message records (mapped
+to qwen / glm / deepseek / kimi / openai), the Anthropic/OpenAI org usage
+APIs (admin keys), GLM's model-usage endpoint (best effort), and the Gemini
+usage log. Both UIs print exactly which feeds are being counted, and which
+configured providers can't contribute:
 
 - **DeepSeek** exposes no usage/history API at all — only a wallet
   balance — so it can never appear in usage panels from its own API.

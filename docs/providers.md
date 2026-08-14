@@ -30,12 +30,16 @@
 - ChatGPT Plus/Pro subscription usage has no public API, but the Codex CLI
   path covers it — wired as provider `codex` (see "ChatGPT plan / Codex
   CLI" below).
+- OpenCode local records map to `openai`; see the shared
+  **OpenCode local usage** section below.
 
 ## DeepSeek (implemented)
 - `GET https://api.deepseek.com/user/balance` → `balance_infos[]` with
   `currency` (CNY|USD), `total_balance`, `granted_balance`,
   `topped_up_balance` as decimal strings. No usage-history endpoint, so llmu
   snapshots balances per run and derives spend from deltas.
+- OpenCode local records map to `deepseek`; see the shared
+  **OpenCode local usage** section below.
 
 ## Kimi / Moonshot (implemented)
 - `GET {base}/v1/users/me/balance` (base `api.moonshot.ai` or `.cn`) →
@@ -43,6 +47,8 @@
 - Kimi Code membership quota (5h window + weekly) is served to the CLI via
   OAuth stored in `~/.kimi/credentials/`; undocumented. Reference:
   https://github.com/luisleineweber/usagebar (docs/providers/kimi.md).
+- OpenCode local records map to `kimi`; see the shared
+  **OpenCode local usage** section below.
 
 ## GLM — Z.ai / Zhipu (implemented)
 - Coding-Plan quotas (5h token window, weekly, MCP monthly) come from
@@ -56,6 +62,8 @@
 - Mind the two platforms: `api.z.ai` (global) vs `open.bigmodel.cn` (CN);
   keys are not interchangeable, and coding-plan traffic must use the
   `/api/coding/paas/v4` base or it bills the wallet instead of the plan.
+- OpenCode local records map to `glm`; see the shared
+  **OpenCode local usage** section below.
 
 ## Gemini (implemented via client-side logging)
 - Google routes Gemini API billing through Cloud Billing; programmatic
@@ -137,6 +145,88 @@ endpoints. A key-only configuration shows as configured but claims no live
 account usage; malformed or unreadable local records are skipped with one
 aggregate secret-free note each.
 
+OpenCode local records for Qwen aliases are read through the shared
+**OpenCode local usage** section below.
+
+## OpenCode local usage (implemented, local)
+
+llmu reads completed assistant usage records from OpenCode's local SQLite
+database, read-only, and reports them under llmu's canonical provider
+identities — Qwen, GLM, DeepSeek, Kimi, and OpenAI (see each provider's
+section above for its other sources). This is separate from OpenCode
+`auth.json` credential discovery: auth supplies keys for some providers;
+usage reads message records and never touches credentials.
+
+**Paths and precedence.** One shared resolver supplies both the auth and
+the database path: non-empty `OPENCODE_DATA_DIR`, else `XDG_DATA_HOME`
+joined with `opencode`, else `~/.local/share/opencode`. The database is
+`<effective-dir>/opencode.db`. A missing database is silent; usage simply
+reports no OpenCode records.
+
+**Read-only, WAL-aware access.** The live database is opened read-only
+(no create, no URI interpretation) with `query_only` enabled and a 250 ms
+busy timeout, so current `-wal`/`-shm` state stays visible; `immutable=1`
+is never used and the database is never copied, snapshotted, written,
+migrated, or vacuumed. Only the `message` table is queried
+(`time_created`, `data`); `event` and `part` tables are never read. No
+browser cookies, console endpoints, or network calls are involved, and no
+message text, prompts, IDs, paths, SQL, or credentials ever appear in
+diagnostics.
+
+**Provider attribution.** Attribution uses an exact, case-sensitive
+allowlist of OpenCode `providerID` values — never model-prefix inference:
+
+| OpenCode providerID | llmu provider |
+|---|---|
+| `alibaba`, `alibaba-cn`, `alibaba-coding-plan`, `alibaba-coding-plan-cn`, `alibaba-token-plan`, `alibaba-token-plan-cn`, `bailian-token-plan-personal` | `qwen` |
+| `zai`, `zai-coding-plan`, `zhipuai`, `zhipuai-coding-plan` | `glm` |
+| `deepseek` | `deepseek` |
+| `kimi-for-coding`, `moonshot`, `moonshotai`, `kimi` | `kimi` |
+| `openai` | `openai` |
+
+Unknown or generic (`opencode`) provider IDs are skipped and counted once;
+no model id is inspected to guess a provider.
+
+**Eligibility.** A record counts only as a completed assistant message:
+`role` is `assistant`; `error` is absent or null; `finish` is exactly
+`tool-calls`, `stop`, or `length`; `time.created` equals the database row
+timestamp and `time.completed` is present; every token bucket is a
+nonnegative integer; the normalized total is positive; and no decoded JSON
+key is duplicated at any nesting depth. Records that fail any of these —
+user/error/incomplete roles, malformed JSON, wrong types, negative or
+fractional numbers, duplicate decoded keys — are skipped and counted once
+as malformed.
+
+**Token and cost semantics.** `tokens.input` is fresh input (never
+cache-subtracted), `tokens.reasoning` folds into output with saturating
+addition, `tokens.cache.read`/`write` map directly, and every aggregate
+and derived total saturates at `u64::MAX`. Records are bucketed hourly and
+aggregated per provider/model/hour. OpenCode's stored local `cost` is
+ignored: the only cost shown is llmu's `[pricing]`-table estimate — never
+a provider-billed or account amount.
+
+**Overlap and filters.** OpenCode records are additive with provider APIs
+and other client logs; a request run through OpenCode may also appear in an
+API aggregate or another client's log. llmu cannot prove overlap without
+stable shared request ids and never deduplicates across sources, so
+overlapping feeds can overcount. Existing `--provider`, `--model`, and
+`--source local` filters apply unchanged; `--provider qwen` admits every
+mapped Qwen alias.
+
+**Standalone status.** `llmu providers` shows a standalone `opencode` row
+that is `yes` only when a read-only one-row query finds a record accepted
+by the same strict validator and provider allowlist as collection;
+missing, unreadable, busy, incompatible, or rejected-only databases answer
+`no`. The probe is lighter than collection — it returns one constant and
+performs no aggregation — but it is not constant-time: with no matching
+record it may examine every `message` row. The status table prints
+no diagnostics; detailed diagnostics appear only as `llmu usage` notes.
+
+**Diagnostics.** `llmu usage` prints at most one bounded note per category
+— malformed records, records from unsupported providers, a busy or unreadable
+database, or an unsupported schema — and nothing else: no paths, SQL text,
+record JSON, provider/model values, IDs, or credentials. A missing database
+is silent.
 ---
 
 ## Endpoints recovered from CLIs & open-source trackers (2026-08)

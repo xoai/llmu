@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- OpenCode local usage: read-only, WAL-aware reads of
+  `~/.local/share/opencode/opencode.db` (`OPENCODE_DATA_DIR` override,
+  `XDG_DATA_HOME` fallback) surface completed assistant records for Qwen,
+  GLM, DeepSeek, Kimi, and OpenAI under llmu's canonical provider ids —
+  closing the observed gap where Qwen usage ran through OpenCode but never
+  appeared. Records are additive with API and client-log sources (possible
+  overlap, no cross-source dedup), reasoning folds into output, cache maps
+  directly, and only llmu `[pricing]` estimates appear — never OpenCode's
+  local cost. Attribution is strict: an exact allowlisted provider-id set,
+  never model-prefix inference.
+- Standalone `opencode` row in `llmu providers`: `yes` only when a
+  read-only one-row query finds a record accepted by the same strict
+  validator as collection; missing, busy, corrupt, or incompatible
+  databases answer `no` with no diagnostics in the status table.
+- Token totals saturate at `u64::MAX` across aggregation, reports, and the
+  TUI, so valid maximum-value OpenCode records never panic or wrap.
+
 ## [0.1.4] - 2026-08-12
 
 ### Fixed
