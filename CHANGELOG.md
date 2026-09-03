@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **macOS Claude quotas no longer silently use a stale borrowed token.**
+  Claude Code stores its `claudeAiOauth` blob in the login keychain on
+  macOS, so none of llmu's plaintext search paths existed and the
+  `claude` provider fell back to whichever direct access token discovery
+  could find — typically OpenCode's, which nothing refreshes once
+  OpenCode stops running. llmu now reads the `Claude Code-credentials`
+  keychain item (service + `$USER` account) **read-only**: it never
+  writes to a keychain, so refresh-token rotation stays owned by Claude
+  Code and cannot log the user out. Precedence is plaintext file
+  (refreshable) > keychain > direct token. Configure a non-default item
+  with `[claude] keychain_service`, or `""` to opt out. Every `security`
+  invocation is bounded (5s) and the child killed on expiry, so a locked
+  keychain's unlock prompt can never hang a CLI run or a TUI tick.
+- **Expired borrowed OAuth tokens are no longer adopted.** OpenCode's
+  `auth.json` records a millisecond `expires`; discovery now skips an
+  entry that has already lapsed instead of installing a dead credential.
+- **`oauth/usage` 429s are no longer reported as plain throttling on
+  unrefreshable sources.** The endpoint answers **429 `rate_limit_error`,
+  not 401**, for an expired or revoked token, so the previous wording
+  ("retry in a few minutes") pointed users away from the only fix. The
+  refreshable file-backed path keeps its exact historical message, where
+  a 429 really is throttling.
+- **Model-scoped weekly meters are no longer dropped.** Entries in the
+  `limits[]` array report `percent` (not `utilization`) and nest the
+  model under `scope.model.{display_name,id}` (not a bare `model`
+  string), so every `weekly_scoped` meter — often the one nearest its
+  cap — was parsed away. Both shapes are now read, and the meter is
+  labelled with its model (e.g. `7d-Opus`).
+
 ## [0.1.5] - 2026-08-14
 
 ### Added

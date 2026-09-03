@@ -245,12 +245,45 @@ Authorization: Bearer <claudeAiOauth.accessToken>
 anthropic-beta: oauth-2025-04-20
 ```
 
-Token: `.credentials.json` in `$CLAUDE_CONFIG_DIR` / `~/.claude` /
-`~/.config/claude` (macOS may use the keychain item "Claude Code-credentials";
-export it and point `[claude].credentials` at the copy). Response:
-`five_hour`, `seven_day`, `seven_day_sonnet` → `{utilization, resets_at}`,
-plus `limits[]` entries of `kind: "weekly_scoped"` for model-scoped weekly
-meters. Aggressively rate-limited — llmu calls it once per run.
+Token discovery, in precedence order:
+1. `.credentials.json` in `$CLAUDE_CONFIG_DIR` / `~/.claude` /
+   `~/.config/claude` — the only refreshable source, so it wins.
+2. macOS login keychain, generic-password service
+   `Claude Code-credentials` with account `$USER` (override:
+   `[claude] keychain_service`; `""` opts out). This is where Claude Code
+   actually stores the blob on macOS, so without it a Mac has *no*
+   Claude Code credentials and falls through to step 3. Read **read-only**
+   via `/usr/bin/security` — llmu never writes to, deletes from, or
+   unlocks a keychain, because refresh rotates the refresh token and llmu
+   cannot update the keychain atomically alongside it; doing so would
+   invalidate Claude Code's stored refresh token and log the user out.
+   Rotation therefore stays Claude Code's job, and an expired item is
+   reported as such rather than refreshed. Every `security` call is
+   bounded (5s, child killed on expiry) so a locked keychain's unlock
+   prompt cannot hang a CLI run or a TUI tick. A non-default
+   `CLAUDE_CONFIG_DIR` makes Claude Code scope the item name
+   (`Claude Code-credentials-<8 hex>`); the suffix is not derivable and a
+   keychain routinely holds many such items, so llmu declines to guess
+   and emits a note naming `[claude] keychain_service` instead.
+3. A direct access token (e.g. OpenCode's `auth.json` `anthropic` OAuth
+   entry) — last resort, never refreshed. Discovery skips an entry whose
+   millisecond `expires` has already lapsed, since adopting a dead token
+   yields a permanent misleading 429 (below) instead of a credential.
+
+Response: `five_hour`, `seven_day`, `seven_day_sonnet` →
+`{utilization, resets_at}`, plus `limits[]` entries of
+`kind: "weekly_scoped"` for model-scoped weekly meters. `limits[]`
+entries report `percent` rather than `utilization` and nest the model
+under `scope.model.{display_name,id}` rather than a bare `model` string;
+llmu accepts both shapes, and a scoped meter is labelled with its model
+(e.g. `7d-Opus`). Aggressively rate-limited — llmu calls it once per run.
+
+The endpoint answers **429 `rate_limit_error`, not 401**, for an expired
+or revoked bearer. On the refreshable file-backed path a 429 really is
+throttling and keeps the historical message; on a source llmu cannot
+refresh (keychain, direct token) the 429 message names token expiry as
+an equally likely cause, so the user is not sent to "retry in a few
+minutes" forever when only re-authentication will help.
 
 OAuth refresh (file-backed `claudeAiOauth` entries only, FR-6):
 - Proactive refresh when the access token expires within five minutes

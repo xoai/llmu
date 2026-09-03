@@ -92,6 +92,7 @@ tokens are never touched. Detected sources:
 |--------|-----------------|
 | `~/.claude/projects/**/*.jsonl` | Claude Pro/Max token usage (local transcripts) |
 | `~/.claude/.credentials.json` | live Claude session/weekly meters |
+| macOS login keychain item `Claude Code-credentials` (override: `[claude] keychain_service`; `""` disables) | live Claude session/weekly meters where Claude Code stores its token on macOS — read **read-only** — llmu never writes to a keychain, so Claude Code keeps owning token rotation |
 | `~/.claude/settings.json` `env` block | GLM / Kimi-Code / DeepSeek keys from routed Claude Code setups (`ANTHROPIC_BASE_URL` decides which) |
 | `$CODEX_HOME` (`~/.codex`) sessions + `auth.json` | ChatGPT-plan usage + 5h/weekly limits |
 | OpenCode `auth.json` (`~/.local/share/opencode` default; `XDG_DATA_HOME/opencode`, override: `OPENCODE_DATA_DIR`) | DeepSeek / Z.ai / Moonshot keys, Claude OAuth fallback |
@@ -332,6 +333,25 @@ itself with a `note:` on stderr instead of staying silent. The common ones:
   `claude` login cures it. For OpenCode access tokens, refresh Anthropic
   authentication in OpenCode or configure Claude Code credentials; llmu
   cannot refresh direct access tokens.
+- `oauth/usage returned HTTP 429: either the endpoint is throttling … or
+  the access token is expired/revoked` — `oauth/usage` answers **429, not
+  401**, for a dead token, so pure "rate-limited" wording would be
+  misleading on a source llmu cannot refresh. Retry once; if it persists,
+  re-authenticate the client that owns the token. llmu refreshes only
+  plaintext `claudeAiOauth` files, never a borrowed access token and
+  never a keychain item.
+- `Claude Code's keychain access token has expired — run any Claude Code
+  command to refresh it` — llmu reads the macOS keychain item read-only.
+  Refreshing would rotate the refresh token without being able to update
+  the keychain atomically, which would log you out of Claude Code, so
+  rotation stays Claude Code's job.
+- `claude: no "Claude Code-credentials" keychain item, and
+  CLAUDE_CONFIG_DIR is set` — Claude Code scopes the keychain item name
+  per config directory (`Claude Code-credentials-<hash>`). The suffix is
+  not derivable, and a keychain often holds many such items, so llmu
+  declines to guess: find yours with
+  `security dump-keychain | grep 'Claude Code-credentials'` and set
+  `[claude] keychain_service` to that exact name.
 - `gemini: quota: Gemini CLI encrypted/keychain credential storage is
   unsupported…` — `oauth_creds.json` is absent but the sibling
   `gemini-credentials.json` encrypted marker exists. Run `gemini` once to

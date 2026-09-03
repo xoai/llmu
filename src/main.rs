@@ -3,6 +3,7 @@ mod config;
 mod credentials;
 mod discover;
 mod http;
+mod keychain;
 mod local;
 mod providers;
 mod report;
