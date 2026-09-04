@@ -148,10 +148,16 @@ fn tui_carries_initial_freshness_and_a_pure_refresh_state_machine() {
         tui.contains("FetchContext::from_config"),
         "src/tui.rs must build the typed fetch context per network tick"
     );
+    assert!(
+        tui.contains("struct QuotaBackoff"),
+        "src/tui.rs must pace the quota cadence as a pure state machine, so a \
+         throttled oauth/usage tick cannot freeze the meters for the session"
+    );
     let main = read("src/main.rs");
     assert!(
-        main.contains("tui::run(cfg, since, refresh, local_refresh, cli.fresh)"),
-        "the global --fresh must reach the TUI as its initial-fetch bypass (FR-3.2)"
+        main.contains("tui::run(cfg, since, refresh, quota_refresh, local_refresh, cli.fresh)"),
+        "the global --fresh must reach the TUI as its initial-fetch bypass (FR-3.2), \
+         alongside the separate quota cadence"
     );
 }
 

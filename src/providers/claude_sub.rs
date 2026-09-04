@@ -26,10 +26,13 @@ const REFRESH_WARNING_MS: i64 = 3 * 24 * 60 * 60 * 1000;
 ///   Authorization: Bearer <accessToken>
 ///   anthropic-beta: oauth-2025-04-20
 ///
-/// Token discovery: `claudeAiOauth` inside `.credentials.json` in
-/// $CLAUDE_CONFIG_DIR / ~/.claude / ~/.config/claude (on macOS, Claude
-/// Code may keep it in the keychain instead — point [claude].credentials
-/// at an exported copy then).
+/// Token discovery, in precedence order:
+///   1. `claudeAiOauth` inside `.credentials.json` in
+///      $CLAUDE_CONFIG_DIR / ~/.claude / ~/.config/claude (refreshable).
+///   2. On macOS, the `Claude Code-credentials` keychain item, which is
+///      where Claude Code actually stores the blob on that platform
+///      (read-only — see `quota_keychain`).
+///   3. A direct access token, e.g. OpenCode's auth.json (read-only).
 ///
 /// Response shape: `five_hour` / `seven_day` / `seven_day_sonnet`
 /// objects with {utilization, resets_at}, plus a `limits[]` array of
@@ -46,8 +49,16 @@ const REFRESH_WARNING_MS: i64 = 3 * 24 * 60 * 60 * 1000;
 /// The endpoint rate-limits aggressively; llmu calls it once per run.
 pub struct ClaudeSub;
 
+/// The percentage a meter reports. Top-level window objects
+/// (`five_hour`, `seven_day`, …) carry `utilization`; entries in the
+/// newer `limits[]` array carry `percent` instead. Accepting both keeps
+/// model-scoped meters from being silently dropped.
+fn meter_percent(v: &serde_json::Value) -> Option<f64> {
+    v["utilization"].as_f64().or_else(|| v["percent"].as_f64())
+}
+
 fn window(v: &serde_json::Value, plan: &str, window: &str) -> Option<QuotaSnapshot> {
-    let used = v["utilization"].as_f64()?;
+    let used = meter_percent(v)?;
     Some(QuotaSnapshot {
         provider: "claude".into(),
         plan: plan.into(),
@@ -77,8 +88,7 @@ fn parse_usage(v: &serde_json::Value, plan: &str, out: &mut Vec<QuotaSnapshot>) 
     // Newer payloads: model-scoped weekly meters under `limits[]`.
     for l in v["limits"].as_array().unwrap_or(&vec![]) {
         if l["kind"].as_str() == Some("weekly_scoped") {
-            let label = l["model"]
-                .as_str()
+            let label = scoped_model(l)
                 .map(|m| format!("7d-{m}"))
                 .unwrap_or_else(|| "7d-scoped".into());
             if let Some(q) = window(l, plan, &label) {
@@ -86,6 +96,20 @@ fn parse_usage(v: &serde_json::Value, plan: &str, out: &mut Vec<QuotaSnapshot>) 
             }
         }
     }
+}
+
+/// The model a `weekly_scoped` meter is scoped to. Current payloads nest
+/// it as `scope.model.{display_name,id}`; older ones put a bare string in
+/// `model`. Without the nested lookup every scoped meter collapses to the
+/// indistinguishable label `7d-scoped`.
+fn scoped_model(l: &serde_json::Value) -> Option<String> {
+    let m = &l["scope"]["model"];
+    m["display_name"]
+        .as_str()
+        .or_else(|| m["id"].as_str())
+        .or_else(|| l["model"].as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
 }
 
 fn now_ms() -> i64 {
@@ -372,10 +396,36 @@ fn usage_is_401(e: &anyhow::Error) -> bool {
 
 /// Existing 429 messaging survives verbatim (FR-6.10); every other error
 /// passes through unchanged.
+///
+/// Only sound for the file-backed path, where the token was just
+/// validated or refreshed, so a 429 really is throttling. Read-only
+/// sources use [`map_unrefreshable_usage_error`] instead.
 fn map_usage_error(e: anyhow::Error) -> anyhow::Error {
     if e.to_string().contains("HTTP 429") {
         anyhow::anyhow!(
             "oauth/usage rate-limited (this endpoint throttles hard) — retry in a few minutes"
+        )
+    } else {
+        e
+    }
+}
+
+/// 429 mapping for token sources llmu cannot refresh (a borrowed direct
+/// access token, or the read-only keychain item).
+///
+/// `oauth/usage` answers **429 `rate_limit_error`, not 401**, when the
+/// bearer token is expired or revoked — verified against the live
+/// endpoint. Reporting that as plain throttling sends the user off to
+/// "retry in a few minutes" forever while the real fix is
+/// re-authentication, so an unrefreshable source names both causes and
+/// says which one llmu cannot rule out.
+fn map_unrefreshable_usage_error(e: anyhow::Error, remedy: &str) -> anyhow::Error {
+    if e.to_string().contains("HTTP 429") {
+        anyhow::anyhow!(
+            "oauth/usage returned HTTP 429: either the endpoint is throttling (it does so hard) \
+             or the access token is expired/revoked — it answers 429, not 401, for a dead token, \
+             and llmu cannot refresh this token source. If retrying in a few minutes does not \
+             help, {remedy}"
         )
     } else {
         e
@@ -462,7 +512,11 @@ fn quota_direct(cfg: &Config, ep: &Endpoints, ctx: &FetchContext) -> Result<Quot
                 "oauth/usage 401: expired access token — refresh Anthropic authentication in OpenCode or configure Claude Code credentials; llmu cannot refresh direct access tokens"
             )
         } else {
-            map_usage_error(e)
+            map_unrefreshable_usage_error(
+                e,
+                "re-authenticate the client that owns this token (e.g. OpenCode) or configure \
+                 Claude Code credentials",
+            )
         }
     })?;
     let live = usage.origin == http::CacheOrigin::Live;
@@ -476,12 +530,85 @@ fn quota_direct(cfg: &Config, ep: &Endpoints, ctx: &FetchContext) -> Result<Quot
     })
 }
 
-/// Internal entry point with an injectable endpoint bundle (AD-4).
-fn quotas_impl(cfg: &Config, ctx: &FetchContext, ep: &Endpoints) -> Result<QuotaFetch> {
-    match cfg.claude.credentials_path() {
-        Some(path) => quota_file_backed(&path, ep, ctx),
-        None => quota_direct(cfg, ep, ctx),
+/// macOS keychain flow: read-only, never refreshed, never written back.
+///
+/// Claude Code owns rotation for its own keychain item. llmu deliberately
+/// does not refresh here even though a refresh token is present: the
+/// token endpoint rotates refresh tokens, and llmu cannot update the
+/// keychain atomically alongside it (`keychain.rs`), so refreshing would
+/// invalidate Claude Code's stored refresh token and log the user out.
+/// An expired item is reported as such — running any Claude Code command
+/// refreshes it in place.
+fn quota_keychain(service: &str, ep: &Endpoints, ctx: &FetchContext) -> Result<QuotaFetch> {
+    let root = crate::keychain::read_json(service)?;
+    let state = ClaudeOauth::from_root(&root)?;
+    if state.expires_at.is_some() && !state.unexpired() {
+        bail!(
+            "Claude Code's keychain access token has expired — run any Claude Code command to \
+             refresh it (llmu never writes to a keychain, so it cannot rotate the token itself)"
+        );
     }
+    let usage = usage_get(&state.token, ep, ctx).map_err(|e| {
+        map_unrefreshable_usage_error(
+            e,
+            "run any Claude Code command to refresh the keychain item",
+        )
+    })?;
+    let live = usage.origin == http::CacheOrigin::Live;
+    let plan = state
+        .sub_type
+        .unwrap_or_else(|| "Claude subscription".into());
+    let mut out = vec![];
+    parse_usage(&usage.body, &plan, &mut out);
+    let empty = out.is_empty();
+    Ok(QuotaFetch {
+        snapshots: out,
+        notes: vec![],
+        refresh_last_known_good: live && !empty,
+    })
+}
+
+/// Internal entry point with an injectable endpoint bundle (AD-4).
+///
+/// A plaintext credentials file wins because it is the only source llmu
+/// can refresh; the macOS keychain comes next because it is Claude
+/// Code's own store and is kept fresh by Claude Code itself; a borrowed
+/// direct access token is the last resort.
+fn quotas_impl(cfg: &Config, ctx: &FetchContext, ep: &Endpoints) -> Result<QuotaFetch> {
+    if let Some(path) = cfg.claude.credentials_path() {
+        return quota_file_backed(&path, ep, ctx);
+    }
+    if let Some(service) = cfg.claude.keychain_available() {
+        return quota_keychain(&service, ep, ctx);
+    }
+    let mut fetch = quota_direct(cfg, ep, ctx)?;
+    let config_dir = std::env::var("CLAUDE_CONFIG_DIR").ok();
+    fetch.notes.extend(scoped_keychain_note(
+        cfg.claude.keychain_service_name().as_deref(),
+        config_dir.as_deref(),
+    ));
+    Ok(fetch)
+}
+
+/// Diagnostic for the one macOS layout llmu cannot resolve on its own.
+///
+/// A non-default `CLAUDE_CONFIG_DIR` makes Claude Code file its keychain
+/// item under an installation-scoped service name
+/// (`Claude Code-credentials-<8 hex>`). The suffix is not derivable from
+/// anything llmu can observe, and a keychain routinely holds dozens of
+/// such items, so picking one by prefix could read a different
+/// installation's credentials. Rather than guess, point at the knob that
+/// settles it. Emitted only when that layout is actually in play: macOS,
+/// keychain lookups enabled, `CLAUDE_CONFIG_DIR` set, and the default
+/// item absent.
+/// Pure so it is testable without mutating process env: `std::env`
+/// writes race every other thread's reads under a parallel test runner.
+fn scoped_keychain_note(service: Option<&str>, config_dir: Option<&str>) -> Option<String> {
+    let service = service?;
+    config_dir.map(str::trim).filter(|d| !d.is_empty())?;
+    Some(format!(
+        "claude: no {service:?} keychain item, and CLAUDE_CONFIG_DIR is set — Claude Code scopes          the item name per config directory ({service}-<hash>); set [claude] keychain_service to          that exact name to enable live quotas"
+    ))
 }
 
 impl Provider for ClaudeSub {
@@ -489,10 +616,12 @@ impl Provider for ClaudeSub {
         "claude"
     }
     fn configured(&self, cfg: &Config) -> bool {
-        cfg.claude.credentials_path().is_some() || cfg.claude.access_token.is_some()
+        cfg.claude.credentials_path().is_some()
+            || cfg.claude.keychain_available().is_some()
+            || cfg.claude.access_token.is_some()
     }
     fn capabilities(&self) -> &'static str {
-        "Pro/Max live session + weekly quotas via api.anthropic.com/api/oauth/usage (Claude Code OAuth token, auto-refreshed)"
+        "Pro/Max live session + weekly quotas via api.anthropic.com/api/oauth/usage (Claude Code OAuth token from .credentials.json (auto-refreshed) or the macOS keychain (read-only))"
     }
 
     fn quotas(&self, cfg: &Config, ctx: &FetchContext) -> Result<QuotaFetch> {
@@ -539,6 +668,9 @@ mod tests {
         let mut cfg = Config::default();
         cfg.claude.credentials = Some(path);
         cfg.claude.access_token = None;
+        // Keep the file-backed path hermetic on a developer Mac, where
+        // the keychain is a live credential source.
+        cfg.claude.keychain_service = Some(String::new());
         cfg
     }
 
@@ -1183,6 +1315,9 @@ mod tests {
         let mut cfg = Config::default();
         cfg.claude.credentials = Some("/nonexistent/llmu-t5-opencode-test".into());
         cfg.claude.access_token = Some("DT-1".into());
+        // The keychain outranks a direct token, so pin it off to keep
+        // this test on the direct path on a developer Mac.
+        cfg.claude.keychain_service = Some(String::new());
         let srv = FixtureServer::start(vec![ScriptedResponse::usage(
             401,
             r#"{"error":"unauthorized"}"#,
@@ -1337,5 +1472,205 @@ mod tests {
             "the stored fresh response is now a plain cache hit"
         );
         assert_eq!(srv.requests().len(), 2, "the third run is network-free");
+    }
+
+    /// Regression: the live payload reports `limits[]` meters with
+    /// `percent` and nests the scoped model under `scope.model`. Reading
+    /// only `utilization` / a bare `model` string silently dropped every
+    /// model-scoped weekly meter — exactly the one that throttles first.
+    #[test]
+    fn scoped_weekly_meters_parse_percent_and_nested_scope_model() {
+        let v: Value = serde_json::from_str(
+            r#"{
+              "five_hour": {"utilization": 13.0, "resets_at": "2026-09-03T15:49:59.629970+00:00"},
+              "seven_day": {"utilization": 63.0, "resets_at": "2026-09-05T20:59:59.629991+00:00"},
+              "limits": [
+                {"kind": "session", "percent": 13},
+                {"kind": "weekly_all", "percent": 63},
+                {"kind": "weekly_scoped", "percent": 89,
+                 "resets_at": "2026-09-05T20:59:59.630177+00:00",
+                 "scope": {"model": {"id": null, "display_name": "Fable"}}}
+              ]
+            }"#,
+        )
+        .unwrap();
+        let mut out = vec![];
+        parse_usage(&v, "max", &mut out);
+        let labels: Vec<_> = out.iter().map(|q| q.window.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["5h", "7d", "7d-Fable"],
+            "the scoped meter must survive and be named: {labels:?}"
+        );
+        let scoped = out.iter().find(|q| q.window == "7d-Fable").unwrap();
+        assert_eq!(scoped.used, 89.0, "`percent` must be read as the value");
+        assert!(scoped.resets_at.is_some(), "scoped meters carry a reset");
+    }
+
+    #[test]
+    fn scoped_meter_falls_back_to_model_id_then_bare_model_then_generic() {
+        let by_id = serde_json::json!({
+            "kind": "weekly_scoped", "percent": 10,
+            "scope": {"model": {"id": "claude-opus-5"}}
+        });
+        assert_eq!(scoped_model(&by_id).as_deref(), Some("claude-opus-5"));
+        let legacy = serde_json::json!({"kind": "weekly_scoped", "percent": 10, "model": "opus"});
+        assert_eq!(scoped_model(&legacy).as_deref(), Some("opus"));
+        let bare = serde_json::json!({"kind": "weekly_scoped", "percent": 10});
+        assert_eq!(scoped_model(&bare), None, "unlabelled -> generic 7d-scoped");
+    }
+
+    #[test]
+    fn meter_percent_prefers_utilization_then_percent() {
+        assert_eq!(
+            meter_percent(&serde_json::json!({"utilization": 5.0, "percent": 9.0})),
+            Some(5.0)
+        );
+        assert_eq!(
+            meter_percent(&serde_json::json!({"percent": 9.0})),
+            Some(9.0)
+        );
+        assert_eq!(meter_percent(&serde_json::json!({})), None);
+    }
+
+    /// Regression: `oauth/usage` returns 429 `rate_limit_error` — not
+    /// 401 — for an expired or revoked token. On a source llmu cannot
+    /// refresh, reporting that as pure throttling ("retry in a few
+    /// minutes") hides the only fix, re-authentication, forever.
+    #[test]
+    fn unrefreshable_429_names_token_expiry_alongside_throttling() {
+        let e = map_unrefreshable_usage_error(
+            anyhow::anyhow!("GET https://x/api/oauth/usage failed: HTTP 429"),
+            "re-authenticate the owning client",
+        );
+        let msg = e.to_string();
+        assert!(msg.contains("429"), "the status stays visible: {msg}");
+        assert!(
+            msg.contains("expired/revoked"),
+            "token death must be named as a cause: {msg}"
+        );
+        assert!(
+            msg.contains("cannot refresh this token source"),
+            "llmu must say why it cannot fix it itself: {msg}"
+        );
+        assert!(
+            msg.contains("re-authenticate the owning client"),
+            "the caller's remedy must reach the user: {msg}"
+        );
+    }
+
+    #[test]
+    fn unrefreshable_mapping_passes_non_429_errors_through_untouched() {
+        let e = map_unrefreshable_usage_error(anyhow::anyhow!("HTTP 503 upstream"), "x");
+        assert_eq!(e.to_string(), "HTTP 503 upstream");
+    }
+
+    /// The refreshable path keeps the exact historical wording (FR-6.10):
+    /// there the token was just validated, so a 429 really is throttling.
+    #[test]
+    fn refreshable_429_message_is_unchanged() {
+        let e = map_usage_error(anyhow::anyhow!("HTTP 429"));
+        assert_eq!(
+            e.to_string(),
+            "oauth/usage rate-limited (this endpoint throttles hard) — retry in a few minutes"
+        );
+    }
+
+    #[test]
+    fn keychain_service_defaults_on_macos_and_honors_the_opt_out() {
+        let mut cfg = Config::default();
+        assert_eq!(
+            cfg.claude.keychain_service_name().is_some(),
+            crate::keychain::supported(),
+            "the default is enabled exactly where keychains are supported"
+        );
+        if crate::keychain::supported() {
+            assert_eq!(
+                cfg.claude.keychain_service_name().as_deref(),
+                Some(crate::keychain::CLAUDE_CODE_SERVICE)
+            );
+        }
+        cfg.claude.keychain_service = Some(String::new());
+        assert_eq!(
+            cfg.claude.keychain_service_name(),
+            None,
+            "an empty service opts out"
+        );
+        cfg.claude.keychain_service = Some("Custom-item".into());
+        assert_eq!(
+            cfg.claude.keychain_service_name().as_deref(),
+            crate::keychain::supported().then_some("Custom-item")
+        );
+    }
+
+    /// A readable credentials file outranks the keychain, because it is
+    /// the only source llmu can refresh. Proven by the file path being
+    /// taken (a refresh POST is issued) while the keychain stays enabled.
+    #[test]
+    fn credentials_file_outranks_the_keychain() {
+        let dir = temp_dir("precedence-file-over-keychain");
+        let path = write_oauth(&dir, &oauth_expiring("AT-old", Some("R-1")));
+        let mut cfg = cfg_for(path);
+        cfg.claude.keychain_service = None; // default-enabled
+        let srv = FixtureServer::start(vec![
+            ScriptedResponse::token_ok(),
+            ScriptedResponse::usage_ok(),
+        ]);
+        quotas_impl(&cfg, &FetchContext::default(), &srv.endpoints).unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].method, "POST", "the refreshable file path ran");
+        assert_eq!(reqs[0].path, "/v1/oauth/token");
+    }
+
+    /// With no file and no keychain, a direct token is still the last
+    /// resort — the pre-existing behavior for non-macOS and opted-out
+    /// setups.
+    #[test]
+    fn direct_token_is_used_when_no_file_and_no_keychain() {
+        let mut cfg = Config::default();
+        cfg.claude.credentials = Some("/nonexistent/llmu-precedence-direct".into());
+        cfg.claude.keychain_service = Some(String::new());
+        cfg.claude.access_token = Some("DT-9".into());
+        let srv = FixtureServer::start(vec![ScriptedResponse::usage_ok()]);
+        let f = quotas_impl(&cfg, &FetchContext::default(), &srv.endpoints).unwrap();
+        assert!(!f.snapshots.is_empty(), "the direct path produced meters");
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "GET");
+    }
+
+    /// The scoped-service diagnostic fires only for the layout it
+    /// describes, and never invents a hashed service name.
+    #[test]
+    fn scoped_keychain_note_requires_config_dir_and_an_enabled_service() {
+        assert_eq!(
+            scoped_keychain_note(Some("Claude Code-credentials"), None),
+            None,
+            "a default install needs no hint"
+        );
+        assert_eq!(
+            scoped_keychain_note(Some("Claude Code-credentials"), Some("   ")),
+            None,
+            "a blank CLAUDE_CONFIG_DIR is not a scoped install"
+        );
+        assert_eq!(
+            scoped_keychain_note(None, Some("/tmp/llmu-alt-claude")),
+            None,
+            "an opted-out or unsupported keychain stays silent"
+        );
+
+        let note = scoped_keychain_note(
+            Some("Claude Code-credentials"),
+            Some("/tmp/llmu-alt-claude"),
+        )
+        .expect("a scoped install gets a hint");
+        assert!(
+            note.contains("keychain_service"),
+            "the hint must name the knob that fixes it: {note}"
+        );
+        assert!(
+            note.contains("<hash>"),
+            "the hint must describe the shape, not guess a value: {note}"
+        );
     }
 }

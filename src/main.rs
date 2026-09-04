@@ -3,6 +3,7 @@ mod config;
 mod credentials;
 mod discover;
 mod http;
+mod keychain;
 mod local;
 mod providers;
 mod report;
@@ -70,9 +71,16 @@ enum Cmd {
     Tui {
         #[arg(long, default_value = "30d")]
         since: String,
-        /// Network refresh cadence in seconds (usage APIs, quotas, balances)
+        /// Network refresh cadence in seconds (usage APIs, billed cost)
         #[arg(long, default_value_t = 60)]
         refresh: u64,
+        /// Quota/balance refresh cadence in seconds. Deliberately slower
+        /// than --refresh: Anthropic's oauth/usage endpoint throttles at
+        /// roughly a poll a minute and answers 429, which freezes the
+        /// meters on their last-known-good values. Doubles on throttle
+        /// and resets on success; `r` always refreshes now.
+        #[arg(long, default_value_t = 300)]
+        quota_refresh: u64,
         /// Local-log refresh cadence in seconds (Claude Code / Codex JSONL)
         #[arg(long, default_value_t = 3)]
         local_refresh: u64,
@@ -141,6 +149,13 @@ struct Gathered {
     quotas: Vec<QuotaSnapshot>,
     balances: Vec<BalanceSnapshot>,
     notes: Vec<String>,
+    /// Providers whose quota fetch failed this call, so their meters are
+    /// either absent or served from the last-known-good cache rather than
+    /// observed live. The CLI already tells the user through `notes` on
+    /// stderr; the TUI has no stderr, so it needs this typed signal to
+    /// label frozen meters and to back off instead of hammering a
+    /// throttling endpoint (FR-3.11).
+    quota_stale: Vec<String>,
 }
 
 /// Everything one provider worker thread returns; the join loop merges
@@ -155,6 +170,8 @@ struct ProviderFetch {
     balances: Vec<BalanceSnapshot>,
     notes: Vec<String>,
     to_cache: Vec<(&'static str, Vec<QuotaSnapshot>)>,
+    /// Set when this worker's quota fetch failed; see `Gathered::quota_stale`.
+    quota_stale: Option<&'static str>,
 }
 
 /// Move one provider's usage fetch into the worker output. events and
@@ -184,12 +201,17 @@ fn absorb_quota(out: &mut ProviderFetch, id: &'static str, f: QuotaFetch) {
 /// Quota failure path: serve the last-known-good meters (age-labeled)
 /// when a cache entry exists, else a plain error note. Cached rows are
 /// cached origin and never queue another cache write.
+///
+/// Either way the provider is marked not-live for this call. Both arms
+/// count: cached rows look exactly like fresh ones to a dashboard, and a
+/// bare error silently drops the meters altogether.
 fn quota_failure(
     out: &mut ProviderFetch,
     id: &'static str,
     e: anyhow::Error,
     cached: Option<Vec<QuotaSnapshot>>,
 ) {
+    out.quota_stale = Some(id);
     match cached {
         Some(cached) => {
             out.notes
@@ -213,6 +235,7 @@ fn merge_provider(
             g.quotas.extend(f.quotas);
             g.balances.extend(f.balances);
             g.notes.extend(f.notes);
+            g.quota_stale.extend(f.quota_stale.map(String::from));
             to_cache.extend(f.to_cache);
         }
         Err(_) => g.notes.push(format!("{id}: worker panicked")),
@@ -276,6 +299,7 @@ pub(crate) fn gather(
         quotas: vec![],
         balances: vec![],
         notes: vec![],
+        quota_stale: vec![],
     };
     let provs = providers::all();
     let selected: Vec<&Box<dyn providers::Provider>> = provs
@@ -516,10 +540,11 @@ fn main() -> Result<()> {
         Cmd::Tui {
             since,
             refresh,
+            quota_refresh,
             local_refresh,
         } => {
             parse_since(&since, now)?; // validate the spec up front
-            tui::run(cfg, since, refresh, local_refresh, cli.fresh)?;
+            tui::run(cfg, since, refresh, quota_refresh, local_refresh, cli.fresh)?;
         }
     }
     Ok(())
@@ -730,6 +755,7 @@ mod tests {
             quotas: vec![],
             balances: vec![],
             notes: vec![],
+            quota_stale: vec![],
         }
     }
 
@@ -1060,6 +1086,10 @@ mod tests {
             ]
         );
         assert!(out.to_cache.is_empty());
+        // Cached meters render exactly like live ones, so the substitution
+        // has to be reported out of band or a dashboard shows a frozen
+        // number under a fresh clock.
+        assert_eq!(out.quota_stale, Some("claude"));
     }
 
     /// Without a cache entry the error surfaces as a plain note and no
@@ -1079,6 +1109,49 @@ mod tests {
         );
         assert!(out.quotas.is_empty());
         assert!(out.to_cache.is_empty());
+        assert_eq!(
+            out.quota_stale,
+            Some("glm"),
+            "dropped meters are not live either"
+        );
+    }
+
+    /// A successful quota fetch must leave the marker clear — otherwise
+    /// the TUI would back off forever on healthy providers.
+    #[test]
+    fn absorb_quota_leaves_the_not_live_marker_clear() {
+        let mut out = ProviderFetch::default();
+        absorb_quota(&mut out, "glm", QuotaFetch::live(vec![quota("glm")]));
+        assert_eq!(out.quota_stale, None);
+    }
+
+    /// The marker has to survive the join into `Gathered`: that vector is
+    /// what paces the TUI's quota backoff and labels its panel.
+    #[test]
+    fn merge_forwards_the_not_live_marker_to_the_gather_result() {
+        let mut g = empty_gathered();
+        let mut to_cache = vec![];
+        merge_provider(
+            &mut g,
+            "claude",
+            Ok(ProviderFetch {
+                quotas: vec![quota("claude")],
+                quota_stale: Some("claude"),
+                ..Default::default()
+            }),
+            &mut to_cache,
+        );
+        merge_provider(
+            &mut g,
+            "glm",
+            Ok(ProviderFetch {
+                quotas: vec![quota("glm")],
+                ..Default::default()
+            }),
+            &mut to_cache,
+        );
+        assert_eq!(g.quota_stale, vec!["claude".to_string()]);
+        assert_eq!(g.quotas.len(), 2, "stale rows still render");
     }
 
     #[test]
