@@ -62,18 +62,29 @@ macOS architectures build on either Mac, and Linux->Windows works via
 
 ## Live watch mode
 
-`llmu watch` (alias of `llmu tui`) is a real-time dashboard: local
-Claude Code / Codex logs are re-parsed every 3 s (mtime-filtered, so it
-costs milliseconds), while usage APIs, quotas, and balances refresh every
-60 s — deliberately slow, since the Claude oauth/usage endpoint
-rate-limits aggressively. Tune with `--local-refresh` / `--refresh`
-(floor 15 s for network). The view: 24 h ktok/hour sparkline, per-period
-bar chart, per-provider colored model table, threshold-colored quota
-gauges (green < 60 % < yellow < 85 % < red), balances. Keys: `q` quit,
-`d/w/m` period, `r` force a network refresh (bypasses the optional HTTP
-cache for exactly that fetch), `p` pause. `llmu --fresh tui` bypasses the
-raw cache only for the initial full network fetch; later scheduled
-refreshes honor the TTL.
+`llmu watch` (alias of `llmu tui`) is a real-time dashboard on three
+cadences: local Claude Code / Codex logs are re-parsed every 3 s
+(mtime-filtered, so it costs milliseconds), usage APIs and billed cost
+every 60 s, and quotas and balances every 300 s. Quotas are slowest on
+purpose. Anthropic's `oauth/usage` endpoint throttles at roughly a poll a
+minute and answers **429**, at which point llmu falls back to
+last-known-good meters — so polling it on the usage cadence used to park
+the dashboard inside the throttle window and freeze the Anthropic
+percentages for as long as it stayed open. A throttled quota tick now
+doubles its own interval (capped at 30 min) and snaps back to the
+configured cadence on the first live answer. Tune with `--local-refresh`
+/ `--refresh` / `--quota-refresh` (floor 15 s for usage, 30 s for
+quotas). The view: 24 h ktok/hour sparkline, per-period bar chart,
+per-provider colored model table, threshold-colored quota gauges
+(green < 60 % < yellow < 85 % < red), balances. Meters that are not live
+are never shown as if they were: the quota panel title turns yellow and
+names the provider, when its meters were last live, and when the next
+attempt lands. Keys: `q` quit, `d/w/m` period, `r` force a network
+refresh (both cadences, clearing any backoff, and bypassing the optional
+HTTP cache for exactly that fetch — it is also remembered rather than
+dropped if you press it while paused), `p` pause. `llmu --fresh tui`
+bypasses the raw cache only for the initial full network fetch; later
+scheduled refreshes honor the TTL.
 
 Plain CLI output is colorized too when stdout is a terminal; `NO_COLOR`
 disables it, `CLICOLOR_FORCE=1` forces it (e.g. through a pager).

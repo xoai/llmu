@@ -7,8 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`llmu watch --quota-refresh <secs>`** (default 300) paces quota and
+  balance fetches independently of `--refresh`, with a 30 s floor.
+
 ### Fixed
 
+- **`llmu watch` no longer freezes the Anthropic meters until you restart
+  it.** Quotas rode the 60 s network tick, but Anthropic's `oauth/usage`
+  endpoint throttles at roughly a poll a minute: once 429s started,
+  `gather` substituted last-known-good meters on every tick, so the
+  percentages sat frozen while the header kept advertising a fresh
+  network time — and quitting and relaunching, by which point the
+  throttle window had passed, looked like the cure. Quotas and balances
+  now run on their own slower cadence, a throttled tick doubles its
+  interval (capped at 30 min) and resets on the first live answer, and
+  the panel is honest about it: `gather` reports not-live providers as a
+  typed signal, and the quota panel title turns yellow naming the
+  provider, its last live time, and the next attempt. `r` still forces an
+  immediate refresh of both cadences, and is no longer discarded when
+  pressed while paused.
+- **A failed keychain probe no longer disables Claude quotas for the life
+  of the process.** `has_item` memoized its answer forever, so a keychain
+  that happened to be locked at launch, a `security` call that hit the
+  5 s bound, or a Claude Code login that came later pinned "no keychain
+  item" until llmu was restarted — the worst case being a dashboard meant
+  to run for hours. The memo now expires after 20 s, still collapsing the
+  several probes one fetch round makes.
 - **macOS Claude quotas no longer silently use a stale borrowed token.**
   Claude Code stores its `claudeAiOauth` blob in the login keychain on
   macOS, so none of llmu's plaintext search paths existed and the

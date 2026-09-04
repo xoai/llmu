@@ -59,6 +59,18 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// Poll cadence while waiting for the bounded child.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
+/// How long one [`has_item`] answer is reused.
+///
+/// Long enough to collapse the several probes a single fetch round makes
+/// (`configured`, `quotas_impl`, and discovery all ask), short enough
+/// that no answer outlives one refresh cycle of `llmu watch`. Caching an
+/// answer for the life of the process was the wrong trade for a
+/// long-running dashboard: a keychain that happened to be locked at
+/// launch, a `security` call that hit [`READ_TIMEOUT`], or a Claude Code
+/// login that came later would all pin "no keychain item" forever, and
+/// only restarting llmu could undo it.
+const PROBE_TTL: Duration = Duration::from_secs(20);
+
 /// Whether this build can read a keychain at all. Keychain support is
 /// macOS-only; every other target keeps the plaintext-file behavior.
 pub const fn supported() -> bool {
@@ -151,31 +163,45 @@ fn lookup(service: &str, secret: bool) -> Result<std::process::Output> {
     security(&lookup_args(service, None, secret))
 }
 
-/// Memoized [`has_item`] results. `configured()` runs on every TUI tick
-/// (`tui.rs`), so the existence probe is spawned at most once per
-/// service per process.
-fn probe_cache() -> &'static Mutex<HashMap<String, bool>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+/// Short-lived [`has_item`] results, keyed by service name. Several
+/// probes run per fetch round (`configured()`, `quotas_impl`, and
+/// discovery each ask), so one `security` spawn covers them all.
+fn probe_cache() -> &'static Mutex<HashMap<String, (bool, Instant)>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, (bool, Instant)>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Whether a memoized answer recorded at `at` may still be reused.
+/// Split out so the expiry rule is testable without waiting on a clock.
+fn probe_is_fresh(at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(at) < PROBE_TTL
 }
 
 /// Cheap read-only existence probe: an attribute lookup with no `-w`, so
 /// the item's secret is never requested and no ACL prompt can appear.
-/// Memoized per process.
+///
+/// Memoized for [`PROBE_TTL`] rather than for the process: a dashboard
+/// runs for hours, and an answer that can never be revisited turns any
+/// momentary failure — a locked keychain, a timed-out `security`, a
+/// login that has not happened yet — into a permanent one that only a
+/// restart clears.
 pub fn has_item(service: &str) -> bool {
     if !supported() {
         return false;
     }
+    let now = Instant::now();
     if let Ok(cache) = probe_cache().lock() {
-        if let Some(hit) = cache.get(service) {
-            return *hit;
+        if let Some((hit, at)) = cache.get(service) {
+            if probe_is_fresh(*at, now) {
+                return *hit;
+            }
         }
     }
     let present = lookup(service, false)
         .map(|o| o.status.success())
         .unwrap_or(false);
     if let Ok(mut cache) = probe_cache().lock() {
-        cache.insert(service.to_string(), present);
+        cache.insert(service.to_string(), (present, Instant::now()));
     }
     present
 }
@@ -247,6 +273,31 @@ mod tests {
         assert!(!has_item(svc));
         // Second call is served from the memo; still false.
         assert!(!has_item(svc));
+    }
+
+    /// The memo must expire. A permanently cached "no such item" is how a
+    /// long-running `llmu watch` loses Claude quotas for good after one
+    /// locked-keychain or timed-out probe.
+    #[test]
+    fn probe_memo_expires_so_a_failed_probe_is_never_permanent() {
+        assert!(
+            PROBE_TTL >= Duration::from_secs(1) && PROBE_TTL <= Duration::from_secs(60),
+            "long enough to collapse one fetch round, short enough to self-heal"
+        );
+        let now = Instant::now();
+        assert!(probe_is_fresh(now, now), "a just-recorded answer is reused");
+        assert!(
+            probe_is_fresh(now, now + PROBE_TTL - Duration::from_millis(1)),
+            "an answer inside the window is reused"
+        );
+        assert!(
+            !probe_is_fresh(now, now + PROBE_TTL),
+            "an answer at the horizon is re-probed"
+        );
+        assert!(
+            !probe_is_fresh(now, now + PROBE_TTL * 100),
+            "no answer survives the process"
+        );
     }
 
     #[test]

@@ -285,6 +285,18 @@ refresh (keychain, direct token) the 429 message names token expiry as
 an equally likely cause, so the user is not sent to "retry in a few
 minutes" forever when only re-authentication will help.
 
+"Aggressively rate-limited" is measured, not hedging: polling once a
+minute draws 429s within minutes, and two calls back to back throttle the
+second. `llmu watch` therefore fetches quotas on their own cadence
+(`--quota-refresh`, default 300 s, floor 30 s) rather than on the 60 s
+usage tick, and a throttled tick doubles that interval up to 30 minutes
+before the first live answer resets it. This matters beyond politeness:
+a throttled quota fetch is served from the last-known-good cache, whose
+rows are indistinguishable from live ones once rendered, so a dashboard
+polling inside the throttle window shows a frozen percentage under a
+freshly-updating clock. `gather` reports those providers in
+`Gathered::quota_stale` and the TUI names them in the quota panel title.
+
 OAuth refresh (file-backed `claudeAiOauth` entries only, FR-6):
 - Proactive refresh when the access token expires within five minutes
   (`expiresAt <= now + 300000ms`) via
