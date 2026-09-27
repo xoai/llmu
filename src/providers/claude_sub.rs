@@ -607,7 +607,9 @@ fn scoped_keychain_note(service: Option<&str>, config_dir: Option<&str>) -> Opti
     let service = service?;
     config_dir.map(str::trim).filter(|d| !d.is_empty())?;
     Some(format!(
-        "claude: no {service:?} keychain item, and CLAUDE_CONFIG_DIR is set — Claude Code scopes          the item name per config directory ({service}-<hash>); set [claude] keychain_service to          that exact name to enable live quotas"
+        "claude: no {service:?} keychain item, and CLAUDE_CONFIG_DIR is set — Claude Code scopes \
+         the item name per config directory ({service}-<hash>); set [claude] keychain_service to \
+         that exact name to enable live quotas"
     ))
 }
 
