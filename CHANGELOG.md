@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`llmu watch --quota-refresh <secs>`** (default 300) paces quota and
+  balance fetches independently of `--refresh`, with a 30 s floor.
+
+### Fixed
+
+- **`llmu watch` no longer freezes the Anthropic meters until you restart
+  it.** Quotas rode the 60 s network tick, but Anthropic's `oauth/usage`
+  endpoint throttles at roughly a poll a minute: once 429s started,
+  `gather` substituted last-known-good meters on every tick, so the
+  percentages sat frozen while the header kept advertising a fresh
+  network time — and quitting and relaunching, by which point the
+  throttle window had passed, looked like the cure. Quotas and balances
+  now run on their own slower cadence, a throttled tick doubles its
+  interval (capped at 30 min) and resets on the first live answer, and
+  the panel is honest about it: `gather` reports not-live providers as a
+  typed signal, and the quota panel title turns yellow naming the
+  provider, its last live time, and the next attempt. `r` still forces an
+  immediate refresh of both cadences, and is no longer discarded when
+  pressed while paused.
+- **A failed keychain probe no longer disables Claude quotas for the life
+  of the process.** `has_item` memoized its answer forever, so a keychain
+  that happened to be locked at launch, a `security` call that hit the
+  5 s bound, or a Claude Code login that came later pinned "no keychain
+  item" until llmu was restarted — the worst case being a dashboard meant
+  to run for hours. The memo now expires after 20 s, still collapsing the
+  several probes one fetch round makes.
+- **macOS Claude quotas no longer silently use a stale borrowed token.**
+  Claude Code stores its `claudeAiOauth` blob in the login keychain on
+  macOS, so none of llmu's plaintext search paths existed and the
+  `claude` provider fell back to whichever direct access token discovery
+  could find — typically OpenCode's, which nothing refreshes once
+  OpenCode stops running. llmu now reads the `Claude Code-credentials`
+  keychain item (service + `$USER` account) **read-only**: it never
+  writes to a keychain, so refresh-token rotation stays owned by Claude
+  Code and cannot log the user out. Precedence is plaintext file
+  (refreshable) > keychain > direct token. Configure a non-default item
+  with `[claude] keychain_service`, or `""` to opt out. Every `security`
+  invocation is bounded (5s) and the child killed on expiry, so a locked
+  keychain's unlock prompt can never hang a CLI run or a TUI tick.
+- **Expired borrowed OAuth tokens are no longer adopted.** OpenCode's
+  `auth.json` records a millisecond `expires`; discovery now skips an
+  entry that has already lapsed instead of installing a dead credential.
+- **`oauth/usage` 429s are no longer reported as plain throttling on
+  unrefreshable sources.** The endpoint answers **429 `rate_limit_error`,
+  not 401**, for an expired or revoked token, so the previous wording
+  ("retry in a few minutes") pointed users away from the only fix. The
+  refreshable file-backed path keeps its exact historical message, where
+  a 429 really is throttling.
+- **Model-scoped weekly meters are no longer dropped.** Entries in the
+  `limits[]` array report `percent` (not `utilization`) and nest the
+  model under `scope.model.{display_name,id}` (not a bare `model`
+  string), so every `weekly_scoped` meter — often the one nearest its
+  cap — was parsed away. Both shapes are now read, and the meter is
+  labelled with its model (e.g. `7d-Opus`).
+
 ## [0.1.5] - 2026-08-14
 
 ### Added

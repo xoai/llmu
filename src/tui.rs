@@ -1,12 +1,25 @@
 //! Live dashboard (`llmu tui` / `llmu watch`).
 //!
-//! Two refresh cadences run on a background worker thread so the UI
+//! Three refresh cadences run on a background worker thread so the UI
 //! never blocks:
 //!   - LOCAL tick (default 3s): re-parses Claude Code, Codex, Gemini,
 //!     Qwen, and OpenCode local usage records — no network requests.
-//!   - NETWORK tick (default 60s): full fetch including provider usage
-//!     APIs, quotas, and balances. Kept slow deliberately — the Claude
-//!     oauth/usage endpoint rate-limits aggressively.
+//!   - USAGE tick (default 60s): provider usage APIs and billed cost.
+//!   - QUOTA tick (default 300s, backing off): quotas and balances.
+//!
+//! Quotas ride their own slow cadence because Anthropic's
+//! `oauth/usage` endpoint throttles at roughly a poll a minute and
+//! answers **429**, at which point `gather` quietly substitutes
+//! last-known-good meters. Folding quotas into the 60s usage tick
+//! therefore parked the dashboard inside the throttle window: the
+//! Anthropic meters froze on a stale percentage for as long as the
+//! dashboard stayed open, while the header kept advertising a fresh
+//! network time — the "it only shows the real number if I restart it"
+//! failure. Two things fix it: poll slowly enough to stay under the
+//! limit (with [`QuotaBackoff`] widening further whenever a tick still
+//! comes back throttled), and never freeze silently — the TUI has no
+//! stderr, so [`quota_title`] says on the panel itself which meters are
+//! not live and when the next attempt lands.
 //!
 //! Keys: q quit • d/w/m period • r force network refresh • p pause.
 
@@ -35,12 +48,31 @@ pub struct Dashboard {
     pub balances: Vec<BalanceSnapshot>,
     pub billed: Vec<BilledCost>,
     pub window_label: String,
+    pub quota: QuotaStatus,
+}
+
+/// Freshness of the quota panel.
+///
+/// `gather` reports a failed quota fetch through `Gathered::quota_stale`
+/// and substitutes last-known-good meters, which are indistinguishable
+/// from live ones once rendered. The CLI prints the reason to stderr; a
+/// full-screen dashboard has nowhere to print, so it carries the state
+/// here and renders it into the panel title instead.
+#[derive(Clone, Default)]
+pub struct QuotaStatus {
+    /// Providers whose meters were not observed live on the last quota
+    /// tick — absent, or served from the last-known-good cache.
+    pub stale: Vec<String>,
+    /// When every meter was last observed live.
+    pub live_at: Option<DateTime<Utc>>,
+    /// When the next quota tick is due, backoff included.
+    pub next_at: Option<DateTime<Utc>>,
 }
 
 struct Snap {
     d: Dashboard,
     at: DateTime<Utc>,
-    net: bool, // was this a full network refresh?
+    net: bool, // was this a network refresh (usage and/or quota)?
 }
 
 /// Raw-cache bypass lifetime for the TUI (FR-3.2): a one-shot `--fresh`
@@ -66,6 +98,84 @@ impl FreshState {
         self.pending = false;
         fresh
     }
+}
+
+/// Retry pacing for the quota/balance cadence.
+///
+/// A throttled quota tick that retries on the same cadence just stays
+/// inside the throttle window, so the meters stay frozen for the life of
+/// the dashboard. Each not-live tick doubles the interval up to [`CAP`];
+/// the first live tick snaps straight back to the configured base, so a
+/// single transient 429 costs one slow cycle, not the session.
+///
+/// [`CAP`]: QuotaBackoff::CAP
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QuotaBackoff {
+    base: Duration,
+    current: Duration,
+}
+
+impl QuotaBackoff {
+    /// Hard floor on the cadence whatever `--quota-refresh` says: below
+    /// this llmu is the reason the endpoint throttles.
+    const FLOOR: u64 = 30;
+    /// A 5h/7d meter reported in whole percent is still useful half an
+    /// hour old; past that the panel would just be wrong.
+    const CAP: Duration = Duration::from_secs(1800);
+
+    fn new(secs: u64) -> Self {
+        let base = Duration::from_secs(secs.max(Self::FLOOR));
+        QuotaBackoff {
+            base,
+            current: base,
+        }
+    }
+
+    fn interval(&self) -> Duration {
+        self.current
+    }
+
+    /// Every meter came back live: drop the penalty entirely.
+    fn on_live(&mut self) {
+        self.current = self.base;
+    }
+
+    /// At least one provider's meters were not live. `max(base)` keeps a
+    /// base above `CAP` (an explicitly slow `--quota-refresh`) from being
+    /// sped up by a failure; the checked doubling keeps an absurd
+    /// `--quota-refresh` from panicking on overflow instead of just
+    /// being slow.
+    fn on_stale(&mut self) {
+        self.current = self
+            .current
+            .checked_mul(2)
+            .unwrap_or(Self::CAP)
+            .min(Self::CAP)
+            .max(self.base);
+    }
+}
+
+/// Quota panel title, including the not-live banner.
+///
+/// Pure so the one place a throttled quota fetch can announce itself is
+/// testable without a terminal.
+fn quota_title(status: &QuotaStatus, hidden: usize, now: DateTime<Utc>) -> String {
+    let mut t = String::from(" subscription quotas");
+    if hidden > 0 {
+        t.push_str(&format!(" ({hidden} more)"));
+    }
+    if !status.stale.is_empty() {
+        t.push_str(&format!(" — {} not live", status.stale.join(", ")));
+        if let Some(at) = status.live_at {
+            t.push_str(&format!(", last {}", at.format("%H:%M:%S")));
+        }
+        if let Some(next) = status.next_at {
+            t.push_str(&format!(", retry {}s", (next - now).num_seconds().max(0)));
+        }
+        t.push_str(" — r to retry now");
+    }
+    t.push(' ');
+    t
 }
 
 fn apply_local_refresh(
@@ -123,6 +233,7 @@ pub fn run(
     cfg: Config,
     since_spec: String,
     net_secs: u64,
+    quota_secs: u64,
     local_secs: u64,
     fresh_initial: bool,
 ) -> Result<()> {
@@ -138,8 +249,10 @@ pub fn run(
         std::thread::spawn(move || {
             let netd = Duration::from_secs(net_secs.max(15));
             let locald = Duration::from_secs(local_secs.max(1));
-            // Fire a full fetch immediately, locals in between.
+            let mut backoff = QuotaBackoff::new(quota_secs);
+            // Fire both network fetches immediately, locals in between.
             let mut last_net = Instant::now() - netd;
+            let mut last_quota = Instant::now() - backoff.interval();
             let mut last_local = Instant::now();
             // FR-3.2: a one-shot --fresh bypasses only the initial full
             // network fetch; `r` bypasses exactly one more. Scheduled
@@ -151,47 +264,78 @@ pub fn run(
             let mut billed: Vec<BilledCost> = vec![];
             let mut quotas: Vec<QuotaSnapshot> = vec![];
             let mut balances: Vec<BalanceSnapshot> = vec![];
+            let mut quota_status = QuotaStatus::default();
 
             loop {
                 if stop.load(Ordering::Relaxed) {
                     return;
                 }
                 let is_paused = paused.load(Ordering::Relaxed);
-                let forced = force.swap(false, Ordering::Relaxed);
+                // Consuming the flag while paused would silently discard
+                // the keypress; leave it set so unpausing honors it.
+                let forced = !is_paused && force.swap(false, Ordering::Relaxed);
                 let now = Utc::now();
                 let since = match crate::parse_since(&label, now) {
                     Ok(s) => s,
                     Err(_) => now - CDuration::days(30),
                 };
 
-                if !is_paused && (forced || last_net.elapsed() >= netd) {
+                let usage_due = forced || last_net.elapsed() >= netd;
+                let quota_due = forced || last_quota.elapsed() >= backoff.interval();
+                if !is_paused && (usage_due || quota_due) {
+                    // One bypass per network iteration, whichever tick
+                    // (or both) is due — `--fresh`/`r` semantics are per
+                    // fetch round, not per endpoint group (FR-3.2).
                     let fresh = fresh_state.take(forced);
                     let ctx = crate::providers::FetchContext::from_config(&cfg, fresh);
-                    let g = crate::gather(&cfg, &ctx, since, now, None, true, true, true);
-                    api_events = g
-                        .events
-                        .iter()
-                        .filter(|e| e.source == SourceKind::Api)
-                        .cloned()
-                        .collect();
-                    local_events = g
-                        .events
-                        .iter()
-                        .filter(|e| e.source == SourceKind::LocalLogs)
-                        .cloned()
-                        .collect();
-                    billed = g.billed.clone();
-                    quotas = g.quotas.clone();
-                    balances = g.balances.clone();
-                    last_net = Instant::now();
-                    last_local = Instant::now();
+                    if quota_due {
+                        // Quotas and balances only: this is the cadence
+                        // that must stay clear of oauth/usage throttling.
+                        let g = crate::gather(&cfg, &ctx, since, now, None, false, true, true);
+                        quotas = g.quotas;
+                        balances = g.balances;
+                        if g.quota_stale.is_empty() {
+                            backoff.on_live();
+                            quota_status.live_at = Some(now);
+                        } else {
+                            backoff.on_stale();
+                        }
+                        quota_status.stale = g.quota_stale;
+                        // An out-of-range cadence yields no countdown
+                        // rather than a panicking date arithmetic.
+                        quota_status.next_at = chrono::Duration::from_std(backoff.interval())
+                            .ok()
+                            .and_then(|d| now.checked_add_signed(d));
+                        last_quota = Instant::now();
+                    }
+                    if usage_due {
+                        let g = crate::gather(&cfg, &ctx, since, now, None, true, false, false);
+                        api_events = g
+                            .events
+                            .iter()
+                            .filter(|e| e.source == SourceKind::Api)
+                            .cloned()
+                            .collect();
+                        local_events = g
+                            .events
+                            .iter()
+                            .filter(|e| e.source == SourceKind::LocalLogs)
+                            .cloned()
+                            .collect();
+                        billed = g.billed;
+                        last_net = Instant::now();
+                        last_local = Instant::now();
+                    }
+                    let mut events = api_events.clone();
+                    events.extend(local_events.iter().cloned());
                     let snap = Snap {
                         d: Dashboard {
-                            events: g.events,
+                            events,
                             quotas: quotas.clone(),
                             balances: balances.clone(),
                             billed: billed.clone(),
                             window_label: label.clone(),
+                            quota: quota_status.clone(),
                         },
                         at: now,
                         net: true,
@@ -247,6 +391,7 @@ pub fn run(
                             balances: balances.clone(),
                             billed: billed.clone(),
                             window_label: label.clone(),
+                            quota: quota_status.clone(),
                         },
                         at: now,
                         net: false,
@@ -531,12 +676,15 @@ fn draw(
 
     // --- quotas: data table with a separate progress-bar column ---
     let hidden_quota_rows = d.quotas.len().saturating_sub(visible_quota_rows);
-    let quota_title = if hidden_quota_rows == 0 {
-        " subscription quotas ".to_string()
+    // `now` is this frame's clock, so the retry countdown ticks down
+    // between snapshots instead of only when a new one lands.
+    let qtitle = quota_title(&d.quota, hidden_quota_rows, now);
+    let qstyle = if d.quota.stale.is_empty() {
+        Style::new()
     } else {
-        format!(" subscription quotas ({hidden_quota_rows} more) ")
+        Style::new().fg(Color::Yellow)
     };
-    let qblock = Block::bordered().title(quota_title);
+    let qblock = Block::bordered().title(Span::styled(qtitle, qstyle));
     let inner = qblock.inner(chunks[4]);
     f.render_widget(qblock, chunks[4]);
     if d.quotas.is_empty() {
@@ -680,6 +828,104 @@ mod tests {
             cost_usd: None,
             cost_is_estimate: false,
         }
+    }
+
+    /// A throttled quota tick must not retry on the same cadence: that
+    /// keeps llmu inside the throttle window and freezes the meters for
+    /// the life of the dashboard.
+    #[test]
+    fn backoff_widens_on_throttle_and_snaps_back_on_the_first_live_tick() {
+        let mut b = QuotaBackoff::new(300);
+        assert_eq!(b.interval(), Duration::from_secs(300));
+        b.on_stale();
+        assert_eq!(b.interval(), Duration::from_secs(600));
+        b.on_stale();
+        assert_eq!(b.interval(), Duration::from_secs(1200));
+        // One good answer is enough; a transient 429 costs one cycle.
+        b.on_live();
+        assert_eq!(b.interval(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn backoff_is_floored_capped_and_never_speeds_up_a_slow_base() {
+        // Below the floor llmu would be the reason for the throttling.
+        assert_eq!(
+            QuotaBackoff::new(1).interval(),
+            Duration::from_secs(QuotaBackoff::FLOOR)
+        );
+
+        let mut b = QuotaBackoff::new(1200);
+        for _ in 0..10 {
+            b.on_stale();
+        }
+        assert_eq!(b.interval(), QuotaBackoff::CAP, "meters must not rot");
+
+        // A base past the cap is a deliberate choice; failure must not
+        // override it into faster polling.
+        let mut slow = QuotaBackoff::new(3600);
+        slow.on_stale();
+        assert_eq!(slow.interval(), Duration::from_secs(3600));
+
+        // An absurd cadence must stay slow, not panic on overflow.
+        let mut absurd = QuotaBackoff::new(u64::MAX);
+        absurd.on_stale();
+        assert_eq!(absurd.interval(), Duration::from_secs(u64::MAX));
+    }
+
+    /// The dashboard has no stderr, so the panel title is the only place
+    /// a substituted last-known-good meter can announce itself. Silence
+    /// here is the whole bug: frozen numbers under a fresh-looking clock.
+    #[test]
+    fn quota_title_names_stale_providers_the_last_live_time_and_the_retry() {
+        let now = Utc::now();
+        let status = QuotaStatus {
+            stale: vec!["claude".into()],
+            live_at: Some(now - CDuration::seconds(240)),
+            next_at: Some(now + CDuration::seconds(90)),
+        };
+        let t = quota_title(&status, 0, now);
+        assert!(t.contains("claude not live"), "{t}");
+        assert!(
+            t.contains(
+                &(now - CDuration::seconds(240))
+                    .format("%H:%M:%S")
+                    .to_string()
+            ),
+            "the last live time must be visible: {t}"
+        );
+        assert!(t.contains("retry 90s"), "{t}");
+        assert!(t.contains("r to retry now"), "{t}");
+    }
+
+    #[test]
+    fn quota_title_is_plain_when_every_meter_is_live() {
+        let now = Utc::now();
+        let live = QuotaStatus {
+            stale: vec![],
+            live_at: Some(now),
+            next_at: Some(now + CDuration::seconds(300)),
+        };
+        assert_eq!(quota_title(&live, 0, now), " subscription quotas ");
+        assert_eq!(
+            quota_title(&live, 3, now),
+            " subscription quotas (3 more) ",
+            "the hidden-row count survives"
+        );
+    }
+
+    /// An overdue retry renders as 0s, never as a negative countdown.
+    #[test]
+    fn quota_title_retry_countdown_never_goes_negative() {
+        let now = Utc::now();
+        let status = QuotaStatus {
+            stale: vec!["claude".into(), "glm".into()],
+            live_at: None,
+            next_at: Some(now - CDuration::seconds(30)),
+        };
+        let t = quota_title(&status, 0, now);
+        assert!(t.contains("claude, glm not live"), "{t}");
+        assert!(t.contains("retry 0s"), "{t}");
+        assert!(!t.contains("-"), "no negative countdown: {t}");
     }
 
     #[test]
@@ -979,13 +1225,27 @@ mod tests {
         let needle = ["crate::", "gat", "her("].concat();
         let src = include_str!("tui.rs");
         let sites: Vec<&str> = src.lines().filter(|l| l.contains(&needle)).collect();
-        assert_eq!(sites.len(), 1, "only the network tick uses gather");
+        assert_eq!(
+            sites.len(),
+            2,
+            "exactly two network ticks use gather: usage and quota"
+        );
         for line in &sites {
             assert!(
                 line.contains("&ctx"),
                 "every TUI gather must pass the context, got: {line}"
             );
         }
+        // The split is the fix, not an accident: quotas must never ride
+        // the fast usage cadence onto a throttling endpoint again.
+        assert!(
+            sites.iter().any(|l| l.contains("None, true, false, false")),
+            "one site fetches usage without quotas or balances: {sites:?}"
+        );
+        assert!(
+            sites.iter().any(|l| l.contains("None, false, true, true")),
+            "one site fetches quotas and balances without usage: {sites:?}"
+        );
         assert!(
             src.contains("provider.usage(&cfg, &ctx, since, now)"),
             "direct local-provider usage must receive the context"

@@ -148,6 +148,35 @@ fn read_qwen_settings(home: &Path) -> Option<QwenSettings> {
     serde_json::from_str(&raw).ok()
 }
 
+/// Wall-clock milliseconds, for comparing against the millisecond expiry
+/// stamps that OpenCode and Claude Code store alongside OAuth tokens.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// A borrowed OpenCode OAuth access token, but only while it is still
+/// valid.
+///
+/// llmu never refreshes a borrowed access token, and `oauth/usage`
+/// answers **429, not 401**, for an expired or revoked bearer — so
+/// adopting a dead token makes every later run report indefinite bogus
+/// rate-limiting instead of the real problem. A missing `expires` stamp
+/// is trusted, preserving the original behavior for entries that carry
+/// no expiry metadata.
+fn usable_oauth_access(entry: &Value, now: i64) -> Option<&str> {
+    if entry["type"].as_str() != Some("oauth") {
+        return None;
+    }
+    let token = entry["access"].as_str().filter(|s| !s.is_empty())?;
+    match entry["expires"].as_i64() {
+        Some(ms) if ms <= now => None,
+        _ => Some(token),
+    }
+}
+
 /// Record field provenance for auto-detected Qwen values: only env and
 /// settings sources are shown; explicit config and derived defaults are
 /// not "auto-detected" and stay silent.
@@ -355,17 +384,18 @@ pub fn apply(cfg: &mut Config) {
                 found(&mut cfg.found, "kimi.code_key", src.clone());
             }
         }
-        // OpenCode's Claude Pro/Max OAuth access token: a fallback when
-        // Claude Code's own credentials file is absent. Best-effort —
-        // the token may lack the profile scope, in which case the quota
-        // call fails gracefully.
-        if cfg.claude.access_token.is_none() && cfg.claude.credentials_path().is_none() {
-            let e = &auth["anthropic"];
-            if e["type"].as_str() == Some("oauth") {
-                if let Some(t) = e["access"].as_str() {
-                    cfg.claude.access_token = Some(t.into());
-                    found(&mut cfg.found, "claude.access_token", src.clone());
-                }
+        // OpenCode's Claude Pro/Max OAuth access token: a last-resort
+        // fallback when neither Claude Code's credentials file nor its
+        // macOS keychain item is available. Best-effort — the token may
+        // lack the profile scope, in which case the quota call fails
+        // gracefully.
+        if cfg.claude.access_token.is_none()
+            && cfg.claude.credentials_path().is_none()
+            && cfg.claude.keychain_available().is_none()
+        {
+            if let Some(t) = usable_oauth_access(&auth["anthropic"], now_ms()) {
+                cfg.claude.access_token = Some(t.to_string());
+                found(&mut cfg.found, "claude.access_token", src.clone());
             }
         }
     }
@@ -420,6 +450,49 @@ pub fn env_provenance() -> Vec<(String, String)> {
 mod tests {
     use super::*;
     use crate::config::{AnthropicCfg, QwenCfg};
+
+    /// The regression this guards: OpenCode's stored token expires once
+    /// OpenCode stops running, and `oauth/usage` reports a dead token as
+    /// 429. Adopting it therefore produced a permanent, misleading
+    /// "rate-limited" state instead of a usable credential.
+    #[test]
+    fn expired_borrowed_oauth_access_token_is_not_adopted() {
+        let now = 1_700_000_000_000i64;
+        let expired = serde_json::json!({
+            "type": "oauth", "access": "AT-dead", "refresh": "R", "expires": now - 1,
+        });
+        assert_eq!(usable_oauth_access(&expired, now), None);
+
+        let fresh = serde_json::json!({
+            "type": "oauth", "access": "AT-live", "refresh": "R", "expires": now + 60_000,
+        });
+        assert_eq!(usable_oauth_access(&fresh, now), Some("AT-live"));
+    }
+
+    #[test]
+    fn borrowed_token_without_expiry_metadata_is_still_trusted() {
+        let now = 1_700_000_000_000i64;
+        let no_expiry = serde_json::json!({"type": "oauth", "access": "AT-x"});
+        assert_eq!(
+            usable_oauth_access(&no_expiry, now),
+            Some("AT-x"),
+            "a missing `expires` preserves the previous behavior"
+        );
+    }
+
+    #[test]
+    fn non_oauth_or_empty_entries_yield_no_token() {
+        let now = 1_700_000_000_000i64;
+        assert_eq!(
+            usable_oauth_access(&serde_json::json!({"type": "api", "key": "K"}), now),
+            None
+        );
+        assert_eq!(
+            usable_oauth_access(&serde_json::json!({"type": "oauth", "access": ""}), now),
+            None
+        );
+        assert_eq!(usable_oauth_access(&serde_json::json!({}), now), None);
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(

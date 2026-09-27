@@ -144,8 +144,36 @@ pub struct ClaudeSubCfg {
     /// Direct OAuth access token (auto-filled from OpenCode's auth.json
     /// when no Claude Code credentials file exists).
     pub access_token: Option<String>,
+    /// macOS Keychain generic-password service holding Claude Code's
+    /// `claudeAiOauth` blob, read when no plaintext credentials file
+    /// exists. Defaults to `Claude Code-credentials`; set to an empty
+    /// string to opt out. Reads are strictly read-only — llmu never
+    /// mutates a keychain, so token rotation stays owned by Claude Code
+    /// (see `keychain.rs`).
+    pub keychain_service: Option<String>,
 }
 impl ClaudeSubCfg {
+    /// The keychain service to read when no plaintext credentials file
+    /// exists. `None` on non-macOS targets and when explicitly disabled
+    /// with `keychain_service = ""`.
+    pub fn keychain_service_name(&self) -> Option<String> {
+        if !crate::keychain::supported() {
+            return None;
+        }
+        match self.keychain_service.as_deref() {
+            Some("") => None,
+            Some(s) => Some(s.to_string()),
+            None => Some(crate::keychain::CLAUDE_CODE_SERVICE.to_string()),
+        }
+    }
+
+    /// The keychain service that actually holds an item, i.e. the one
+    /// worth reading. Cheap: the underlying probe is memoized.
+    pub fn keychain_available(&self) -> Option<String> {
+        self.keychain_service_name()
+            .filter(|s| crate::keychain::has_item(s))
+    }
+
     pub fn credentials_path(&self) -> Option<PathBuf> {
         if let Some(p) = &self.credentials {
             let p = expand_tilde(p);
@@ -582,6 +610,12 @@ enabled = true
 # Pro/Max live quotas read Claude Code's OAuth token; auto-discovered from
 # $CLAUDE_CONFIG_DIR, ~/.claude, ~/.config/claude. Override if elsewhere:
 # credentials = "~/.claude/.credentials.json"
+# On macOS Claude Code stores the token in the login keychain instead of a
+# plaintext file. llmu reads the `Claude Code-credentials` item read-only
+# (it never writes to a keychain, so Claude Code keeps owning rotation).
+# A non-default CLAUDE_CONFIG_DIR scopes that item name per config
+# directory — name yours explicitly, or set "" to skip the keychain:
+# keychain_service = "Claude Code-credentials-1a2b3c4d"
 
 [codex]
 # OpenAI Codex CLI (ChatGPT plan): tokens from $CODEX_HOME/sessions logs,

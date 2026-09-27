@@ -241,9 +241,12 @@ mod tests {
     fn claude_quotas_without_credentials_return_empty_default() {
         let mut cfg = Config::default();
         // Block the real ~/.claude discovery so the test never reads the
-        // user's credentials file or calls the network.
+        // user's credentials file or calls the network. The macOS
+        // keychain is pinned off for the same reason: on a developer Mac
+        // with Claude Code installed it is a live credential source.
         cfg.claude.credentials = Some("/nonexistent/llmu-claude-test".into());
         cfg.claude.access_token = None;
+        cfg.claude.keychain_service = Some(String::new());
         let f = ClaudeSub.quotas(&cfg, &FetchContext::default()).unwrap();
         assert!(f.snapshots.is_empty());
         assert!(!f.refresh_last_known_good);

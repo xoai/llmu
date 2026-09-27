@@ -154,3 +154,35 @@ fn integration_tests_never_import_llmu() {
         "tests/claude_refresh.rs is a std-only contract and must not import llmu"
     );
 }
+
+/// The scoped-keychain hint must be a properly `\`-continued literal. A
+/// line-join accident once collapsed the continuations into ~10-space
+/// runs embedded in the string, so the user-facing note printed with
+/// garbled gaps while `cargo fmt` stayed clean (fmt never reflows inside
+/// a single literal).
+#[test]
+fn scoped_keychain_note_literal_has_no_mangled_space_runs() {
+    let c = read("src/providers/claude_sub.rs");
+    let start = c
+        .find("fn scoped_keychain_note")
+        .expect("scoped_keychain_note must exist");
+    let end = c[start..]
+        .find("impl Provider")
+        .map(|i| start + i)
+        .expect("the note fn is followed by the Provider impl");
+    let body = &c[start..end];
+    for line in body.lines() {
+        // Leading indentation is legitimate; a 3+ space run in the
+        // trimmed content means the literal's continuation was joined
+        // into the string itself.
+        let trimmed = line.trim_start();
+        assert!(
+            !trimmed.contains("   "),
+            "a 3+ space run inside scoped_keychain_note is a joined-line artifact: {trimmed:?}"
+        );
+    }
+    assert!(
+        body.contains("scopes \\"),
+        "the long literal must use a backslash continuation, not embedded spaces"
+    );
+}
